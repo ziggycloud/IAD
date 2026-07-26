@@ -5,6 +5,8 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
+.env
+.env.*
 
 outputs/**
 !outputs/.gitkeep
@@ -15,3 +17,6 @@ tmp/
 third_party/Dinomaly2/backbones/weights/
 
 *.log
+*.pt
+*.pth
+*.ckpt
