@@ -61,7 +61,7 @@
 4. 若训练进程已退出且状态为 `interrupted`/`failed`，运行：
 
    ```powershell
-   .\train.ps1 -Config configs\rtx3060ti_strict_upstream.yaml
+   python run_pipeline.py --config configs\rtx3060ti_strict_upstream.yaml
    ```
 
    它会从 `checkpoints/last.pt` 继续；强制终止最多损失最近 999 步，
@@ -70,7 +70,9 @@
 5. 若 `run_state.status == "trained"` 但自动评估未运行，执行：
 
    ```powershell
-   .\evaluate.ps1 -Config configs\rtx3060ti_strict_upstream.yaml
+   python run_pipeline.py `
+     --config configs\rtx3060ti_strict_upstream.yaml `
+     --skip-train
    ```
 
 6. 若状态为 `evaluating` 或 `evaluation_failed`，重复同一评估命令；

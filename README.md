@@ -8,35 +8,30 @@ StableAdamW，重写了数据读取、8 GB 显存探测、断点续训和可恢�
 
 ## 最短运行方式
 
-在项目根目录打开 PowerShell：
+在项目根目录打开 PowerShell。激活 `IAD` 环境后，一条 Python 命令会依次
+完成训练和评估；训练中断后重复运行同一命令，会自动从 `last.pt` 续跑：
 
 ```powershell
-# 依赖已安装时可跳过
+conda activate IAD
+python run_pipeline.py
+```
+
+也可以直接指定本机环境，无需激活：
+
+```powershell
+J:\project\IAD\data\.conda\iad\python.exe run_pipeline.py
+```
+
+首次运行前建议先安装依赖并做一次数据抽检（约 40 秒）：
+
+```powershell
 .\setup_env.ps1
-
-# 建议先做一次数据抽检（约 40 秒）
 .\validate_data.ps1 -Mode sample
-
-# 一键训练；会自动探测 16/8/4/2/1，并自动从 last.pt 续跑
-.\train.ps1
-
-# 一键评估；会逐类别落盘并跳过已完成类别
-.\evaluate.ps1
 ```
 
-如果 PowerShell 执行策略阻止脚本：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\train.ps1
-powershell -ExecutionPolicy Bypass -File .\evaluate.ps1
-```
-
-脚本会优先使用用户指定的 `-PythonPath`，其次寻找名为 `IAD` 的 conda
-环境，再寻找本机已搭好的 IAD prefix。本机实际验证使用：
-
-```text
-J:\project\IAD\data\.conda\iad\python.exe
-```
+`run_pipeline.py` 会自动探测 micro-batch（16/8/4/2/1）、训练、保存断点，
+再按论文口径做可恢复的 160 类评估。旧的 `train.ps1` 和 `evaluate.ps1`
+继续保留作兼容入口。
 
 ## 3060 Ti 配置
 
@@ -64,16 +59,16 @@ J:\project\IAD\data\.conda\iad\python.exe
 仅重新做显存探测而不训练：
 
 ```powershell
-.\train.ps1 -ProbeOnly
+python train.py --probe-only
 ```
 
 若仍遇到 OOM，可直接覆盖配置，无需改代码：
 
 ```powershell
-.\train.ps1 -Set `
-  "training.micro_batch_size=8",`
-  "evaluation.batch_size=1",`
-  "runtime.num_workers=1"
+python run_pipeline.py `
+  --set training.micro_batch_size=8 `
+  --set evaluation.batch_size=1 `
+  --set runtime.num_workers=1
 ```
 
 上游当前 Real-IAD Variety multiview 脚本是 preview：所有可训练层均使用
@@ -81,7 +76,7 @@ J:\project\IAD\data\.conda\iad\python.exe
 显式命令等价于默认一键命令：
 
 ```powershell
-.\train.ps1 -Config configs\rtx3060ti_strict_upstream.yaml
+python run_pipeline.py --config configs\rtx3060ti_strict_upstream.yaml
 ```
 
 两个 preset 必须分开报告，不能混用 checkpoint。
@@ -94,10 +89,10 @@ J:\project\IAD\data\.conda\iad\python.exe
 
 ```powershell
 # 可中断；重新运行会验证并跳过已完成图片
-.\prepare_cache.ps1
+python prepare_cache.py
 
 # 使用缓存训练，评估仍读取官方原图和 mask
-.\train.ps1 -Config configs\rtx3060ti_strict_upstream_cached.yaml
+python run_pipeline.py --config configs\rtx3060ti_strict_upstream_cached.yaml
 ```
 
 缓存状态位于
@@ -105,7 +100,7 @@ J:\project\IAD\data\.conda\iad\python.exe
 `_cache_progress.jsonl`。只验证两张图的缓存流程：
 
 ```powershell
-.\prepare_cache.ps1 -MaxImages 2
+python prepare_cache.py --max-images 2
 ```
 
 有限缓存不能用于完整训练；随后需不带 `-MaxImages` 重新运行补齐。
@@ -177,9 +172,10 @@ checkpoint 与配置生成签名，并跳过同签名下已完成的类别。
 正式报告。仅做诊断时可以显式运行：
 
 ```powershell
-.\evaluate.ps1 `
-  -Checkpoint outputs\<实验>\checkpoints\last.pt `
-  -AllowPartial
+python run_pipeline.py `
+  --skip-train `
+  --checkpoint outputs\<实验>\checkpoints\last.pt `
+  --allow-partial
 ```
 
 中间断点评估会标记为 diagnostic，且不会覆盖正式总报告。
@@ -194,8 +190,7 @@ checkpoint 与配置生成签名，并跳过同签名下已完成的类别。
 .\validate_data.ps1 -Mode full
 
 # 两步训练 + 10 张图评估
-.\train.ps1 -Config configs\smoke.yaml -Resume never
-.\evaluate.ps1 -Config configs\smoke.yaml
+python run_pipeline.py --config configs\smoke.yaml --resume never
 ```
 
 预训练 backbone 首次使用时从 Meta 官方地址下载到
