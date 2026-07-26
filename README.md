@@ -1,0 +1,203 @@
+# Dinomaly2 × Real-IAD Variety（RTX 3060 Ti）
+
+这是从
+[guojiajeremy/Dinomaly2](https://github.com/guojiajeremy/Dinomaly2)
+固定版本 `1745c613` 中抽取的 Real-IAD Variety 基线。它保留
+DINOv2-register encoder、Dinomaly2 bottleneck/decoder、Loose Loss 和
+StableAdamW，重写了数据读取、8 GB 显存探测、断点续训和可恢复评估。
+
+## 最短运行方式
+
+在项目根目录打开 PowerShell：
+
+```powershell
+# 依赖已安装时可跳过
+.\setup_env.ps1
+
+# 建议先做一次数据抽检（约 40 秒）
+.\validate_data.ps1 -Mode sample
+
+# 一键训练；会自动探测 16/8/4/2/1，并自动从 last.pt 续跑
+.\train.ps1
+
+# 一键评估；会逐类别落盘并跳过已完成类别
+.\evaluate.ps1
+```
+
+如果 PowerShell 执行策略阻止脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\train.ps1
+powershell -ExecutionPolicy Bypass -File .\evaluate.ps1
+```
+
+脚本会优先使用用户指定的 `-PythonPath`，其次寻找名为 `IAD` 的 conda
+环境，再寻找本机已搭好的 IAD prefix。本机实际验证使用：
+
+```text
+J:\project\IAD\data\.conda\iad\python.exe
+```
+
+## 3060 Ti 配置
+
+一键训练/评估默认使用
+[configs/rtx3060ti_strict_upstream.yaml](configs/rtx3060ti_strict_upstream.yaml)，
+即本次正式 baseline。另提供显存更宽松、采用论文 LR 修正的
+[configs/rtx3060ti.yaml](configs/rtx3060ti.yaml)：
+
+- DINOv2-register ViT-B/14，输入 280 × 280；
+- 100,000 optimizer steps，有效 batch 16；
+- 修正版使用 BF16 AMP；两套配置都会实机探测 micro-batch，必要时自动
+  梯度累积；
+- 每 1,000 步原子保存 `last.pt`，重新运行同一命令即可续跑；
+- 预留 700 MiB 显存给桌面和波动；
+- 修正版采用 warmup + cosine LR（`2e-3 → 2e-4`），首层
+  bottleneck 使用 `2e-4`；严格 preset 的 LR 见下文。
+
+本机真实 forward/backward/optimizer 探测结果：
+
+```text
+默认 BF16：micro-batch=16, accumulation=1, peak reserved=3092 MiB
+严格上游 FP32：micro-batch=16, accumulation=1, peak reserved=4728 MiB
+```
+
+仅重新做显存探测而不训练：
+
+```powershell
+.\train.ps1 -ProbeOnly
+```
+
+若仍遇到 OOM，可直接覆盖配置，无需改代码：
+
+```powershell
+.\train.ps1 -Set `
+  "training.micro_batch_size=8",`
+  "evaluation.batch_size=1",`
+  "runtime.num_workers=1"
+```
+
+上游当前 Real-IAD Variety multiview 脚本是 preview：所有可训练层均使用
+`2e-3`，FP32，第一步 LR 为 0，100 步 warmup 后保持 `2e-3`。
+显式命令等价于默认一键命令：
+
+```powershell
+.\train.ps1 -Config configs\rtx3060ti_strict_upstream.yaml
+```
+
+两个 preset 必须分开报告，不能混用 checkpoint。
+
+## 可选的训练集缓存
+
+默认严格配置直接读取原图，拿到项目后可以立刻一键训练。由于 100,000 步会
+重复解码约 160 万张高分辨率图片，建议先建立仅含官方 19,955 张训练图的
+1024 × 1024 缓存：
+
+```powershell
+# 可中断；重新运行会验证并跳过已完成图片
+.\prepare_cache.ps1
+
+# 使用缓存训练，评估仍读取官方原图和 mask
+.\train.ps1 -Config configs\rtx3060ti_strict_upstream_cached.yaml
+```
+
+缓存状态位于
+`data\realiadvariety_1024\_cache_state.json`，逐步记录位于同目录的
+`_cache_progress.jsonl`。只验证两张图的缓存流程：
+
+```powershell
+.\prepare_cache.ps1 -MaxImages 2
+```
+
+有限缓存不能用于完整训练；随后需不带 `-MaxImages` 重新运行补齐。
+`rtx3060ti_cached.yaml` 则是 BF16 + 论文 LR 修正版的缓存 preset。
+
+## 数据与评估口径
+
+数据由官方 160 份 split JSON 枚举，不扫描文件夹猜标签：
+
+```text
+data\realiadvariety_jsons\Real-IAD_Variety_jsons
+data\realiadvariety_raw
+```
+
+已核对的官方规模：
+
+| split | 图像/视图 | 五视角对象 |
+|---|---:|---:|
+| train（全正常） | 19,955 | 3,991 |
+| test | 178,995 | 35,799 |
+
+评估对每个类别单独计算，再对 160 类做宏平均：
+
+```text
+I-ROC, I-PR, I-F1max, P-ROC, P-PR, P-F1max, P-PRO
+```
+
+- 图像分数：单视角异常图 top 1% 像素均值；
+- P-PRO：积分到 30% FPR；
+- 异常图先缩放到 256 × 256，再做 `5 × 5, σ=4` Gaussian；
+- mask 使用 pinned 上游的 bilinear + nonzero 语义；若要做更规范的
+  nearest-neighbor 消融，可覆盖
+  `dataset.mask_resize_semantics=nearest_binary`；
+- manifest 中异常对象但 `mask_path=null` 的视角，按 Dinomaly2 上游
+  语义作为 view-normal；像素 mask 为全零；
+- 另输出五视角对象级 O-ROC/O-PR/O-F1 作为架构诊断，不混入论文七项指标。
+
+论文表 3 给出的 Dinomaly 数值不是 Dinomaly2，报告中仅作为量级参考，
+不会冒充本次实测。
+
+## 输出与中断恢复
+
+默认输出目录：
+
+```text
+outputs\dinomaly2_realiad_variety_b_280\
+├── resolved_config.yaml
+├── batch_tuning.json
+├── run_state.json
+├── logs\
+│   ├── train.log
+│   └── progress.jsonl
+├── checkpoints\
+│   ├── last.pt
+│   └── final_model.pt
+└── evaluation\<签名>\
+    ├── eval_state.json
+    ├── metrics.json
+    ├── metrics_per_category.csv
+    ├── evaluation_report.md
+    └── per_category\*.json
+```
+
+任务中断后，让 Codex 读取 [RUN_LOG.md](RUN_LOG.md) 和对应实验的
+`run_state.json` 即可知道下一步。训练会从 `last.pt` 继续；评估会根据
+checkpoint 与配置生成签名，并跳过同签名下已完成的类别。
+
+默认评估只接受完成 100,000 步的 `final_model.pt`，避免把中间模型静默写成
+正式报告。仅做诊断时可以显式运行：
+
+```powershell
+.\evaluate.ps1 `
+  -Checkpoint outputs\<实验>\checkpoints\last.pt `
+  -AllowPartial
+```
+
+中间断点评估会标记为 diagnostic，且不会覆盖正式总报告。
+
+## 常用检查
+
+```powershell
+# 只检查全部 manifest 元数据与固定计数
+.\validate_data.ps1 -Mode metadata
+
+# 全量解码所有图像和 mask（耗时很长）
+.\validate_data.ps1 -Mode full
+
+# 两步训练 + 10 张图评估
+.\train.ps1 -Config configs\smoke.yaml -Resume never
+.\evaluate.ps1 -Config configs\smoke.yaml
+```
+
+预训练 backbone 首次使用时从 Meta 官方地址下载到
+`third_party\Dinomaly2\backbones\weights`。本机已下载并完成真实 GPU
+冒烟训练、评估和断点恢复测试。

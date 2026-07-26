@@ -1,0 +1,77 @@
+experiment:
+  name: dinomaly2_realiad_variety_b_280_cached
+  output_dir: outputs/dinomaly2_realiad_variety_b_280_cached
+  seed: 1
+
+dataset:
+  type: realiad_variety
+  json_dir: data/realiadvariety_jsons/Real-IAD_Variety_jsons
+  # Evaluation always reads the original images and masks from this directory.
+  image_dir: data/realiadvariety_raw
+  # Training alone reads the resumable 1024x1024 cache.
+  train_image_dir: data/realiadvariety_1024
+  categories: all
+  category_limit: null
+  image_size: 280
+  crop_size: 280
+  train_mode: all_views
+  image_label_policy: visible_defect
+  missing_anomaly_mask_policy: include_as_normal_view
+  mask_resize_semantics: upstream_bilinear_nonzero
+
+model:
+  backbone: dinov2reg_vit_base_14
+  backbone_weights_dir: third_party/Dinomaly2/backbones/weights
+  dropout: 0.4
+  linear_attention: true
+  loose_constraint_groups: 2
+  loose_loss: true
+  context_aware_recenter: true
+
+training:
+  total_steps: 100000
+  effective_batch_size: 16
+  micro_batch_size: auto
+  batch_candidates: [16, 8, 4, 2, 1]
+  memory_headroom_mb: 700
+  amp: true
+  amp_dtype: bfloat16
+  learning_rate: 0.002
+  first_bottleneck_lr_scale: 0.1
+  weight_decay: 0.0001
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-10
+  warmup_steps: 100
+  lr_step_offset: 1
+  final_lr_ratio: 0.1
+  loose_loss_warmup_steps: 1000
+  loose_loss_final_discard: 0.9
+  gradient_clip_norm: 0.1
+  log_every: 20
+  checkpoint_every: 1000
+  auto_resume: true
+
+evaluation:
+  amp: false
+  batch_size: 2
+  num_workers: 2
+  resize_mask: 256
+  image_top_ratio: 0.01
+  object_top_ratio: 0.01
+  gaussian_kernel_size: 5
+  gaussian_sigma: 4.0
+  metric_bins: 1000
+  resume: true
+
+runtime:
+  device: cuda:0
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  deterministic: true
+
+cache:
+  output_dir: data/realiadvariety_1024
+  max_side: 1024
+  workers: 4

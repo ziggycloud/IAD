@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+outputs/**
+!outputs/.gitkeep
+/data/
+/2511.00540v2.pdf
+tmp/
+
+third_party/Dinomaly2/backbones/weights/
+
+*.log

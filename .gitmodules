@@ -1,0 +1,4 @@
+[submodule "third_party/Dinomaly2"]
+	path = third_party/Dinomaly2
+	url = https://github.com/guojiajeremy/Dinomaly2.git
+	ignore = untracked
