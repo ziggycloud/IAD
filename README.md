@@ -8,19 +8,27 @@ StableAdamW，重写了数据读取、8 GB 显存探测、断点续训和可恢�
 
 ## 最短运行方式
 
-在项目根目录打开 PowerShell。激活 `IAD` 环境后，一条 Python 命令会依次
-完成训练和评估；训练中断后重复运行同一命令，会自动从 `last.pt` 续跑：
+在项目根目录打开 PowerShell，直接运行一条 Python 命令即可。若当前
+Python 缺少依赖，脚本会自动定位本机的 IAD 环境并用正确解释器重新启动；
+训练中断后重复运行同一命令，会自动从 `last.pt` 续跑：
 
 ```powershell
-conda activate IAD
 python run_pipeline.py
 ```
 
-也可以直接指定本机环境，无需激活：
+也可以显式激活路径型环境，或直接指定解释器。当前环境是按路径创建的，
+因此不能使用 `conda activate IAD`：
 
 ```powershell
+conda activate J:\project\IAD\data\.conda\iad
+python run_pipeline.py
+
+# 不激活环境也可以
 J:\project\IAD\data\.conda\iad\python.exe run_pipeline.py
 ```
+
+在其他机器上可以把 `IAD_PYTHON` 环境变量设为目标环境的 Python 路径，
+一键脚本会优先使用它。
 
 首次运行前建议先安装依赖并做一次数据抽检（约 40 秒）：
 

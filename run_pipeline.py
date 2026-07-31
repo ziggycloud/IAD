@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import multiprocessing
+import os
+import subprocess
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -11,6 +14,114 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _missing_runtime_modules() -> list[str]:
+    required = ("torch", "sklearn", "yaml", "cv2")
+    return [name for name in required if importlib.util.find_spec(name) is None]
+
+
+def _python_in_prefix(prefix: Path) -> Path:
+    return prefix / ("python.exe" if os.name == "nt" else "bin/python")
+
+
+def _candidate_iad_pythons() -> list[Path]:
+    candidates: list[Path] = []
+    configured = os.environ.get("IAD_PYTHON")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+
+    # Known local prefixes plus the same layout relative to the repository.
+    project_parent = ROOT.parent
+    prefixes = [
+        project_parent / "IAD" / "data" / ".conda" / "iad",
+        project_parent / "IAD" / "data" / ".conda" / "realiad-variety-py311",
+        project_parent / "IAD" / "data.conda" / "realiad-variety-py311",
+        Path(r"J:\project\IAD\data\.conda\iad"),
+        Path(r"J:\project\IAD\data\.conda\realiad-variety-py311"),
+        Path(r"J:\project\IAD\data.conda\realiad-variety-py311"),
+    ]
+    candidates.extend(_python_in_prefix(prefix) for prefix in prefixes)
+
+    try:
+        result = subprocess.run(
+            ["conda", "env", "list", "--json"],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=15,
+        )
+        envs = json.loads(result.stdout).get("envs", [])
+        for raw_prefix in envs:
+            prefix = Path(raw_prefix)
+            if prefix.name.casefold() in {"iad", "realiad-variety-py311"}:
+                candidates.append(_python_in_prefix(prefix))
+    except (FileNotFoundError, subprocess.SubprocessError, json.JSONDecodeError):
+        pass
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def _candidate_has_runtime(candidate: Path) -> bool:
+    probe = (
+        "import importlib.util,sys;"
+        "mods=('torch','sklearn','yaml','cv2');"
+        "sys.exit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)"
+    )
+    try:
+        result = subprocess.run(
+            [str(candidate), "-c", probe],
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _ensure_iad_python() -> None:
+    missing = _missing_runtime_modules()
+    if not missing:
+        return
+
+    if os.environ.get("IAD_PIPELINE_REEXEC") == "1":
+        raise RuntimeError(
+            f"Selected IAD Python is missing dependencies: {', '.join(missing)}"
+        )
+
+    current = Path(sys.executable).resolve()
+    for candidate in _candidate_iad_pythons():
+        if not candidate.is_file() or candidate.resolve() == current:
+            continue
+        if not _candidate_has_runtime(candidate):
+            continue
+        print(
+            f"Current Python is missing {', '.join(missing)}; "
+            f"re-launching with {candidate}",
+            file=sys.stderr,
+            flush=True,
+        )
+        os.environ["IAD_PIPELINE_REEXEC"] = "1"
+        os.execv(
+            str(candidate),
+            [str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
+
+    raise RuntimeError(
+        "A complete IAD Python environment was not found. Set IAD_PYTHON to "
+        "its python executable, or run setup_env.ps1 first. Missing modules: "
+        + ", ".join(missing)
+    )
+
+
+_ensure_iad_python()
 sys.path.insert(0, str(ROOT / "src"))
 
 from realiad_dinomaly2.config import load_config, materialize_paths

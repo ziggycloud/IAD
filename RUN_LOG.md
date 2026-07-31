@@ -1,29 +1,31 @@
 # Dinomaly2 / Real-IAD Variety 续接日志
 
-最后人工更新：2026-07-26 19:41（Asia/Shanghai）
+最后人工更新：2026-08-01 00:21（Asia/Shanghai）
 
 ## 当前状态
 
-正式 pinned-upstream baseline 正在后台训练，训练成功后会自动启动 160 类
-评估并生成报告。不要同时启动第二个同配置训练进程。
+正式 pinned-upstream baseline 的原后台进程已经退出，尚未完成训练或评估。
+最后状态停在 step 13,620/100,000，完整的 `last.pt` 仍在，可以自动续训。
 
 - 实验：`dinomaly2_realiad_variety_b_280_strict_upstream`
 - 配置：`configs/rtx3060ti_strict_upstream.yaml`
-- 训练主进程 PID（本次启动）：`43740`
-- 自动评估监视器状态：
-  `outputs/dinomaly2_realiad_variety_b_280_strict_upstream/pipeline_state.json`
+- 原训练 PID `43740` 已不存在；旧自动评估监视器状态已失效
+- 下一步：在项目根目录运行 `python run_pipeline.py`；脚本会自动切换到
+  正确的 IAD Python，并从 step 13,000 的 `last.pt` 继续
 - 最新训练步、loss、ETA 的唯一权威来源：
   `outputs/dinomaly2_realiad_variety_b_280_strict_upstream/run_state.json`
 
-人工更新本日志时训练已超过 step 1,000/100,000，且首个 720,702,551-byte
-`last.pt` 已在 step 1,000 成功落盘；`run_state.json` 每 20 步
-更新，因此恢复任务时不要依赖这里的旧步数。
+现有 `last.pt` 为 720,702,551 bytes，保存于 step 13,000；
+`run_state.json` 的 step 13,620 是旧进程退出前的内存进度，因此续训会从
+13,000 开始，最多回退 620 步。
 
 ## 已完成
 
 - 固定上游源码：`guojiajeremy/Dinomaly2@1745c613`
 - 环境：`J:\project\IAD\data\.conda\iad\python.exe`
   (`torch 2.9.0+cu128`)
+- 该环境是路径型环境，不是名为 `IAD` 的环境；不要运行
+  `conda activate IAD`。`run_pipeline.py` 会从 base Python 自动切换到它。
 - GPU：RTX 3060 Ti 8 GB
 - 数据 metadata/sample 校验通过：
   160 类、19,955 train views、178,995 test views
