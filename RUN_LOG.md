@@ -1,23 +1,25 @@
 # Dinomaly2 / Real-IAD Variety 续接日志
 
-最后人工更新：2026-08-01 00:21（Asia/Shanghai）
+最后人工更新：2026-08-01 00:24（Asia/Shanghai）
 
 ## 当前状态
 
-正式 pinned-upstream baseline 的原后台进程已经退出，尚未完成训练或评估。
-最后状态停在 step 13,620/100,000，完整的 `last.pt` 仍在，可以自动续训。
+正式 pinned-upstream baseline 已通过 `run_pipeline.py` 从 step 13,000 的
+`last.pt` 恢复训练；训练完成后，同一进程会自动启动 160 类评估。不要再
+启动第二个同配置训练进程。
 
 - 实验：`dinomaly2_realiad_variety_b_280_strict_upstream`
 - 配置：`configs/rtx3060ti_strict_upstream.yaml`
-- 原训练 PID `43740` 已不存在；旧自动评估监视器状态已失效
-- 下一步：在项目根目录运行 `python run_pipeline.py`；脚本会自动切换到
-  正确的 IAD Python，并从 step 13,000 的 `last.pt` 继续
+- 当前续训 Python PID：`31160`（恢复任务时仍须重新核对，不可只信旧 PID）
+- 流水线状态：
+  `outputs/dinomaly2_realiad_variety_b_280_strict_upstream/pipeline_state.json`
+- 当前操作：等待训练和自动评估，不要重复运行 `run_pipeline.py`
 - 最新训练步、loss、ETA 的唯一权威来源：
   `outputs/dinomaly2_realiad_variety_b_280_strict_upstream/run_state.json`
 
-现有 `last.pt` 为 720,702,551 bytes，保存于 step 13,000；
-`run_state.json` 的 step 13,620 是旧进程退出前的内存进度，因此续训会从
-13,000 开始，最多回退 620 步。
+恢复所用的 `last.pt` 为 720,702,551 bytes，保存于 step 13,000；旧进程
+退出前曾到 step 13,620，因此本次最多回退了 620 步。人工更新本日志时，
+新进程已超过 step 13,340；实时进度以 `run_state.json` 为准。
 
 ## 已完成
 
