@@ -23,12 +23,6 @@ python run_pipeline.py
 conda activate J:\project\IAD\data\.conda\iad
 python run_pipeline.py
 
-# 不激活环境也可以
-J:\project\IAD\data\.conda\iad\python.exe run_pipeline.py
-```
-
-在其他机器上可以把 `IAD_PYTHON` 环境变量设为目标环境的 Python 路径，
-一键脚本会优先使用它。
 
 首次运行前建议先安装依赖并做一次数据抽检（约 40 秒）：
 
