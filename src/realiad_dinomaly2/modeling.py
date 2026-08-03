@@ -11,6 +11,11 @@ import torch
 import torch.nn as nn
 
 from .config import PROJECT_ROOT
+from .generalized_model import (
+    CompositionalNormalityAdapter,
+    GeneralizedDinomaly,
+    combine_auxiliary_losses,
+)
 
 
 UPSTREAM_ROOT = PROJECT_ROOT / "third_party" / "Dinomaly2"
@@ -171,21 +176,66 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
         parameter.requires_grad_(False)
 
     dropout = float(model_config["dropout"])
-    bottleneck = nn.ModuleList(
-        [
-            nn.Sequential(
-                nn.Linear(embed_dim, 256),
-                nn.Dropout(p=dropout),
-            ),
-            nn.Sequential(
-                nn.Linear(256, embed_dim * 4),
-                nn.GELU(),
-                nn.Dropout(p=dropout),
-                nn.Linear(embed_dim * 4, embed_dim),
-                nn.Dropout(p=dropout),
-            ),
-        ]
-    )
+    architecture = str(model_config.get("architecture", "dinomaly2")).lower()
+    generalized_names = {"generalized", "category_generalized", "cg_dinomaly"}
+    if architecture in generalized_names:
+        generalized = dict(model_config.get("generalized", {}))
+        latent_dim = int(generalized.get("latent_dim", 256))
+        if latent_dim <= 0:
+            raise ValueError("model.generalized.latent_dim must be positive")
+        bottleneck = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(embed_dim, latent_dim),
+                    nn.Dropout(p=dropout),
+                ),
+                CompositionalNormalityAdapter(
+                    latent_dim=latent_dim,
+                    output_dim=embed_dim,
+                    num_special_tokens=1 + int(encoder.num_register_tokens),
+                    num_references=int(
+                        generalized.get("num_references", 256)
+                    ),
+                    reference_top_k=int(
+                        generalized.get("reference_top_k", 16)
+                    ),
+                    reference_temperature=float(
+                        generalized.get("reference_temperature", 0.07)
+                    ),
+                    router_temperature=float(
+                        generalized.get("router_temperature", 1.0)
+                    ),
+                    router_top_k=int(generalized.get("router_top_k", 3)),
+                    router_trim_ratio=float(
+                        generalized.get("router_trim_ratio", 0.1)
+                    ),
+                    dropout=float(
+                        generalized.get("expert_dropout", dropout)
+                    ),
+                ),
+            ]
+        )
+    elif architecture in {"dinomaly", "dinomaly2", "baseline"}:
+        bottleneck = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(embed_dim, 256),
+                    nn.Dropout(p=dropout),
+                ),
+                nn.Sequential(
+                    nn.Linear(256, embed_dim * 4),
+                    nn.GELU(),
+                    nn.Dropout(p=dropout),
+                    nn.Linear(embed_dim * 4, embed_dim),
+                    nn.Dropout(p=dropout),
+                ),
+            ]
+        )
+    else:
+        raise ValueError(
+            "model.architecture must be dinomaly2 or generalized, "
+            f"got {architecture!r}"
+        )
 
     decoder = nn.ModuleList()
     attention = (
@@ -208,7 +258,12 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
     encoder_fusion, decoder_fusion = loose_constraint_layers(
         int(model_config["loose_constraint_groups"])
     )
-    model = symbols["Dinomaly"](
+    model_class = (
+        GeneralizedDinomaly
+        if architecture in generalized_names
+        else symbols["Dinomaly"]
+    )
+    model = model_class(
         encoder=encoder,
         bottleneck=bottleneck,
         decoder=decoder,
@@ -328,3 +383,74 @@ def parameter_summary(bundle: ModelBundle) -> dict[str, int]:
         "trainable_parameters": trainable,
         "frozen_parameters": total - trainable,
     }
+
+
+def auxiliary_losses(
+    model: nn.Module,
+    detach: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Read optional architecture losses without special-casing the baseline.
+
+    This deliberately returns an empty mapping for the original Dinomaly2
+    model, making it safe for shared training and logging code.
+    """
+
+    unwrapped = getattr(model, "module", model)
+    getter = getattr(unwrapped, "auxiliary_losses", None)
+    if getter is None:
+        return {}
+    return getter(detach=detach)
+
+
+def forward_with_regularization(
+    model: nn.Module,
+    images: torch.Tensor,
+    weights: dict[str, float] | None = None,
+) -> tuple[
+    list[torch.Tensor],
+    list[torch.Tensor],
+    torch.Tensor,
+    dict[str, torch.Tensor],
+]:
+    """Forward either architecture and return a uniform auxiliary contract.
+
+    GeneralizedDinomaly returns its per-replica terms through ``forward`` so
+    ``DataParallel`` can gather graph-connected values.  Each gathered vector
+    is reduced to one scalar here.  Baseline Dinomaly2 gets an exact device-side
+    zero and an empty mapping.
+    """
+
+    unwrapped = getattr(model, "module", model)
+    if isinstance(unwrapped, GeneralizedDinomaly):
+        encoder_features, decoder_features, gathered = model(
+            images,
+            return_auxiliary=True,
+        )
+        reduced = {name: value.mean() for name, value in gathered.items()}
+        regularizer = combine_auxiliary_losses(
+            reduced,
+            weights=weights,
+            anchor=next(iter(reduced.values())),
+        )
+        return encoder_features, decoder_features, regularizer, reduced
+
+    encoder_features, decoder_features = model(images)
+    zero = decoder_features[0].new_zeros(())
+    return encoder_features, decoder_features, zero, {}
+
+
+def regularization_loss(
+    model: nn.Module,
+    weights: dict[str, float] | None = None,
+) -> torch.Tensor:
+    """Return a differentiable scalar, or zero for the baseline architecture."""
+
+    unwrapped = getattr(model, "module", model)
+    getter = getattr(unwrapped, "regularization_loss", None)
+    if getter is not None:
+        return getter(weights=weights)
+    try:
+        parameter = next(unwrapped.parameters())
+    except StopIteration:
+        return torch.tensor(0.0)
+    return parameter.sum() * 0.0

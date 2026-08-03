@@ -416,6 +416,9 @@ def evaluate(
     config: dict[str, Any],
     checkpoint: str = "auto",
     allow_partial: bool = False,
+    categories_override: list[str] | None = None,
+    split_name: str | None = None,
+    publish_root_report: bool = True,
 ) -> dict[str, Any]:
     output_dir = Path(config["experiment"]["output_dir"])
     checkpoint_path = _resolve_checkpoint(output_dir, checkpoint)
@@ -431,8 +434,16 @@ def evaluate(
     )
     categories = discover_categories(
         Path(config["dataset"]["json_dir"]),
-        requested=config["dataset"]["categories"],
-        limit=config["dataset"].get("category_limit"),
+        requested=(
+            categories_override
+            if categories_override is not None
+            else config["dataset"]["categories"]
+        ),
+        limit=(
+            None
+            if categories_override is not None
+            else config["dataset"].get("category_limit")
+        ),
     )
     signature, signature_payload = _evaluation_signature(
         config,
@@ -574,6 +585,7 @@ def evaluate(
     )
     metrics_payload = {
         "status": "partial_diagnostic" if is_partial else "complete",
+        "split_name": split_name,
         "completed_at": utc_now(),
         "checkpoint": str(checkpoint_path),
         "checkpoint_steps": checkpoint_payload.get("completed_steps"),
@@ -582,6 +594,10 @@ def evaluate(
         "macro_average": macro,
         "category_standard_deviation": standard_deviation,
         "paper_metric_order": PAPER_METRIC_KEYS,
+        "evaluation_dir": str(evaluation_dir),
+        "metrics_per_category": str(
+            evaluation_dir / "metrics_per_category.csv"
+        ),
     }
     atomic_write_json(evaluation_dir / "metrics.json", metrics_payload)
     _write_csv(evaluation_dir / "metrics_per_category.csv", rows)
@@ -597,7 +613,9 @@ def evaluate(
     report_path = evaluation_dir / "evaluation_report.md"
     report_path.write_text(report, encoding="utf-8", newline="\n")
     if (
-        "smoke" not in str(config["experiment"]["name"]).lower()
+        publish_root_report
+        and split_name is None
+        and "smoke" not in str(config["experiment"]["name"]).lower()
         and not is_partial
     ):
         (PROJECT_ROOT / "reports" / "evaluation_report.md").write_text(

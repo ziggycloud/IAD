@@ -1,0 +1,116 @@
+experiment:
+  name: generalized_dinomaly_realiad_seen50_unseen50_vitl392
+  output_dir: outputs/generalized_dinomaly_seen50_unseen50_vitl392
+  seed: 20260803
+
+protocol:
+  # The sampled split is persisted under output_dir/protocol and cannot change
+  # silently on resume.
+  seed: 20260803
+  seen_categories: 50
+  unseen_categories: 50
+  unused_categories: 60
+
+dataset:
+  type: realiad_variety
+  json_dir: data/realiadvariety_jsons/Real-IAD_Variety_jsons
+  image_dir: data/realiadvariety_raw
+  train_image_dir: null
+  # run_unseen_pipeline.py replaces this with the persisted 50 seen classes.
+  categories: all
+  category_limit: null
+  image_size: 392
+  crop_size: 392
+  train_mode: all_views
+  image_label_policy: visible_defect
+  missing_anomaly_mask_policy: include_as_normal_view
+  mask_resize_semantics: upstream_bilinear_nonzero
+
+model:
+  architecture: category_generalized
+  backbone: dinov2reg_vit_large_14
+  backbone_weights_dir: third_party/Dinomaly2/backbones/weights
+  dropout: 0.2
+  linear_attention: true
+  loose_constraint_groups: 2
+  loose_loss: true
+  context_aware_recenter: true
+  generalized:
+    latent_dim: 384
+    num_references: 512
+    reference_top_k: 32
+    reference_temperature: 0.1
+    # Dense routing is intentional: all local/component/global experts receive
+    # gradients from the first step. Set 2 only for a sparse-routing ablation.
+    router_top_k: 3
+    router_temperature: 1.0
+    router_trim_ratio: 0.1
+    expert_dropout: 0.1
+    auxiliary_weights:
+      reference_balance: 1.0
+      router_balance: 1.0
+      router_entropy_penalty: 0.05
+      expert_diversity: 0.05
+
+training:
+  # With this seed, 6k x global batch 64 = 384k views ~= 61.5 passes over
+  # the 6,240 seen-train views, about 23% fewer normalized epochs than the
+  # original 100k x batch-16 run over all 19,955 train views.
+  total_steps: 6000
+  effective_batch_size: 64
+  # Per GPU. Probe 32 first on the target 40 GB card, then fall back while
+  # keeping the global effective batch fixed at 64.
+  micro_batch_size: auto
+  batch_candidates: [32, 16, 8, 4, 2, 1]
+  memory_headroom_mb: 2500
+  amp: true
+  amp_dtype: bfloat16
+  learning_rate: 0.001
+  first_bottleneck_lr_scale: 0.2
+  weight_decay: 0.0001
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-10
+  warmup_steps: 300
+  lr_step_offset: 1
+  final_lr_ratio: 0.1
+  loose_loss_warmup_steps: 800
+  loose_loss_final_discard: 0.9
+  generalized_regularization_weight: 0.01
+  gradient_clip_norm: 0.1
+  log_every: 20
+  checkpoint_every: 250
+  auto_resume: true
+
+evaluation:
+  amp: true
+  batch_size: 8
+  num_workers: 4
+  resize_mask: 256
+  image_top_ratio: 0.01
+  object_top_ratio: 0.01
+  gaussian_kernel_size: 5
+  gaussian_sigma: 4.0
+  metric_bins: 1000
+  resume: true
+
+latency:
+  warmup_iterations: 10
+  measure_iterations: 50
+  threshold_seconds: 1.0
+
+runtime:
+  device: cuda:0
+  # Plain Python on Windows: DataParallel over device_ids. torchrun: DDP.
+  multi_gpu_strategy: auto
+  distributed_backend: auto
+  device_ids: [0, 1]
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  deterministic: false
+
+cache:
+  output_dir: data/realiadvariety_1024
+  max_side: 1024
+  workers: 8

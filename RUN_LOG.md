@@ -1,27 +1,25 @@
 # Dinomaly2 / Real-IAD Variety 续接日志
 
-最后人工更新：2026-08-01 00:24（Asia/Shanghai）
+最后人工更新：2026-08-03（Asia/Shanghai）
 
 ## 当前状态
 
-正式 pinned-upstream baseline 已通过 `run_pipeline.py` 从 step 13,000 的
-`last.pt` 恢复训练；训练完成后，同一进程会自动启动 160 类评估。不要再
-启动第二个同配置训练进程。
+旧的 160 类 pinned-upstream baseline 训练已按用户要求停止，当前没有正在运行的
+项目 Python 训练进程；其代码和参数保持第一版基线语义。
 
-- 实验：`dinomaly2_realiad_variety_b_280_strict_upstream`
-- 配置：`configs/rtx3060ti_strict_upstream.yaml`
-- 当前续训 Python PID：`31160`（恢复任务时仍须重新核对，不可只信旧 PID）
-- 流水线状态：
-  `outputs/dinomaly2_realiad_variety_b_280_strict_upstream/pipeline_state.json`
-- 当前操作：等待训练和自动评估，不要重复运行 `run_pipeline.py`
-- 最新训练步、loss、ETA 的唯一权威来源：
-  `outputs/dinomaly2_realiad_variety_b_280_strict_upstream/run_state.json`
+当前主任务已切换为 50 seen / 50 unseen / 60 unused 的类别泛化实验。新架构、
+双卡配置和一键脚本已经完成，尚未在目标 2 × 40 GB GPU 上启动长训练。恢复此任务时
+优先读取 [UNSEEN_RUN_LOG.md](UNSEEN_RUN_LOG.md)，然后运行：
 
-恢复所用的 `last.pt` 为 720,702,551 bytes，保存于 step 13,000；旧进程
-退出前曾到 step 13,620，因此本次最多回退了 620 步。人工更新本日志时，
-新进程已超过 step 13,340；实时进度以 `run_state.json` 为准。
+```powershell
+python run_unseen_pipeline.py
+```
 
-## 已完成
+动态状态位于
+`outputs/generalized_dinomaly_seen50_unseen50_vitl392/unseen_pipeline_state.json`；
+不要依据下方保留的旧 PID/step 历史判断当前是否仍在训练。
+
+## 已完成（旧 160 类基线）
 
 - 固定上游源码：`guojiajeremy/Dinomaly2@1745c613`
 - 环境：`J:\project\IAD\data\.conda\iad\python.exe`
@@ -42,7 +40,7 @@
 - 正式 FP32 batch 探测：micro-batch 16、无梯度累积、peak reserved
   4,728 MiB
 
-## 正式运行语义
+## 正式运行语义（旧 160 类基线）
 
 - ViT-B/14，280×280，全部 160 类统一训练
 - FP32，effective/micro batch 都是 16
@@ -56,7 +54,7 @@
 - mask 使用上游 bilinear + nonzero 语义
 - 七项结果逐类别计算后对 160 类宏平均
 
-## 中断后怎么继续
+## 旧基线中断后怎么继续
 
 1. 读取本文件。
 2. 读取正式实验的 `run_state.json` 和 `pipeline_state.json`。

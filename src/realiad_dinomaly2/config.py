@@ -87,6 +87,9 @@ def _validate(config: dict[str, Any]) -> None:
     if int(training["total_steps"]) <= 0:
         raise ValueError("total_steps 必须为正整数")
 
+    if float(training.get("generalized_regularization_weight", 0.0)) < 0:
+        raise ValueError("generalized_regularization_weight must be >= 0")
+
     evaluation = config["evaluation"]
     if not 0 < float(evaluation["image_top_ratio"]) <= 1:
         raise ValueError("image_top_ratio 必须位于 (0, 1]")
@@ -183,6 +186,7 @@ def semantic_config(config: dict[str, Any]) -> dict[str, Any]:
                 "final_lr_ratio",
                 "loose_loss_warmup_steps",
                 "loose_loss_final_discard",
+                "generalized_regularization_weight",
                 "gradient_clip_norm",
             )
         },

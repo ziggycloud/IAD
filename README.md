@@ -204,3 +204,16 @@ python run_pipeline.py --config configs\smoke.yaml --resume never
 预训练 backbone 首次使用时从 Meta 官方地址下载到
 `third_party\Dinomaly2\backbones\weights`。本机已下载并完成真实 GPU
 冒烟训练、评估和断点恢复测试。
+
+## Seen/Unseen 类别泛化实验
+
+新增的类别泛化架构、双卡 40 GB 配置和 50/50/60 评估协议使用独立入口：
+
+```powershell
+python run_unseen_pipeline.py
+```
+
+它只用固定的 50 个 seen 类 train-good 训练，随后分别评估 seen 和完全未参与训练的
+50 个 unseen 类，并输出 `S_cls`、`S_seg`、`S_zs`、百分制总分及单图延迟判定。
+完整参数、公式和恢复方式见 [UNSEEN_PROTOCOL.md](UNSEEN_PROTOCOL.md)，任务交接状态见
+[UNSEEN_RUN_LOG.md](UNSEEN_RUN_LOG.md)。

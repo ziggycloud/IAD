@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -41,6 +42,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run the real CUDA batch-size probe and exit before training.",
     )
+    parser.add_argument(
+        "--local-rank",
+        "--local_rank",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     return parser.parse_args()
 
 
@@ -56,6 +64,9 @@ def main() -> int:
         # A fresh-run guard must not overwrite the state of the existing run.
         raise
     except Exception as exc:
+        # In torchrun mode only rank 0 owns shared logs/state/checkpoints.
+        if int(os.environ.get("RANK", "0")) != 0:
+            raise
         state_path = (
             Path(config["experiment"]["output_dir"]) / "run_state.json"
         )
