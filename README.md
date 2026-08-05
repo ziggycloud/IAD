@@ -217,3 +217,56 @@ python run_unseen_pipeline.py
 50 个 unseen 类，并输出 `S_cls`、`S_seg`、`S_zs`、百分制总分及单图延迟判定。
 完整参数、公式和恢复方式见 [UNSEEN_PROTOCOL.md](UNSEEN_PROTOCOL.md)，任务交接状态见
 [UNSEEN_RUN_LOG.md](UNSEEN_RUN_LOG.md)。
+
+## 比赛 Train / Test_A 提交流水线
+
+比赛数据直接按 `category/Sxxxx/0.png..4.png` 读取，不需要官方 JSON，也不读取
+任何标签。默认配置复用上面的 category-generalized Dinomaly、DINOv2-register
+ViT-L/14，并把输入对齐到提交 mask 的 448 × 448：
+
+```powershell
+# 一键：审计数据 → 训练（可从 last.pt 恢复）→ Test_A 推理 → 校验并打 ZIP
+python run_competition_pipeline.py
+
+# 只检查目录、类别和五视角完整性
+python run_competition_pipeline.py --validate-only
+
+# 已有 final_model.pt 时跳过训练，重新/继续按类别推理和打包
+python run_competition_pipeline.py --skip-train
+
+# 只训练，暂不推理
+python run_competition_pipeline.py --skip-inference
+```
+
+默认数据路径和配置分别为 `data/competition/Train`、
+`data/competition/Test_A` 与 `configs/competition.yaml`。分类分数把同一零件的
+5 个视角合并后取异常热图 top 1% 均值，再用严格单调函数映射到 `[0,1]`；
+mask 按类别做无标签、严格单调的 8-bit 分位数标定，以充分利用 PNG 灰度范围。
+
+完成后读取：
+
+```text
+outputs/generalized_dinomaly_competition_seen50_vitl448/
+├── competition_data_audit.json
+├── competition_pipeline_state.json
+├── checkpoints/final_model.pt
+└── competition_submission/
+    ├── latest.json
+    └── <签名>/
+        ├── result.json
+        ├── package/
+        │   ├── submission.csv
+        │   └── predicted_masks/<类别>/Sxxxx/0_mask.png ... 4_mask.png
+        └── submission.zip
+```
+
+`submission.zip` 已检查 CSV 行数/顺序、分数范围、全部 448 × 448 单通道 mask、
+ZIP 根目录结构和 CRC，可直接手动上传。推理按类别落盘；中断后重复同一命令会跳过
+已完整生成的类别。单张大显存 GPU 运行时可覆盖设备列表和推理 batch；训练仍用
+梯度累计保持全局 effective batch 64：
+
+```powershell
+python run_competition_pipeline.py `
+  --set runtime.device_ids=[0] `
+  --set submission.batch_size=2
+```

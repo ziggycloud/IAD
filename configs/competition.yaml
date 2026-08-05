@@ -1,0 +1,101 @@
+experiment:
+  name: generalized_dinomaly_competition_seen50_vitl448
+  output_dir: outputs/generalized_dinomaly_competition_seen50_vitl448
+  seed: 20260803
+
+dataset:
+  type: competition_folders
+  train_dir: data/competition/Train
+  test_dir: data/competition/Test_A
+  categories: all
+  category_limit: null
+  expected_categories: 50
+  expected_train_samples_per_category: 20
+  expected_test_samples_per_category: 15
+  image_size: 448
+  crop_size: 448
+  train_mode: all_views
+
+model:
+  # Keep the same category-generalized model used by run_unseen_pipeline.py.
+  architecture: category_generalized
+  backbone: dinov2reg_vit_large_14
+  backbone_weights_dir: third_party/Dinomaly2/backbones/weights
+  dropout: 0.2
+  linear_attention: true
+  loose_constraint_groups: 2
+  loose_loss: true
+  context_aware_recenter: true
+  generalized:
+    latent_dim: 384
+    num_references: 512
+    reference_top_k: 32
+    reference_temperature: 0.1
+    router_top_k: 3
+    router_temperature: 1.0
+    router_trim_ratio: 0.1
+    expert_dropout: 0.1
+    auxiliary_weights:
+      reference_balance: 1.0
+      router_balance: 1.0
+      router_entropy_penalty: 0.05
+      expert_diversity: 0.05
+
+training:
+  # 6k x global batch 64 over 5,000 views is about 76.8 passes.
+  total_steps: 6000
+  effective_batch_size: 64
+  micro_batch_size: auto
+  batch_candidates: [16, 8, 4, 2, 1]
+  memory_headroom_mb: 3000
+  amp: true
+  amp_dtype: bfloat16
+  learning_rate: 0.001
+  first_bottleneck_lr_scale: 0.2
+  weight_decay: 0.0001
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-10
+  warmup_steps: 300
+  lr_step_offset: 1
+  final_lr_ratio: 0.1
+  loose_loss_warmup_steps: 800
+  loose_loss_final_discard: 0.9
+  generalized_regularization_weight: 0.01
+  gradient_clip_norm: 0.1
+  log_every: 20
+  checkpoint_every: 250
+  auto_resume: true
+
+evaluation:
+  # Used by competition inference; no labels or local metrics are required.
+  amp: true
+  batch_size: 4
+  num_workers: 4
+  resize_mask: 448
+  image_top_ratio: 0.01
+  object_top_ratio: 0.01
+  gaussian_kernel_size: 5
+  gaussian_sigma: 4.0
+  metric_bins: 1000
+  resume: true
+
+submission:
+  mask_size: 448
+  batch_size: 4
+  num_workers: 4
+  object_top_ratio: 0.01
+  # Per-category monotonic 8-bit calibration. The extreme upper quantile keeps
+  # anomalous peaks from being collapsed while using the PNG range efficiently.
+  lower_quantile: 0.001
+  upper_quantile: 0.99999
+
+runtime:
+  device: cuda:0
+  multi_gpu_strategy: auto
+  distributed_backend: auto
+  device_ids: [0, 1]
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  deterministic: false

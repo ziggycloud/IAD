@@ -21,6 +21,7 @@ from .config import (
     config_fingerprint,
     dump_resolved_config,
 )
+from .competition_data import build_competition_train_dataset
 from .data import build_train_dataset, discover_categories
 from .losses import discard_rate_for_step, reconstruction_loss
 from .modeling import (
@@ -872,53 +873,67 @@ def _train_impl(
     }
     logger.info("环境：%s", environment)
 
-    json_dir = Path(config["dataset"]["json_dir"])
-    raw_image_dir = Path(config["dataset"]["image_dir"])
-    configured_train_dir = config["dataset"].get("train_image_dir")
-    image_dir = (
-        Path(configured_train_dir)
-        if configured_train_dir
-        else raw_image_dir
-    )
-    if configured_train_dir and not image_dir.is_dir():
-        message = (
-            "Configured dataset.train_image_dir does not exist: "
-            f"{image_dir}. Run prepare_cache.ps1 first, or use "
-            "the matching non-cached config (for example "
-            "configs/rtx3060ti_strict_upstream.yaml) to train from raw images."
+    dataset_config = config["dataset"]
+    dataset_type = str(dataset_config.get("type", "realiad_variety"))
+    if dataset_type == "competition_folders":
+        image_dir = Path(dataset_config["train_dir"])
+        dataset, competition_manifest = build_competition_train_dataset(
+            train_dir=image_dir,
+            categories=dataset_config["categories"],
+            category_limit=dataset_config.get("category_limit"),
+            image_size=int(dataset_config["image_size"]),
+            crop_size=int(dataset_config["crop_size"]),
         )
-        logger.error(message)
-        if context.is_primary:
-            atomic_write_json(
-                state_path,
-                {
-                    "status": "failed",
-                    "updated_at": utc_now(),
-                    "experiment": config["experiment"]["name"],
-                    "config": config["_meta"]["config_path"],
-                    "output_dir": str(output_dir),
-                    "completed_steps": 0,
-                    "total_steps": int(config["training"]["total_steps"]),
-                    "last_error": message,
-                    "next_action": (
-                        "Run prepare_cache.ps1 to completion, then restart "
-                        "training; or select the raw-image config."
-                    ),
-                },
+        categories = list(competition_manifest.categories)
+    else:
+        json_dir = Path(dataset_config["json_dir"])
+        raw_image_dir = Path(dataset_config["image_dir"])
+        configured_train_dir = dataset_config.get("train_image_dir")
+        image_dir = (
+            Path(configured_train_dir)
+            if configured_train_dir
+            else raw_image_dir
+        )
+        if configured_train_dir and not image_dir.is_dir():
+            message = (
+                "Configured dataset.train_image_dir does not exist: "
+                f"{image_dir}. Run prepare_cache.ps1 first, or use "
+                "the matching non-cached config (for example "
+                "configs/rtx3060ti_strict_upstream.yaml) to train from raw "
+                "images."
             )
-        raise FileNotFoundError(message)
-    categories = discover_categories(
-        json_dir,
-        requested=config["dataset"]["categories"],
-        limit=config["dataset"].get("category_limit"),
-    )
-    dataset = build_train_dataset(
-        json_dir=json_dir,
-        image_dir=image_dir,
-        categories=categories,
-        image_size=int(config["dataset"]["image_size"]),
-        crop_size=int(config["dataset"]["crop_size"]),
-    )
+            logger.error(message)
+            if context.is_primary:
+                atomic_write_json(
+                    state_path,
+                    {
+                        "status": "failed",
+                        "updated_at": utc_now(),
+                        "experiment": config["experiment"]["name"],
+                        "config": config["_meta"]["config_path"],
+                        "output_dir": str(output_dir),
+                        "completed_steps": 0,
+                        "total_steps": int(config["training"]["total_steps"]),
+                        "last_error": message,
+                        "next_action": (
+                            "Run prepare_cache.ps1 to completion, then restart "
+                            "training; or select the raw-image config."
+                        ),
+                    },
+                )
+            raise FileNotFoundError(message)
+        categories = discover_categories(
+            json_dir,
+            requested=dataset_config["categories"],
+            limit=dataset_config.get("category_limit"),
+        )
+        dataset = build_train_dataset(
+            json_dir=json_dir,
+            image_dir=image_dir,
+            categories=categories,
+            image_size=int(dataset_config["image_size"]),
+            crop_size=int(dataset_config["crop_size"]),
+        )
     logger.info(
         "训练 manifest：%d 类，%d 张正常视图",
         len(categories),

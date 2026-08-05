@@ -53,8 +53,15 @@ def _validate(config: dict[str, Any]) -> None:
         raise ValueError(f"配置缺少 section：{', '.join(missing)}")
 
     dataset = config["dataset"]
-    if dataset.get("type") != "realiad_variety":
-        raise ValueError("当前适配器仅支持 dataset.type=realiad_variety")
+    dataset_type = str(dataset.get("type", ""))
+    if dataset_type not in {"realiad_variety", "competition_folders"}:
+        raise ValueError(
+            "dataset.type 必须是 realiad_variety 或 competition_folders"
+        )
+    if dataset_type == "competition_folders":
+        for key in ("train_dir", "test_dir"):
+            if not isinstance(dataset.get(key), (str, Path)):
+                raise ValueError(f"dataset.{key} must be a path")
     image_size = int(dataset["image_size"])
     crop_size = int(dataset["crop_size"])
     if image_size <= 0 or crop_size <= 0 or crop_size > image_size:
@@ -95,6 +102,20 @@ def _validate(config: dict[str, Any]) -> None:
         raise ValueError("image_top_ratio 必须位于 (0, 1]")
     if int(evaluation["metric_bins"]) < 5:
         raise ValueError("metric_bins 不能小于 5")
+    submission = config.get("submission")
+    if dataset_type == "competition_folders":
+        if not isinstance(submission, dict):
+            raise ValueError(
+                "competition_folders 配置必须包含 submission section"
+            )
+        if int(submission.get("mask_size", 448)) != 448:
+            raise ValueError("比赛要求 submission.mask_size 固定为 448")
+        lower = float(submission.get("lower_quantile", 0.001))
+        upper = float(submission.get("upper_quantile", 0.99999))
+        if not 0.0 <= lower < upper <= 1.0:
+            raise ValueError(
+                "submission quantiles must satisfy 0 <= lower < upper <= 1"
+            )
     cache = config.get("cache")
     if cache is not None:
         if "output_dir" not in cache:
@@ -121,24 +142,33 @@ def load_config(path: str | Path, overrides: Iterable[str] = ()) -> dict[str, An
 
 
 def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
+    dataset = config["dataset"]
     paths = {
-        "json_dir": resolve_path(config["dataset"]["json_dir"]),
-        "image_dir": resolve_path(config["dataset"]["image_dir"]),
         "output_dir": resolve_path(config["experiment"]["output_dir"]),
         "backbone_weights_dir": resolve_path(config["model"]["backbone_weights_dir"]),
     }
-    if config["dataset"].get("train_image_dir"):
-        paths["train_image_dir"] = resolve_path(
-            config["dataset"]["train_image_dir"]
-        )
+    if dataset.get("type") == "competition_folders":
+        paths["train_dir"] = resolve_path(dataset["train_dir"])
+        paths["test_dir"] = resolve_path(dataset["test_dir"])
+    else:
+        paths["json_dir"] = resolve_path(dataset["json_dir"])
+        paths["image_dir"] = resolve_path(dataset["image_dir"])
+        if dataset.get("train_image_dir"):
+            paths["train_image_dir"] = resolve_path(
+                dataset["train_image_dir"]
+            )
     return paths
 
 
 def materialize_paths(config: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(config)
     paths = resolved_paths(result)
-    result["dataset"]["json_dir"] = str(paths["json_dir"])
-    result["dataset"]["image_dir"] = str(paths["image_dir"])
+    if result["dataset"].get("type") == "competition_folders":
+        result["dataset"]["train_dir"] = str(paths["train_dir"])
+        result["dataset"]["test_dir"] = str(paths["test_dir"])
+    else:
+        result["dataset"]["json_dir"] = str(paths["json_dir"])
+        result["dataset"]["image_dir"] = str(paths["image_dir"])
     if "train_image_dir" in paths:
         result["dataset"]["train_image_dir"] = str(paths["train_image_dir"])
     result["experiment"]["output_dir"] = str(paths["output_dir"])
@@ -158,6 +188,7 @@ def semantic_config(config: dict[str, Any]) -> dict[str, Any]:
                 "json_dir",
                 "image_dir",
                 "train_image_dir",
+                "train_dir",
                 "categories",
                 "category_limit",
                 "image_size",
