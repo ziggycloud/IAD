@@ -66,6 +66,8 @@ class GaussianFilter(nn.Module):
         super().__init__()
         if kernel_size <= 0 or kernel_size % 2 == 0:
             raise ValueError("Gaussian kernel_size 必须是正奇数")
+        if sigma < 0:
+            raise ValueError("Gaussian sigma must be >= 0")
         coordinates = torch.arange(kernel_size, dtype=torch.float32)
         coordinates -= kernel_size // 2
         grid_y, grid_x = torch.meshgrid(
@@ -73,8 +75,14 @@ class GaussianFilter(nn.Module):
             coordinates,
             indexing="ij",
         )
-        kernel = torch.exp(-(grid_x.square() + grid_y.square()) / (2 * sigma**2))
-        kernel /= kernel.sum()
+        if sigma == 0:
+            kernel = torch.zeros_like(grid_x)
+            kernel[kernel_size // 2, kernel_size // 2] = 1.0
+        else:
+            kernel = torch.exp(
+                -(grid_x.square() + grid_y.square()) / (2 * sigma**2)
+            )
+            kernel /= kernel.sum()
         self.register_buffer("weight", kernel.reshape(1, 1, kernel_size, kernel_size))
         self.padding = kernel_size // 2
 

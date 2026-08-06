@@ -87,6 +87,77 @@ def _validate(config: dict[str, Any]) -> None:
     if int(training["total_steps"]) <= 0:
         raise ValueError("total_steps 必须为正整数")
 
+    if float(training["learning_rate"]) <= 0:
+        raise ValueError("training.learning_rate must be > 0")
+    if float(training["adam_epsilon"]) <= 0:
+        raise ValueError("training.adam_epsilon must be > 0")
+    if float(training["gradient_clip_norm"]) <= 0:
+        raise ValueError("training.gradient_clip_norm must be > 0")
+
+    optimizer = training.get("optimizer", {})
+    if not isinstance(optimizer, dict):
+        raise ValueError("training.optimizer must be a mapping")
+    optimizer_type = str(optimizer.get("type", "stable_adamw")).lower()
+    if optimizer_type not in {"stable_adamw", "adamw", "adam"}:
+        raise ValueError(
+            "training.optimizer.type must be stable_adamw, adamw, or adam"
+        )
+    if float(optimizer.get("stable_clip_threshold", 1.0)) <= 0:
+        raise ValueError("training.optimizer.stable_clip_threshold must be > 0")
+
+    scheduler = training.get("scheduler", {})
+    if not isinstance(scheduler, dict):
+        raise ValueError("training.scheduler must be a mapping")
+    scheduler_type = str(scheduler.get("type", "cosine")).lower()
+    if scheduler_type not in {
+        "cosine", "linear", "polynomial", "constant", "step", "multistep"
+    }:
+        raise ValueError(
+            "training.scheduler.type must be cosine, linear, polynomial, "
+            "constant, step, or multistep"
+        )
+    scheduler_warmup = int(
+        scheduler.get("warmup_steps", training.get("warmup_steps", 0))
+    )
+    scheduler_min_ratio = float(
+        scheduler.get("min_lr_ratio", training.get("final_lr_ratio", 1.0))
+    )
+    if scheduler_warmup < 0:
+        raise ValueError("training.scheduler.warmup_steps must be >= 0")
+    if not 0.0 <= scheduler_min_ratio <= 1.0:
+        raise ValueError("training.scheduler.min_lr_ratio must be in [0, 1]")
+    if scheduler_type == "polynomial" and float(
+        scheduler.get("power", 1.0)
+    ) <= 0:
+        raise ValueError("training.scheduler.power must be > 0")
+    if scheduler_type == "step" and int(
+        scheduler.get("step_size", 1000)
+    ) <= 0:
+        raise ValueError("training.scheduler.step_size must be > 0")
+    if scheduler_type in {"step", "multistep"} and not 0.0 < float(
+        scheduler.get("gamma", 0.1)
+    ) <= 1.0:
+        raise ValueError("training.scheduler.gamma must be in (0, 1]")
+    milestones = scheduler.get("milestones", [])
+    if scheduler_type == "multistep" and (
+        not isinstance(milestones, list)
+        or any(int(value) <= 0 for value in milestones)
+    ):
+        raise ValueError(
+            "training.scheduler.milestones must be a list of positive steps"
+        )
+
+    gradient_guard = training.get("gradient_guard", {})
+    if not isinstance(gradient_guard, dict):
+        raise ValueError("training.gradient_guard must be a mapping")
+    skip_step_norm = gradient_guard.get("skip_step_norm")
+    if skip_step_norm is not None and float(skip_step_norm) <= 0:
+        raise ValueError("training.gradient_guard.skip_step_norm must be > 0 or null")
+    if int(gradient_guard.get("max_consecutive_skips", 3)) < 0:
+        raise ValueError(
+            "training.gradient_guard.max_consecutive_skips must be >= 0"
+        )
+
     if float(training.get("generalized_regularization_weight", 0.0)) < 0:
         raise ValueError("generalized_regularization_weight must be >= 0")
 
@@ -95,6 +166,23 @@ def _validate(config: dict[str, Any]) -> None:
         raise ValueError("image_top_ratio 必须位于 (0, 1]")
     if int(evaluation["metric_bins"]) < 5:
         raise ValueError("metric_bins 不能小于 5")
+    gaussian_kernel_size = int(evaluation["gaussian_kernel_size"])
+    if gaussian_kernel_size <= 0 or gaussian_kernel_size % 2 == 0:
+        raise ValueError("evaluation.gaussian_kernel_size must be positive and odd")
+    if float(evaluation["gaussian_sigma"]) < 0:
+        raise ValueError("evaluation.gaussian_sigma must be >= 0")
+    layer_weights = evaluation.get("anomaly_map_layer_weights")
+    if layer_weights is not None:
+        if (
+            not isinstance(layer_weights, list)
+            or not layer_weights
+            or any(float(value) < 0 for value in layer_weights)
+            or sum(float(value) for value in layer_weights) <= 0
+        ):
+            raise ValueError(
+                "evaluation.anomaly_map_layer_weights must be a non-empty "
+                "list of non-negative values with a positive sum"
+            )
     cache = config.get("cache")
     if cache is not None:
         if "output_dir" not in cache:
@@ -150,6 +238,22 @@ def materialize_paths(config: dict[str, Any]) -> dict[str, Any]:
 
 def semantic_config(config: dict[str, Any]) -> dict[str, Any]:
     """Return the fields that must match when resuming a training run."""
+    training_semantics = {
+        key: config["training"].get(key)
+        for key in (
+            "total_steps", "effective_batch_size", "amp", "amp_dtype",
+            "learning_rate", "first_bottleneck_lr_scale", "weight_decay",
+            "adam_betas", "adam_epsilon", "warmup_steps", "lr_step_offset",
+            "final_lr_ratio", "loose_loss_warmup_steps",
+            "loose_loss_final_discard", "generalized_regularization_weight",
+            "gradient_clip_norm",
+        )
+    }
+    for optional_key in ("optimizer", "scheduler", "gradient_guard"):
+        if optional_key in config["training"]:
+            training_semantics[optional_key] = copy.deepcopy(
+                config["training"][optional_key]
+            )
     return {
         "dataset": {
             key: config["dataset"].get(key)
@@ -169,27 +273,7 @@ def semantic_config(config: dict[str, Any]) -> dict[str, Any]:
             )
         },
         "model": copy.deepcopy(config["model"]),
-        "training": {
-            key: config["training"].get(key)
-            for key in (
-                "total_steps",
-                "effective_batch_size",
-                "amp",
-                "amp_dtype",
-                "learning_rate",
-                "first_bottleneck_lr_scale",
-                "weight_decay",
-                "adam_betas",
-                "adam_epsilon",
-                "warmup_steps",
-                "lr_step_offset",
-                "final_lr_ratio",
-                "loose_loss_warmup_steps",
-                "loose_loss_final_discard",
-                "generalized_regularization_weight",
-                "gradient_clip_norm",
-            )
-        },
+        "training": training_semantics,
         "seed": config["experiment"]["seed"],
     }
 

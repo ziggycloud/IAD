@@ -324,6 +324,34 @@ def _trainable_parameters(bundle: ModelBundle) -> list[torch.nn.Parameter]:
     ]
 
 
+def _optimizer_group_gradient_norms(optimizer) -> dict[str, float]:
+    """Return pre-clipping L2 norms, grouped for spike diagnosis."""
+    result: dict[str, float] = {}
+    for index, group in enumerate(optimizer.param_groups):
+        norms = [
+            parameter.grad.detach().norm(2)
+            for parameter in group["params"]
+            if parameter.grad is not None
+        ]
+        if norms:
+            total = torch.stack(norms).norm(2)
+            value = float(total.detach().cpu())
+        else:
+            value = 0.0
+        result[str(group.get("group_name", f"group_{index}"))] = value
+    return result
+
+
+def _gradient_step_should_be_skipped(
+    grad_norm: float,
+    gradient_guard: dict[str, Any],
+) -> bool:
+    if not math.isfinite(grad_norm):
+        return True
+    threshold = gradient_guard.get("skip_step_norm")
+    return threshold is not None and grad_norm > float(threshold)
+
+
 def _run_probe(
     bundle: ModelBundle,
     config: dict[str, Any],
@@ -811,6 +839,14 @@ def _distributed_mean(value: float, context: DistributedContext) -> float:
     return float(tensor.cpu())
 
 
+def _distributed_max(value: float, context: DistributedContext) -> float:
+    if not context.is_ddp:
+        return value
+    tensor = torch.tensor(value, dtype=torch.float64, device=context.device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return float(tensor.cpu())
+
+
 def _assert_finite_on_all_ranks(
     loss: torch.Tensor,
     context: DistributedContext,
@@ -1089,18 +1125,36 @@ def _train_impl(
         )
         started = time.perf_counter()
         interval_started = started
+        consecutive_skipped_steps = 0
 
         try:
             for step_index in range(completed_steps, total_steps):
+                scheduler_config = dict(
+                    config["training"].get("scheduler", {})
+                )
                 learning_rates = set_learning_rate(
                     optimizer=optimizer,
                     completed_steps=step_index,
                     total_steps=total_steps,
-                    warmup_steps=int(config["training"]["warmup_steps"]),
-                    final_ratio=float(config["training"]["final_lr_ratio"]),
-                    step_offset=int(
-                        config["training"].get("lr_step_offset", 1)
+                    warmup_steps=int(
+                        scheduler_config.get(
+                            "warmup_steps",
+                            config["training"].get("warmup_steps", 0),
+                        )
                     ),
+                    final_ratio=float(
+                        scheduler_config.get(
+                            "min_lr_ratio",
+                            config["training"].get("final_lr_ratio", 1.0),
+                        )
+                    ),
+                    step_offset=int(
+                        scheduler_config.get(
+                            "step_offset",
+                            config["training"].get("lr_step_offset", 1),
+                        )
+                    ),
+                    scheduler_config=scheduler_config,
                 )
                 optimizer.zero_grad(set_to_none=True)
                 accumulated_loss = 0.0
@@ -1179,19 +1233,55 @@ def _train_impl(
 
                 if scaler.is_enabled():
                     scaler.unscale_(optimizer)
+                gradient_clip_norm = float(
+                    config["training"]["gradient_clip_norm"]
+                )
                 grad_norm = clip_grad_norm_(
                     trainable_parameters,
-                    max_norm=float(config["training"]["gradient_clip_norm"]),
+                    max_norm=gradient_clip_norm,
+                    error_if_nonfinite=False,
                 )
-                scaler.step(optimizer)
-                scaler.update()
+                grad_norm_value = float(
+                    grad_norm.detach().cpu()
+                    if torch.is_tensor(grad_norm)
+                    else grad_norm
+                )
+                grad_norm_value = _distributed_max(grad_norm_value, context)
+                gradient_guard = dict(
+                    config["training"].get("gradient_guard", {})
+                )
+                if not math.isfinite(grad_norm_value) and bool(
+                    gradient_guard.get("fail_on_nonfinite", True)
+                ):
+                    raise FloatingPointError(
+                        f"step={step_index} produced non-finite gradients"
+                    )
+                skip_optimizer_step = _gradient_step_should_be_skipped(
+                    grad_norm_value,
+                    gradient_guard,
+                )
+                next_completed_steps = step_index + 1
+                scheduled_log = (
+                    next_completed_steps == 1
+                    or next_completed_steps % log_every == 0
+                    or next_completed_steps == total_steps
+                )
+                gradient_group_norms = (
+                    _optimizer_group_gradient_norms(optimizer)
+                    if scheduled_log or skip_optimizer_step
+                    else {}
+                )
+                if skip_optimizer_step:
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                    consecutive_skipped_steps += 1
+                else:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    consecutive_skipped_steps = 0
                 completed_steps = step_index + 1
 
-                should_log = (
-                    completed_steps == 1
-                    or completed_steps % log_every == 0
-                    or completed_steps == total_steps
-                )
+                should_log = scheduled_log or skip_optimizer_step
                 if should_log:
                     mean_loss = _distributed_mean(
                         accumulated_loss
@@ -1239,10 +1329,20 @@ def _train_impl(
                             regularization_weight
                         ),
                         "auxiliary_losses": mean_auxiliary,
-                        "grad_norm": float(
-                            grad_norm.detach().cpu()
-                            if torch.is_tensor(grad_norm)
-                            else grad_norm
+                        # clip_grad_norm_ returns the norm before clipping.
+                        "grad_norm": grad_norm_value,
+                        "grad_norm_pre_clip": grad_norm_value,
+                        "gradient_clip_norm": gradient_clip_norm,
+                        "gradient_clip_scale": (
+                            min(1.0, gradient_clip_norm / grad_norm_value)
+                            if math.isfinite(grad_norm_value)
+                            and grad_norm_value > 0
+                            else 0.0
+                        ),
+                        "gradient_group_norms": gradient_group_norms,
+                        "optimizer_step_skipped": skip_optimizer_step,
+                        "consecutive_skipped_steps": (
+                            consecutive_skipped_steps
                         ),
                         "learning_rates": learning_rates,
                         "discard_rate": discard_rate,
@@ -1264,12 +1364,15 @@ def _train_impl(
                     if context.is_primary:
                         append_jsonl(progress_path, payload)
                     logger.info(
-                        "step %d/%d | loss %.6f | lr %.3e | grad %.4f | ETA %.1fh",
+                        "step %d/%d | loss %.6f | lr %.3e | grad_preclip %.4f "
+                        "| clipped_to %.4f | skipped %s | ETA %.1fh",
                         completed_steps,
                         total_steps,
                         payload["loss"],
                         learning_rates[-1],
                         payload["grad_norm"],
+                        gradient_clip_norm,
+                        skip_optimizer_step,
                         eta_seconds / 3600,
                     )
                     state.update(
@@ -1290,6 +1393,21 @@ def _train_impl(
                     if context.is_primary:
                         atomic_write_json(state_path, state)
                     interval_started = now
+
+                max_consecutive_skips = int(
+                    gradient_guard.get("max_consecutive_skips", 3)
+                )
+                if (
+                    skip_optimizer_step
+                    and max_consecutive_skips > 0
+                    and consecutive_skipped_steps >= max_consecutive_skips
+                ):
+                    raise FloatingPointError(
+                        "gradient guard stopped training after "
+                        f"{consecutive_skipped_steps} consecutive skipped "
+                        f"optimizer steps at step={completed_steps}; "
+                        f"last pre-clip norm={grad_norm_value:.6g}"
+                    )
 
                 if (
                     completed_steps % checkpoint_every == 0

@@ -84,9 +84,22 @@ def anomaly_map(
     encoder_features: list[torch.Tensor],
     decoder_features: list[torch.Tensor],
     output_size: int | tuple[int, int],
+    layer_weights: list[float] | None = None,
+    align_corners: bool = True,
 ) -> torch.Tensor:
     if isinstance(output_size, int):
         output_size = (output_size, output_size)
+    if layer_weights is None:
+        weights = [1.0] * len(encoder_features)
+    else:
+        weights = [float(value) for value in layer_weights]
+        if len(weights) != len(encoder_features):
+            raise ValueError(
+                "anomaly_map layer_weights length must match feature groups: "
+                f"{len(weights)} != {len(encoder_features)}"
+            )
+        if any(value < 0 for value in weights) or sum(weights) <= 0:
+            raise ValueError("anomaly_map layer_weights must be non-negative")
     maps: list[torch.Tensor] = []
     for encoder_feature, decoder_feature in zip(
         encoder_features,
@@ -102,7 +115,9 @@ def anomaly_map(
             current.unsqueeze(1),
             size=output_size,
             mode="bilinear",
-            align_corners=True,
+            align_corners=align_corners,
         )
         maps.append(current)
-    return torch.cat(maps, dim=1).mean(dim=1, keepdim=True)
+    stacked = torch.cat(maps, dim=1)
+    weight_tensor = stacked.new_tensor(weights).view(1, -1, 1, 1)
+    return (stacked * weight_tensor).sum(dim=1, keepdim=True) / sum(weights)

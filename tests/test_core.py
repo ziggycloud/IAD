@@ -15,12 +15,17 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from realiad_dinomaly2.data import Record, mask_transform
 from realiad_dinomaly2.metrics import (
+    GaussianFilter,
     SpoolingPixelMetricAccumulator,
     binary_metrics,
     top_ratio_mean,
 )
+from realiad_dinomaly2.losses import anomaly_map
 from realiad_dinomaly2.modeling import set_learning_rate
-from realiad_dinomaly2.train_engine import DeterministicIterationBatchSampler
+from realiad_dinomaly2.train_engine import (
+    DeterministicIterationBatchSampler,
+    _gradient_step_should_be_skipped,
+)
 
 
 class DataTests(unittest.TestCase):
@@ -81,6 +86,11 @@ class SamplerTests(unittest.TestCase):
 
 
 class MetricTests(unittest.TestCase):
+    def test_zero_sigma_disables_gaussian_smoothing(self) -> None:
+        maps = torch.rand(2, 1, 5, 5)
+        filtered = GaussianFilter(kernel_size=5, sigma=0.0)(maps)
+        self.assertTrue(torch.equal(filtered, maps))
+
     def test_binary_metrics_perfect(self) -> None:
         result = binary_metrics([0, 0, 1, 1], [0.1, 0.2, 0.8, 0.9])
         self.assertEqual(result, {"auroc": 1.0, "aupr": 1.0, "f1max": 1.0})
@@ -166,6 +176,47 @@ class ScheduleTests(unittest.TestCase):
             step_offset=0,
         )
         self.assertEqual(first[0], 0.0)
+
+    def test_yaml_linear_scheduler(self) -> None:
+        parameter = torch.nn.Parameter(torch.tensor(0.0))
+        optimizer = torch.optim.SGD(
+            [{"params": [parameter], "lr": 2.0, "initial_lr": 2.0}]
+        )
+        middle = set_learning_rate(
+            optimizer,
+            completed_steps=49,
+            total_steps=100,
+            warmup_steps=0,
+            final_ratio=0.1,
+            scheduler_config={"type": "linear"},
+        )
+        self.assertAlmostEqual(middle[0], 1.1)
+
+
+class StabilityTests(unittest.TestCase):
+    def test_gradient_guard_skips_catastrophic_norms(self) -> None:
+        guard = {"skip_step_norm": 1.0}
+        self.assertFalse(_gradient_step_should_be_skipped(0.9, guard))
+        self.assertTrue(_gradient_step_should_be_skipped(40.0, guard))
+        self.assertTrue(_gradient_step_should_be_skipped(float("nan"), guard))
+
+    def test_anomaly_map_layer_weights(self) -> None:
+        encoder = [
+            torch.tensor([[[[1.0]], [[0.0]]]]),
+            torch.tensor([[[[1.0]], [[0.0]]]]),
+        ]
+        decoder = [
+            torch.tensor([[[[0.0]], [[1.0]]]]),
+            torch.tensor([[[[1.0]], [[0.0]]]]),
+        ]
+        result = anomaly_map(
+            encoder,
+            decoder,
+            output_size=2,
+            layer_weights=[0.25, 0.75],
+            align_corners=False,
+        )
+        self.assertTrue(torch.allclose(result, torch.full_like(result, 0.25)))
 
 
 if __name__ == "__main__":
