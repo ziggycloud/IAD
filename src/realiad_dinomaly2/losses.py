@@ -22,6 +22,7 @@ def reconstruction_loss(
     discard_rate: float,
     loose_loss: bool,
     discarded_gradient_factor: float = 0.1,
+    valid_view_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if len(encoder_features) != len(decoder_features):
         raise ValueError("encoder/decoder feature groups 数量不一致")
@@ -31,6 +32,29 @@ def reconstruction_loss(
         decoder_features,
         strict=True,
     ):
+        if encoder_feature.shape != decoder_feature.shape:
+            raise ValueError("encoder/decoder feature shapes do not match")
+        if encoder_feature.ndim == 5:
+            batch_size, view_count = encoder_feature.shape[:2]
+            encoder_feature = encoder_feature.reshape(
+                batch_size * view_count, *encoder_feature.shape[2:]
+            )
+            decoder_feature = decoder_feature.reshape(
+                batch_size * view_count, *decoder_feature.shape[2:]
+            )
+            if valid_view_mask is not None:
+                if valid_view_mask.shape != (batch_size, view_count):
+                    raise ValueError("valid_view_mask must have shape [B, V]")
+                selected = valid_view_mask.reshape(-1).to(
+                    device=encoder_feature.device,
+                    dtype=torch.bool,
+                )
+                if not bool(selected.any()):
+                    raise ValueError("reconstruction loss has no valid views")
+                encoder_feature = encoder_feature[selected]
+                decoder_feature = decoder_feature[selected]
+        elif encoder_feature.ndim != 4:
+            raise ValueError("features must have shape [B,C,H,W] or [B,V,C,H,W]")
         target = encoder_feature.detach()
         if loose_loss:
             with torch.no_grad():
@@ -101,11 +125,29 @@ def anomaly_map(
         if any(value < 0 for value in weights) or sum(weights) <= 0:
             raise ValueError("anomaly_map layer_weights must be non-negative")
     maps: list[torch.Tensor] = []
+    multi_view_shape: tuple[int, int] | None = None
     for encoder_feature, decoder_feature in zip(
         encoder_features,
         decoder_features,
         strict=True,
     ):
+        if encoder_feature.shape != decoder_feature.shape:
+            raise ValueError("encoder/decoder feature shapes do not match")
+        if encoder_feature.ndim == 5:
+            batch_size, view_count = encoder_feature.shape[:2]
+            current_shape = (batch_size, view_count)
+            if multi_view_shape is None:
+                multi_view_shape = current_shape
+            elif multi_view_shape != current_shape:
+                raise ValueError("multi-view feature groups have inconsistent shapes")
+            encoder_feature = encoder_feature.reshape(
+                batch_size * view_count, *encoder_feature.shape[2:]
+            )
+            decoder_feature = decoder_feature.reshape(
+                batch_size * view_count, *decoder_feature.shape[2:]
+            )
+        elif encoder_feature.ndim != 4:
+            raise ValueError("features must have shape [B,C,H,W] or [B,V,C,H,W]")
         current = 1.0 - F.cosine_similarity(
             encoder_feature,
             decoder_feature,
@@ -120,4 +162,7 @@ def anomaly_map(
         maps.append(current)
     stacked = torch.cat(maps, dim=1)
     weight_tensor = stacked.new_tensor(weights).view(1, -1, 1, 1)
-    return (stacked * weight_tensor).sum(dim=1, keepdim=True) / sum(weights)
+    result = (stacked * weight_tensor).sum(dim=1, keepdim=True) / sum(weights)
+    if multi_view_shape is not None:
+        result = result.reshape(*multi_view_shape, *result.shape[1:])
+    return result

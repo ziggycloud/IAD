@@ -126,6 +126,7 @@ from realiad_dinomaly2.eval_engine import evaluate  # noqa: E402
 from realiad_dinomaly2.latency import (  # noqa: E402
     benchmark_single_frame_latency,
 )
+from realiad_dinomaly2.normal_prior import fit_normal_prior  # noqa: E402
 from realiad_dinomaly2.runtime import (  # noqa: E402
     append_jsonl,
     atomic_write_json,
@@ -374,6 +375,24 @@ def main() -> int:
         # rank 0 performs the two resumable evaluations and writes the report.
         if not is_primary:
             return 0
+        checkpoint_path = _checkpoint_path(output_dir, args.checkpoint)
+        if bool(
+            config["evaluation"].get("normal_prior", {}).get("enabled", False)
+        ):
+            _write_state(
+                output_dir,
+                log_path,
+                status="fitting_normal_prior",
+                next_action=(
+                    "Fit/resume Train-normal category/view and view-global priors."
+                ),
+                checkpoint=str(checkpoint_path),
+            )
+            fit_normal_prior(
+                config,
+                checkpoint_path,
+                categories=split.seen,
+            )
         if args.skip_eval:
             _write_state(
                 output_dir,
@@ -422,7 +441,6 @@ def main() -> int:
             _metric_rows(unseen_result),
             split=split,
         )
-        checkpoint_path = _checkpoint_path(output_dir, args.checkpoint)
         latency_summary = None
         if not args.skip_latency:
             _write_state(

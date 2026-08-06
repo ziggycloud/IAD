@@ -214,9 +214,13 @@ python run_unseen_pipeline.py
 ```
 
 它只用固定的 50 个 seen 类 train-good 训练，随后分别评估 seen 和完全未参与训练的
-50 个 unseen 类，并输出 `S_cls`、`S_seg`、`S_zs`、百分制总分及单图延迟判定。
+50 个 unseen 类，并输出 `S_cls`、`S_seg`、`S_zs`、百分制总分及五视角对象延迟判定。
 完整参数、公式和恢复方式见 [UNSEEN_PROTOCOL.md](UNSEEN_PROTOCOL.md)，任务交接状态见
 [UNSEEN_RUN_LOG.md](UNSEEN_RUN_LOG.md)。
+
+真正的五视角 object batch、Set Transformer、visibility-aware adapter、Train-only
+正常边缘先验及消融方式见
+[MULTIVIEW_ARCHITECTURE.md](MULTIVIEW_ARCHITECTURE.md)。
 
 ## 比赛 Train / Test_A 提交流水线
 

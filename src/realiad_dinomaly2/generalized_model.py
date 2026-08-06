@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -25,6 +26,10 @@ DEFAULT_AUXILIARY_WEIGHTS: dict[str, float] = {
     "router_balance": 1.0,
     "router_entropy_penalty": 0.1,
     "expert_diversity": 0.1,
+    "context_consistency": 0.01,
+    "context_variance": 0.001,
+    "visibility_balance": 0.001,
+    "attention_entropy": 0.001,
 }
 
 
@@ -76,6 +81,334 @@ def _robust_token_context(
     kept = order[:, trim : token_count - trim]
     kept = kept.unsqueeze(-1).expand(-1, -1, tokens.shape[-1])
     return tokens.gather(dim=1, index=kept).mean(dim=1)
+
+
+@dataclass
+class MultiViewContextOutput:
+    """Outputs of the category-free multi-view context path."""
+
+    object_context: torch.Tensor
+    cross_view_context: torch.Tensor
+    robust_view_context: torch.Tensor
+    token_dispersion: torch.Tensor
+    visibility_weights: torch.Tensor
+    attention_weights: torch.Tensor
+
+
+class SetAttentionBlock(nn.Module):
+    """Self-attention over camera contexts with explicit missing-view masking."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if dim % num_heads:
+            raise ValueError("SetAttentionBlock dim must be divisible by num_heads")
+        self.input_norm = nn.LayerNorm(dim, eps=1e-6)
+        self.attention = nn.MultiheadAttention(
+            dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attention_dropout = nn.Dropout(dropout)
+        self.output_norm = nn.LayerNorm(dim, eps=1e-6)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 2, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        contexts: torch.Tensor,
+        valid_view_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if contexts.ndim != 3:
+            raise ValueError("contexts must have shape [B, V, C]")
+        if valid_view_mask.shape != contexts.shape[:2]:
+            raise ValueError("valid_view_mask must have shape [B, V]")
+        if bool((~valid_view_mask.any(dim=1)).any()):
+            raise ValueError("every object must contain at least one valid view")
+        normalized = self.input_norm(contexts)
+        attended, weights = self.attention(
+            normalized,
+            normalized,
+            normalized,
+            key_padding_mask=~valid_view_mask,
+            need_weights=True,
+            average_attn_weights=False,
+        )
+        contexts = contexts + self.attention_dropout(attended)
+        contexts = contexts + self.mlp(self.output_norm(contexts))
+        contexts = contexts * valid_view_mask.unsqueeze(-1).to(contexts.dtype)
+        return contexts, weights
+
+
+class VisibilityAwareCrossViewFusion(nn.Module):
+    """Produce per-view conditioning and a reliability-weighted set context."""
+
+    def __init__(self, dim: int, temperature: float = 1.0) -> None:
+        super().__init__()
+        if temperature <= 0:
+            raise ValueError("visibility temperature must be positive")
+        self.temperature = float(temperature)
+        self.reliability = nn.Sequential(
+            nn.LayerNorm(dim * 3, eps=1e-6),
+            nn.Linear(dim * 3, max(32, dim // 2)),
+            nn.GELU(),
+            nn.Linear(max(32, dim // 2), 1),
+        )
+        self.cross_view_projection = nn.Sequential(
+            nn.LayerNorm(dim * 2, eps=1e-6),
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+        )
+
+    def forward(
+        self,
+        robust_context: torch.Tensor,
+        attended_context: torch.Tensor,
+        dispersion: torch.Tensor,
+        valid_view_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits = self.reliability(
+            torch.cat([robust_context, attended_context, dispersion], dim=-1)
+        ).squeeze(-1)
+        logits = logits.float() / self.temperature
+        logits = logits.masked_fill(~valid_view_mask, -torch.inf)
+        visibility = F.softmax(logits, dim=1).to(attended_context.dtype)
+        object_context = (
+            attended_context * visibility.unsqueeze(-1)
+        ).sum(dim=1)
+        expanded = object_context.unsqueeze(1).expand_as(attended_context)
+        cross_view = self.cross_view_projection(
+            torch.cat([attended_context, expanded], dim=-1)
+        )
+        cross_view = cross_view * valid_view_mask.unsqueeze(-1).to(
+            cross_view.dtype
+        )
+        return object_context, cross_view, visibility
+
+
+class MultiViewContextEncoder(nn.Module):
+    """Robust pooling + Set Transformer over a fixed set of camera views."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_views: int = 5,
+        num_layers: int = 2,
+        num_heads: int = 6,
+        trim_ratio: float = 0.1,
+        view_embedding: bool = True,
+        view_dropout_probability: float = 0.2,
+        visibility_temperature: float = 1.0,
+        dropout: float = 0.1,
+        variance_target: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if num_views <= 0:
+            raise ValueError("num_views must be positive")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        if not 0.0 <= view_dropout_probability < 1.0:
+            raise ValueError("view_dropout_probability must be in [0, 1)")
+        self.dim = int(dim)
+        self.num_views = int(num_views)
+        self.trim_ratio = float(trim_ratio)
+        self.view_dropout_probability = float(view_dropout_probability)
+        self.variance_target = float(variance_target)
+        self.view_embedding = (
+            nn.Embedding(self.num_views, self.dim) if view_embedding else None
+        )
+        self.blocks = nn.ModuleList(
+            [
+                SetAttentionBlock(self.dim, num_heads=num_heads, dropout=dropout)
+                for _ in range(num_layers)
+            ]
+        )
+        self.fusion = VisibilityAwareCrossViewFusion(
+            self.dim,
+            temperature=visibility_temperature,
+        )
+        self._last_auxiliary: dict[str, torch.Tensor] = {}
+
+    def _normalize_inputs(
+        self,
+        patch_tokens: torch.Tensor,
+        view_ids: torch.Tensor | None,
+        valid_view_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if patch_tokens.ndim != 4 or patch_tokens.shape[-1] != self.dim:
+            raise ValueError(
+                f"expected [B, V, N, {self.dim}] tokens, got "
+                f"{tuple(patch_tokens.shape)}"
+            )
+        batch_size, view_count = patch_tokens.shape[:2]
+        if view_count != self.num_views:
+            raise ValueError(
+                f"expected {self.num_views} views, got {view_count}"
+            )
+        if view_ids is None:
+            view_ids = torch.arange(view_count, device=patch_tokens.device)
+        view_ids = view_ids.to(device=patch_tokens.device, dtype=torch.long)
+        if view_ids.ndim == 1:
+            view_ids = view_ids.unsqueeze(0).expand(batch_size, -1)
+        if view_ids.shape != (batch_size, view_count):
+            raise ValueError("view_ids must have shape [V] or [B, V]")
+        if bool(((view_ids < 0) | (view_ids >= self.num_views)).any()):
+            raise ValueError("view_ids contain an out-of-range camera index")
+        if valid_view_mask is None:
+            valid_view_mask = torch.ones(
+                (batch_size, view_count),
+                dtype=torch.bool,
+                device=patch_tokens.device,
+            )
+        else:
+            valid_view_mask = valid_view_mask.to(
+                device=patch_tokens.device,
+                dtype=torch.bool,
+            )
+        if valid_view_mask.shape != (batch_size, view_count):
+            raise ValueError("valid_view_mask must have shape [B, V]")
+        if bool((~valid_view_mask.any(dim=1)).any()):
+            raise ValueError("every object must contain at least one valid view")
+        return view_ids, valid_view_mask
+
+    def _encode_once(
+        self,
+        patch_tokens: torch.Tensor,
+        view_ids: torch.Tensor,
+        valid_view_mask: torch.Tensor,
+    ) -> MultiViewContextOutput:
+        batch_size, view_count, token_count, _ = patch_tokens.shape
+        flat = patch_tokens.reshape(batch_size * view_count, token_count, self.dim)
+        robust = _robust_token_context(flat, self.trim_ratio).reshape(
+            batch_size, view_count, self.dim
+        )
+        centered = patch_tokens - robust.unsqueeze(2)
+        dispersion = centered.float().square().mean(dim=2).sqrt().to(
+            patch_tokens.dtype
+        )
+        contexts = robust
+        if self.view_embedding is not None:
+            contexts = contexts + self.view_embedding(view_ids).to(contexts.dtype)
+        contexts = contexts * valid_view_mask.unsqueeze(-1).to(contexts.dtype)
+        attention_weights = contexts.new_zeros(
+            (batch_size, 1, view_count, view_count)
+        )
+        for block in self.blocks:
+            contexts, attention_weights = block(contexts, valid_view_mask)
+        object_context, cross_view, visibility = self.fusion(
+            robust,
+            contexts,
+            dispersion,
+            valid_view_mask,
+        )
+        return MultiViewContextOutput(
+            object_context=object_context,
+            cross_view_context=cross_view,
+            robust_view_context=robust,
+            token_dispersion=dispersion,
+            visibility_weights=visibility,
+            attention_weights=attention_weights,
+        )
+
+    @staticmethod
+    def _drop_views(
+        valid_view_mask: torch.Tensor,
+        probability: float,
+    ) -> torch.Tensor:
+        keep = torch.rand(valid_view_mask.shape, device=valid_view_mask.device)
+        keep = (keep >= probability) & valid_view_mask
+        empty = ~keep.any(dim=1)
+        if bool(empty.any()):
+            for row in empty.nonzero(as_tuple=False).flatten().tolist():
+                candidates = valid_view_mask[row].nonzero(as_tuple=False).flatten()
+                keep[row, int(candidates[0])] = True
+        return keep
+
+    def forward(
+        self,
+        patch_tokens: torch.Tensor,
+        view_ids: torch.Tensor | None = None,
+        valid_view_mask: torch.Tensor | None = None,
+    ) -> MultiViewContextOutput:
+        view_ids, valid_view_mask = self._normalize_inputs(
+            patch_tokens,
+            view_ids,
+            valid_view_mask,
+        )
+        output = self._encode_once(patch_tokens, view_ids, valid_view_mask)
+
+        object_context = output.object_context.float()
+        context_variance = F.relu(
+            self.variance_target
+            - torch.sqrt(object_context.var(dim=0, unbiased=False) + 1e-4)
+        ).mean()
+        valid_float = valid_view_mask.float()
+        observed = valid_float.sum(dim=0)
+        target_usage = observed / observed.sum().clamp_min(1.0)
+        actual_usage = output.visibility_weights.float().sum(dim=0)
+        actual_usage = actual_usage / actual_usage.sum().clamp_min(1e-8)
+        visibility_balance = (
+            (actual_usage - target_usage).square().mean() * self.num_views
+        )
+
+        attention = output.attention_weights.float().clamp_min(0.0)
+        key_mask = valid_view_mask[:, None, None, :]
+        attention = attention * key_mask
+        attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        entropy = -(attention.clamp_min(1e-8) * attention.clamp_min(1e-8).log())
+        entropy = entropy.sum(dim=-1)
+        maximum = valid_view_mask.sum(dim=1).clamp_min(1).float().log()
+        entropy_gap = (maximum[:, None, None] - entropy).clamp_min(0.0)
+        valid_queries = valid_view_mask[:, None, :].expand_as(entropy)
+        attention_entropy = (
+            (entropy_gap * valid_queries).sum()
+            / valid_queries.sum().clamp_min(1)
+        )
+
+        context_consistency = object_context.sum() * 0.0
+        if self.training and self.view_dropout_probability > 0.0:
+            dropped_mask = self._drop_views(
+                valid_view_mask,
+                self.view_dropout_probability,
+            )
+            dropped = self._encode_once(patch_tokens, view_ids, dropped_mask)
+            context_consistency = (
+                1.0
+                - F.cosine_similarity(
+                    output.object_context,
+                    dropped.object_context,
+                    dim=-1,
+                    eps=1e-6,
+                )
+            ).mean()
+        self._last_auxiliary = {
+            "context_consistency": context_consistency,
+            "context_variance": context_variance,
+            "visibility_balance": visibility_balance,
+            "attention_entropy": attention_entropy,
+        }
+        return output
+
+    def auxiliary_losses(
+        self,
+        detach: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        if detach:
+            return {
+                name: value.detach() for name, value in self._last_auxiliary.items()
+            }
+        return dict(self._last_auxiliary)
 
 
 class CompositionalReferenceBank(nn.Module):
@@ -173,6 +506,7 @@ class CategoryFreeRouter(nn.Module):
         top_k: int = 3,
         trim_ratio: float = 0.1,
         dropout: float = 0.0,
+        multi_view_conditioning: bool = False,
     ) -> None:
         super().__init__()
         if num_experts < 2:
@@ -187,9 +521,11 @@ class CategoryFreeRouter(nn.Module):
         self.temperature = float(temperature)
         self.top_k = min(int(top_k), self.num_experts)
         self.trim_ratio = float(trim_ratio)
+        self.multi_view_conditioning = bool(multi_view_conditioning)
+        input_dim = dim * (3 if self.multi_view_conditioning else 2)
         self.network = nn.Sequential(
-            nn.LayerNorm(dim * 2, eps=1e-6),
-            nn.Linear(dim * 2, hidden_dim),
+            nn.LayerNorm(input_dim, eps=1e-6),
+            nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_experts),
@@ -207,17 +543,40 @@ class CategoryFreeRouter(nn.Module):
         nn.init.zeros_(output.weight)
         nn.init.zeros_(output.bias)
 
-    def forward(self, patch_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        patch_tokens: torch.Tensor,
+        view_context: torch.Tensor | None = None,
+        cross_view_context: torch.Tensor | None = None,
+        token_dispersion: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if patch_tokens.ndim != 3 or patch_tokens.shape[-1] != self.dim:
             raise ValueError(
                 f"expected [B, N, {self.dim}] tokens, got "
                 f"{tuple(patch_tokens.shape)}"
             )
-        context = _robust_token_context(patch_tokens, self.trim_ratio)
-        centered = patch_tokens - context.unsqueeze(1)
-        dispersion = centered.float().square().mean(dim=1).sqrt()
-        dispersion = dispersion.to(context.dtype)
-        logits = self.network(torch.cat([context, dispersion], dim=-1))
+        context = (
+            _robust_token_context(patch_tokens, self.trim_ratio)
+            if view_context is None
+            else view_context
+        )
+        if context.shape != (patch_tokens.shape[0], self.dim):
+            raise ValueError("view_context must have shape [B, C]")
+        if token_dispersion is None:
+            centered = patch_tokens - context.unsqueeze(1)
+            token_dispersion = centered.float().square().mean(dim=1).sqrt()
+            token_dispersion = token_dispersion.to(context.dtype)
+        if token_dispersion.shape != context.shape:
+            raise ValueError("token_dispersion must have shape [B, C]")
+        router_inputs = [context]
+        if self.multi_view_conditioning:
+            if cross_view_context is None:
+                cross_view_context = context
+            if cross_view_context.shape != context.shape:
+                raise ValueError("cross_view_context must have shape [B, C]")
+            router_inputs.append(cross_view_context)
+        router_inputs.append(token_dispersion)
+        logits = self.network(torch.cat(router_inputs, dim=-1))
         logits = logits / self.temperature
         if self.top_k < self.num_experts:
             top_values, top_indices = logits.topk(self.top_k, dim=-1)
@@ -338,6 +697,7 @@ class CompositionalNormalityAdapter(nn.Module):
         router_top_k: int = 3,
         router_trim_ratio: float = 0.1,
         dropout: float = 0.0,
+        multi_view_conditioning: bool = False,
     ) -> None:
         super().__init__()
         if num_special_tokens < 0:
@@ -345,6 +705,7 @@ class CompositionalNormalityAdapter(nn.Module):
         self.latent_dim = int(latent_dim)
         self.output_dim = int(output_dim)
         self.num_special_tokens = int(num_special_tokens)
+        self.multi_view_conditioning = bool(multi_view_conditioning)
         self.reference_bank = CompositionalReferenceBank(
             dim=latent_dim,
             num_references=num_references,
@@ -358,6 +719,7 @@ class CompositionalNormalityAdapter(nn.Module):
             top_k=router_top_k,
             trim_ratio=router_trim_ratio,
             dropout=dropout,
+            multi_view_conditioning=self.multi_view_conditioning,
         )
         self.experts = nn.ModuleList(
             [
@@ -382,9 +744,23 @@ class CompositionalNormalityAdapter(nn.Module):
         )
         self.output_norm = nn.LayerNorm(latent_dim, eps=1e-6)
         self.output_projection = nn.Linear(latent_dim, output_dim)
+        self.cross_view_film = (
+            nn.Sequential(
+                nn.LayerNorm(latent_dim * 2, eps=1e-6),
+                nn.Linear(latent_dim * 2, latent_dim * 2),
+            )
+            if self.multi_view_conditioning
+            else None
+        )
         self._last_auxiliary: dict[str, torch.Tensor] = {}
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        view_context: torch.Tensor | None = None,
+        cross_view_context: torch.Tensor | None = None,
+        token_dispersion: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if tokens.ndim != 3 or tokens.shape[-1] != self.latent_dim:
             raise ValueError(
                 f"expected [B, N, {self.latent_dim}] tokens, got "
@@ -396,8 +772,27 @@ class CompositionalNormalityAdapter(nn.Module):
         # Routing reads encoder context, but the experts only receive the
         # normal-reference reconstruction.  There is no encoder-value shortcut.
         patch_tokens = tokens[:, self.num_special_tokens :]
-        routing = self.router(patch_tokens)
+        routing = self.router(
+            patch_tokens,
+            view_context=view_context,
+            cross_view_context=cross_view_context,
+            token_dispersion=token_dispersion,
+        )
         normal_tokens = self.reference_bank(tokens)
+        if self.cross_view_film is not None:
+            if view_context is None or cross_view_context is None:
+                raise ValueError(
+                    "multi-view normality adapter requires view and cross-view context"
+                )
+            scale, shift = self.cross_view_film(
+                torch.cat([view_context, cross_view_context], dim=-1)
+            ).chunk(2, dim=-1)
+            # Context can only softly modulate the normal-reference path.  Raw
+            # encoder patch values are never added to decoder values.
+            normal_tokens = normal_tokens * (
+                1.0 + 0.1 * torch.tanh(scale).unsqueeze(1)
+            )
+            normal_tokens = normal_tokens + 0.1 * torch.tanh(shift).unsqueeze(1)
         expert_outputs = torch.stack(
             [
                 expert(normal_tokens, self.num_special_tokens)
@@ -472,7 +867,7 @@ class CompositionalNormalityAdapter(nn.Module):
 
 
 class GeneralizedDinomaly(nn.Module):
-    """Dinomaly-compatible model with category-generalized bottleneck."""
+    """Dinomaly-compatible model with an optional true multi-view path."""
 
     def __init__(
         self,
@@ -486,11 +881,13 @@ class GeneralizedDinomaly(nn.Module):
         mask_neighbor_size: int = 0,
         remove_class_token: bool = False,
         context_aware_recenter: bool = True,
+        multi_view_context_encoder: MultiViewContextEncoder | None = None,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         self.bottleneck = bottleneck
         self.decoder = decoder
+        self.multi_view_context_encoder = multi_view_context_encoder
         self.target_layers = list(target_layers)
         self.fuse_layer_encoder = [list(group) for group in fuse_layer_encoder]
         self.fuse_layer_decoder = [list(group) for group in fuse_layer_decoder]
@@ -503,6 +900,10 @@ class GeneralizedDinomaly(nn.Module):
                 self.encoder, "n_storage_tokens", 0
             )
 
+    @property
+    def multi_view_enabled(self) -> bool:
+        return self.multi_view_context_encoder is not None
+
     @staticmethod
     def fuse_feature(features: Sequence[torch.Tensor]) -> torch.Tensor:
         if not features:
@@ -512,7 +913,10 @@ class GeneralizedDinomaly(nn.Module):
     def init_weights(self) -> None:
         # Match the upstream Dinomaly initialization for trainable transformer
         # components while preserving the frozen pretrained encoder.
-        for module in (self.bottleneck, self.decoder):
+        trainable_modules = [self.bottleneck, self.decoder]
+        if self.multi_view_context_encoder is not None:
+            trainable_modules.append(self.multi_view_context_encoder)
+        for module in trainable_modules:
             for child in module.modules():
                 if isinstance(child, nn.Linear):
                     nn.init.trunc_normal_(
@@ -531,6 +935,8 @@ class GeneralizedDinomaly(nn.Module):
                         nn.init.zeros_(child.bias)
                     if child.weight is not None:
                         nn.init.ones_(child.weight)
+                elif isinstance(child, nn.Embedding):
+                    nn.init.trunc_normal_(child.weight, std=0.02, a=-0.06, b=0.06)
         for child in self.bottleneck.modules():
             if isinstance(child, CompositionalReferenceBank):
                 child.reset_reference_parameters()
@@ -563,6 +969,8 @@ class GeneralizedDinomaly(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
+        view_ids: torch.Tensor | None = None,
+        valid_view_mask: torch.Tensor | None = None,
         return_auxiliary: bool = False,
     ) -> (
         tuple[list[torch.Tensor], list[torch.Tensor]]
@@ -572,8 +980,33 @@ class GeneralizedDinomaly(nn.Module):
             dict[str, torch.Tensor],
         ]
     ):
+        object_batch_size: int | None = None
+        view_count: int | None = None
+        if self.multi_view_enabled:
+            if images.ndim != 5:
+                raise ValueError(
+                    "multi-view model expects images with shape [B, V, 3, H, W]"
+                )
+            object_batch_size, view_count = images.shape[:2]
+            assert self.multi_view_context_encoder is not None
+            if view_count != self.multi_view_context_encoder.num_views:
+                raise ValueError(
+                    f"expected {self.multi_view_context_encoder.num_views} views, "
+                    f"got {view_count}"
+                )
+            flat_images = images.reshape(
+                object_batch_size * view_count,
+                *images.shape[2:],
+            )
+        else:
+            if images.ndim != 4:
+                raise ValueError(
+                    "single-view model expects images with shape [B, 3, H, W]"
+                )
+            flat_images = images
+
         with torch.no_grad():
-            tokens = self.encoder.prepare_tokens(images)
+            tokens = self.encoder.prepare_tokens(flat_images)
         encoder_layers: list[torch.Tensor] = []
         for index, block in enumerate(self.encoder.blocks):
             if index > self.target_layers[-1]:
@@ -603,8 +1036,43 @@ class GeneralizedDinomaly(nn.Module):
         tokens = self.fuse_feature(
             [bottleneck_layers[index] for index in self.fuse_layer_bottleneck]
         ).detach()
+        context_output: MultiViewContextOutput | None = None
         for block in self.bottleneck:
-            tokens = block(tokens)
+            if self.multi_view_enabled and isinstance(
+                block, CompositionalNormalityAdapter
+            ):
+                assert object_batch_size is not None and view_count is not None
+                assert self.multi_view_context_encoder is not None
+                patch_tokens = tokens[:, block.num_special_tokens :].reshape(
+                    object_batch_size,
+                    view_count,
+                    patch_count,
+                    block.latent_dim,
+                )
+                context_output = self.multi_view_context_encoder(
+                    patch_tokens,
+                    view_ids=view_ids,
+                    valid_view_mask=valid_view_mask,
+                )
+                tokens = block(
+                    tokens,
+                    view_context=context_output.robust_view_context.reshape(
+                        object_batch_size * view_count,
+                        block.latent_dim,
+                    ),
+                    cross_view_context=context_output.cross_view_context.reshape(
+                        object_batch_size * view_count,
+                        block.latent_dim,
+                    ),
+                    token_dispersion=context_output.token_dispersion.reshape(
+                        object_batch_size * view_count,
+                        block.latent_dim,
+                    ),
+                )
+            else:
+                tokens = block(tokens)
+        if self.multi_view_enabled and context_output is None:
+            raise RuntimeError("multi-view context was not connected to the adapter")
 
         attention_mask = None
         if self.mask_neighbor_size > 0:
@@ -638,19 +1106,37 @@ class GeneralizedDinomaly(nn.Module):
         else:
             encoder_features = [feature[:, special:] for feature in encoder_features]
 
-        batch_size = images.shape[0]
+        flat_batch_size = flat_images.shape[0]
         encoder_features = [
             feature.permute(0, 2, 1)
-            .reshape(batch_size, -1, side, side)
+            .reshape(flat_batch_size, -1, side, side)
             .contiguous()
             for feature in encoder_features
         ]
         decoder_features = [
             feature.permute(0, 2, 1)
-            .reshape(batch_size, -1, side, side)
+            .reshape(flat_batch_size, -1, side, side)
             .contiguous()
             for feature in decoder_features
         ]
+        if self.multi_view_enabled:
+            assert object_batch_size is not None and view_count is not None
+            encoder_features = [
+                feature.reshape(
+                    object_batch_size,
+                    view_count,
+                    *feature.shape[1:],
+                )
+                for feature in encoder_features
+            ]
+            decoder_features = [
+                feature.reshape(
+                    object_batch_size,
+                    view_count,
+                    *feature.shape[1:],
+                )
+                for feature in decoder_features
+            ]
         if not return_auxiliary:
             return encoder_features, decoder_features
         # DataParallel cannot reliably expose Python-side state mutated inside
@@ -672,14 +1158,36 @@ class GeneralizedDinomaly(nn.Module):
         self,
         detach: bool = False,
     ) -> dict[str, torch.Tensor]:
+        losses: dict[str, torch.Tensor] = {}
         adapter = self._normality_adapter()
-        return {} if adapter is None else adapter.auxiliary_losses(detach=detach)
+        if adapter is not None:
+            losses.update(adapter.auxiliary_losses(detach=detach))
+        if self.multi_view_context_encoder is not None:
+            losses.update(
+                self.multi_view_context_encoder.auxiliary_losses(detach=detach)
+            )
+        return losses
 
     def regularization_loss(
         self,
         weights: Mapping[str, float] | None = None,
     ) -> torch.Tensor:
-        adapter = self._normality_adapter()
-        if adapter is None:
+        losses = self.auxiliary_losses(detach=False)
+        if not losses:
             return next(self.parameters()).sum() * 0.0
-        return adapter.regularization_loss(weights=weights)
+        return combine_auxiliary_losses(
+            losses,
+            weights=weights,
+            anchor=next(self.parameters()),
+        )
+
+
+class MultiViewGeneralizedDinomaly(GeneralizedDinomaly):
+    """Explicit type for the five-view category-generalized architecture."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        if kwargs.get("multi_view_context_encoder") is None:
+            raise ValueError(
+                "MultiViewGeneralizedDinomaly requires multi_view_context_encoder"
+            )
+        super().__init__(*args, **kwargs)

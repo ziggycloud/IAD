@@ -69,6 +69,41 @@ def _validate(config: dict[str, Any]) -> None:
     if crop_size % 14 != 0:
         raise ValueError("DINOv2/14 要求 crop_size 能被 14 整除")
 
+    model = config["model"]
+    multi_view = model.get("multi_view", {})
+    if not isinstance(multi_view, dict):
+        raise ValueError("model.multi_view must be a mapping")
+    if bool(multi_view.get("enabled", False)):
+        if int(multi_view.get("num_views", 5)) != 5:
+            raise ValueError("the joint architecture requires exactly five views")
+        if int(multi_view.get("context_dim", 0)) <= 0:
+            raise ValueError("model.multi_view.context_dim must be positive")
+        if int(multi_view.get("num_set_layers", 0)) not in {1, 2}:
+            raise ValueError("model.multi_view.num_set_layers must be 1 or 2")
+        heads = int(multi_view.get("num_heads", 0))
+        context_dim = int(multi_view["context_dim"])
+        if heads <= 0 or context_dim % heads:
+            raise ValueError(
+                "model.multi_view.num_heads must divide context_dim"
+            )
+        for key in ("view_dropout_probability", "cross_view_dropout"):
+            value = float(multi_view.get(key, 0.0))
+            if not 0.0 <= value < 1.0:
+                raise ValueError(f"model.multi_view.{key} must be in [0, 1)")
+        if float(multi_view.get("visibility_temperature", 1.0)) <= 0:
+            raise ValueError(
+                "model.multi_view.visibility_temperature must be positive"
+            )
+        if multi_view.get("missing_view_policy", "error") not in {
+            "error",
+            "pad_and_mask",
+            "drop_incomplete",
+        }:
+            raise ValueError(
+                "model.multi_view.missing_view_policy must be error, "
+                "pad_and_mask, or drop_incomplete"
+            )
+
     train_image_dir = dataset.get("train_image_dir")
     if train_image_dir is not None and not isinstance(train_image_dir, (str, Path)):
         raise ValueError("dataset.train_image_dir must be a path or null")
@@ -172,6 +207,14 @@ def _validate(config: dict[str, Any]) -> None:
 
     if float(training.get("generalized_regularization_weight", 0.0)) < 0:
         raise ValueError("generalized_regularization_weight must be >= 0")
+    multi_view_weights = training.get("multi_view_auxiliary_weights", {})
+    if not isinstance(multi_view_weights, dict) or any(
+        float(value) < 0 for value in multi_view_weights.values()
+    ):
+        raise ValueError(
+            "training.multi_view_auxiliary_weights must be a mapping of "
+            "non-negative weights"
+        )
 
     evaluation = config["evaluation"]
     if not 0 < float(evaluation["image_top_ratio"]) <= 1:
@@ -209,6 +252,30 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError(
                 "submission quantiles must satisfy 0 <= lower < upper <= 1"
             )
+    normal_prior = evaluation.get("normal_prior", {})
+    if not isinstance(normal_prior, dict):
+        raise ValueError("evaluation.normal_prior must be a mapping")
+    if bool(normal_prior.get("enabled", False)):
+        if normal_prior.get("resolution", "patch") != "patch":
+            raise ValueError("evaluation.normal_prior.resolution must be patch")
+        if normal_prior.get("statistic", "median_mad") != "median_mad":
+            raise ValueError(
+                "evaluation.normal_prior.statistic currently supports median_mad"
+            )
+        if normal_prior.get("unseen_fallback", "view_global") not in {
+            "view_global",
+            "none",
+        }:
+            raise ValueError(
+                "evaluation.normal_prior.unseen_fallback must be view_global or none"
+            )
+        if float(normal_prior.get("temperature", 0.5)) <= 0:
+            raise ValueError("evaluation.normal_prior.temperature must be positive")
+        if float(normal_prior.get("eps", 1e-6)) <= 0:
+            raise ValueError("evaluation.normal_prior.eps must be positive")
+        blend = float(normal_prior.get("blend", 0.8))
+        if not 0.0 <= blend <= 1.0:
+            raise ValueError("evaluation.normal_prior.blend must be in [0, 1]")
     cache = config.get("cache")
     if cache is not None:
         if "output_dir" not in cache:
@@ -294,7 +361,12 @@ def semantic_config(config: dict[str, Any]) -> dict[str, Any]:
             "gradient_clip_norm",
         )
     }
-    for optional_key in ("optimizer", "scheduler", "gradient_guard"):
+    for optional_key in (
+        "optimizer",
+        "scheduler",
+        "gradient_guard",
+        "multi_view_auxiliary_weights",
+    ):
         if optional_key in config["training"]:
             training_semantics[optional_key] = copy.deepcopy(
                 config["training"][optional_key]
