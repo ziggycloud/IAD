@@ -229,7 +229,7 @@ python run_unseen_pipeline.py
 ViT-L/14，并把输入对齐到提交 mask 的 448 × 448：
 
 ```powershell
-# 一键：审计数据 → 训练（可从 last.pt 恢复）→ Test_A 推理 → 校验并打 ZIP
+# 一键：审计 → 正常 Train 训练 → 正常 Train prior → Test_A 推理 → 校验并打 ZIP
 python run_competition_pipeline.py
 
 # 只检查目录、类别和五视角完整性
@@ -243,17 +243,23 @@ python run_competition_pipeline.py --skip-inference
 ```
 
 默认数据路径和配置分别为 `data/competition/Train`、
-`data/competition/Test_A` 与 `configs/competition.yaml`。分类分数把同一零件的
-5 个视角合并后取异常热图 top 1% 均值，再用严格单调函数映射到 `[0,1]`；
-mask 按类别做无标签、严格单调的 8-bit 分位数标定，以充分利用 PNG 灰度范围。
+`data/competition/Test_A` 与 `configs/competition.yaml`。每个 `Sxxxx` 的五张图现在是
+一个 `[5,3,448,448]` 网络样本：共享 DINO 编码器后由 Set Transformer 建模跨视角
+上下文，但五张异常图和 mask 始终独立。分类分数聚合由
+`submission.object_score_aggregation` 控制；`legacy_concat_topk` 可恢复旧基线，默认
+`visibility_aware` 同时保留 max 分量，避免单相机可见缺陷被软共识抹掉。
+
+正常边缘先验仅扫描 Train 正常图，并把 checkpoint/config fingerprint 写入 artifact；
+不匹配时拒绝复用。Test_A 只在 prior 保存后进入推理，不参与统计或阈值选择。
 
 完成后读取：
 
 ```text
-outputs/generalized_dinomaly_competition_seen50_vitl448_stable_v2/
+outputs/multiview_generalized_dinomaly_competition_vitl448_v3/
 ├── competition_data_audit.json
 ├── competition_pipeline_state.json
 ├── checkpoints/final_model.pt
+├── normal_prior/normal_prior.pt
 └── competition_submission/
     ├── latest.json
     └── <签名>/
@@ -266,8 +272,9 @@ outputs/generalized_dinomaly_competition_seen50_vitl448_stable_v2/
 
 `submission.zip` 已检查 CSV 行数/顺序、分数范围、全部 448 × 448 单通道 mask、
 ZIP 根目录结构和 CRC，可直接手动上传。推理按类别落盘；中断后重复同一命令会跳过
-已完整生成的类别。单张大显存 GPU 运行时可覆盖设备列表和推理 batch；训练仍用
-梯度累计保持全局 effective batch 64：
+已完整生成的类别。启用五视角后，训练和推理 batch 都以“对象”为单位；默认 effective
+object batch 是 12，等效 view batch 是 60，而不是 64 个对象/320 张图。自动显存探测
+执行真实五视角 forward/backward。单张 GPU 可覆盖对象 batch：
 
 ```powershell
 python run_competition_pipeline.py `

@@ -252,6 +252,30 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError(
                 "submission quantiles must satisfy 0 <= lower < upper <= 1"
             )
+        aggregation = submission.get(
+            "object_score_aggregation", "legacy_concat_topk"
+        )
+        if aggregation not in {
+            "legacy_concat_topk",
+            "max",
+            "softmax",
+            "visibility_aware",
+        }:
+            raise ValueError(
+                "submission.object_score_aggregation must be one of "
+                "legacy_concat_topk, max, softmax, visibility_aware"
+            )
+        if float(submission.get("object_score_softmax_temperature", 0.25)) <= 0:
+            raise ValueError(
+                "submission.object_score_softmax_temperature must be positive"
+            )
+        visibility_max_blend = float(
+            submission.get("visibility_max_blend", 0.5)
+        )
+        if not 0.0 <= visibility_max_blend <= 1.0:
+            raise ValueError(
+                "submission.visibility_max_blend must be in [0, 1]"
+            )
     normal_prior = evaluation.get("normal_prior", {})
     if not isinstance(normal_prior, dict):
         raise ValueError("evaluation.normal_prior must be a mapping")

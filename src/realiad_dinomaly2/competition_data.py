@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -160,21 +161,118 @@ class CompetitionFolderDataset(Dataset[dict[str, Any]]):
         }
 
 
+class CompetitionObjectDataset(Dataset[dict[str, Any]]):
+    """One strict competition sample with five ordered camera images."""
+
+    def __init__(
+        self,
+        views: Sequence[CompetitionView],
+        image_size: int,
+        crop_size: int,
+        *,
+        num_views: int = 5,
+        missing_view_policy: str = "error",
+    ) -> None:
+        if num_views != len(EXPECTED_VIEW_IDS):
+            raise ValueError("competition requires exactly five views")
+        if missing_view_policy not in {
+            "error",
+            "pad_and_mask",
+            "drop_incomplete",
+        }:
+            raise ValueError("invalid missing_view_policy")
+        grouped: dict[str, list[CompetitionView | None]] = {}
+        for view in views:
+            if not 0 <= int(view.view_id) < num_views:
+                raise ValueError(
+                    f"{view.group_folder} has out-of-range view {view.view_id}"
+                )
+            slots = grouped.setdefault(view.group_folder, [None] * num_views)
+            if slots[view.view_id] is not None:
+                raise ValueError(
+                    f"{view.group_folder} contains duplicate view {view.view_id}"
+                )
+            slots[view.view_id] = view
+        objects: list[tuple[str, tuple[CompetitionView | None, ...]]] = []
+        for group_folder, slots in grouped.items():
+            missing = [index for index, value in enumerate(slots) if value is None]
+            if missing:
+                if missing_view_policy == "error":
+                    raise ValueError(
+                        f"{group_folder} is missing competition views {missing}"
+                    )
+                if missing_view_policy == "drop_incomplete":
+                    continue
+            objects.append((group_folder, tuple(slots)))
+        if not objects:
+            raise ValueError("CompetitionObjectDataset has no usable objects")
+        self.objects = tuple(objects)
+        self.num_views = int(num_views)
+        self.crop_size = int(crop_size)
+        self.transform = image_transform(image_size, crop_size)
+
+    def __len__(self) -> int:
+        return len(self.objects)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        group_folder, slots = self.objects[index]
+        template_view = next(view for view in slots if view is not None)
+        images: list[torch.Tensor] = []
+        valid: list[bool] = []
+        image_paths: list[str] = []
+        for view in slots:
+            if view is None:
+                # This branch is only reachable for an explicit pad_and_mask
+                # ablation; the official competition scanner is strict.
+                images.append(torch.zeros(3, self.crop_size, self.crop_size))
+                valid.append(False)
+                image_paths.append("")
+                continue
+            with Image.open(view.image_path) as source:
+                images.append(self.transform(source.convert("RGB")))
+            valid.append(True)
+            image_paths.append(str(view.image_path))
+        return {
+            "images": torch.stack(images, dim=0),
+            "view_ids": torch.arange(self.num_views, dtype=torch.long),
+            "valid_view_mask": torch.tensor(valid, dtype=torch.bool),
+            "category": template_view.category,
+            "sample": template_view.sample,
+            "group_folder": group_folder,
+            "image_paths": tuple(image_paths),
+        }
+
+
 def build_competition_train_dataset(
     train_dir: Path,
     categories: str | Sequence[str],
     category_limit: int | None,
     image_size: int,
     crop_size: int,
-) -> tuple[CompetitionFolderDataset, CompetitionManifest]:
+    *,
+    multi_view_enabled: bool = False,
+    num_views: int = 5,
+    missing_view_policy: str = "error",
+) -> tuple[Dataset[dict[str, Any]], CompetitionManifest]:
     manifest = scan_competition_split(
         train_dir,
         requested=categories,
         limit=category_limit,
     )
-    dataset = CompetitionFolderDataset(
+    dataset_class = (
+        CompetitionObjectDataset if multi_view_enabled else CompetitionFolderDataset
+    )
+    dataset = dataset_class(
         manifest.views,
         image_size=image_size,
         crop_size=crop_size,
+        **(
+            {
+                "num_views": num_views,
+                "missing_view_policy": missing_view_policy,
+            }
+            if multi_view_enabled
+            else {}
+        ),
     )
     return dataset, manifest

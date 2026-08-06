@@ -1,7 +1,7 @@
 experiment:
-  name: generalized_dinomaly_competition_seen50_vitl448_stable_v2
-  # A new directory is intentional: do not resume the already destabilized run.
-  output_dir: outputs/generalized_dinomaly_competition_seen50_vitl448_stable_v2
+  name: multiview_generalized_dinomaly_competition_vitl448_v3
+  # Multi-view checkpoints are incompatible with the old per-view run.
+  output_dir: outputs/multiview_generalized_dinomaly_competition_vitl448_v3
   seed: 20260803
 
 dataset:
@@ -41,13 +41,28 @@ model:
       router_balance: 1.0
       router_entropy_penalty: 0.05
       expert_diversity: 0.05
+  multi_view:
+    enabled: true
+    num_views: 5
+    context_dim: 384
+    num_set_layers: 2
+    num_heads: 6
+    view_embedding: true
+    view_dropout_probability: 0.2
+    visibility_temperature: 1.0
+    cross_view_dropout: 0.1
+    # Official competition folders must contain exactly 0.png..4.png.
+    missing_view_policy: error
+    variance_target: 1.0
 
 training:
-  # 6k x global batch 64 over 5,000 views is about 76.8 passes.
+  # Object batch 12 equals 60 views. Do not set this to the old view batch 64,
+  # which would silently become 320 images per optimizer step.
   total_steps: 6000
-  effective_batch_size: 64
+  effective_batch_size: 12
   micro_batch_size: auto
-  batch_candidates: [16, 8, 4, 2, 1]
+  # Per GPU, measured by a real five-view forward/backward probe.
+  batch_candidates: [3, 2, 1]
   memory_headroom_mb: 3000
   amp: true
   amp_dtype: bfloat16
@@ -77,6 +92,11 @@ training:
   loose_loss_warmup_steps: 2000
   loose_loss_final_discard: 0.7
   generalized_regularization_weight: 0.01
+  multi_view_auxiliary_weights:
+    context_consistency: 0.01
+    context_variance: 0.001
+    visibility_balance: 0.001
+    attention_entropy: 0.001
   gradient_clip_norm: 0.1
   gradient_guard:
     # The logged norm is measured before clipping. Skip only catastrophic
@@ -91,7 +111,8 @@ training:
 evaluation:
   # Used by competition inference; no labels or local metrics are required.
   amp: true
-  batch_size: 4
+  # Object batch; equivalent view batch is 10.
+  batch_size: 2
   num_workers: 4
   resize_mask: 448
   image_top_ratio: 0.01
@@ -105,16 +126,34 @@ evaluation:
   anomaly_map_align_corners: false
   metric_bins: 1000
   resume: true
+  normal_prior:
+    enabled: true
+    resolution: patch
+    category_view_enabled: true
+    unseen_fallback: view_global
+    statistic: median_mad
+    threshold: 2.0
+    temperature: 0.5
+    blend: 0.8
+    eps: 1.0e-6
+    batch_size: 2
+    num_workers: 4
 
 submission:
   mask_size: 448
-  batch_size: 4
+  # Object batch; each item contains five independent output masks.
+  batch_size: 2
   num_workers: 4
   object_top_ratio: 0.01
   # Per-category monotonic 8-bit calibration. The extreme upper quantile keeps
   # anomalous peaks from being collapsed while using the PNG range efficiently.
   lower_quantile: 0.001
   upper_quantile: 0.99999
+  # Baseline option: legacy_concat_topk. Other options: max, softmax.
+  object_score_aggregation: visibility_aware
+  object_score_softmax_temperature: 0.25
+  # Keep a max component so a defect visible in one camera is not erased.
+  visibility_max_blend: 0.5
 
 runtime:
   device: cuda:0

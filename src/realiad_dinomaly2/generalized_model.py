@@ -972,11 +972,18 @@ class GeneralizedDinomaly(nn.Module):
         view_ids: torch.Tensor | None = None,
         valid_view_mask: torch.Tensor | None = None,
         return_auxiliary: bool = False,
+        return_context: bool = False,
     ) -> (
         tuple[list[torch.Tensor], list[torch.Tensor]]
         | tuple[
             list[torch.Tensor],
             list[torch.Tensor],
+            dict[str, torch.Tensor],
+        ]
+        | tuple[
+            list[torch.Tensor],
+            list[torch.Tensor],
+            dict[str, torch.Tensor],
             dict[str, torch.Tensor],
         ]
     ):
@@ -1137,7 +1144,17 @@ class GeneralizedDinomaly(nn.Module):
                 )
                 for feature in decoder_features
             ]
+        context_payload: dict[str, torch.Tensor] = {}
+        if context_output is not None:
+            context_payload = {
+                "object_context": context_output.object_context,
+                "cross_view_context": context_output.cross_view_context,
+                "visibility_weights": context_output.visibility_weights,
+                "attention_weights": context_output.attention_weights,
+            }
         if not return_auxiliary:
+            if return_context:
+                return encoder_features, decoder_features, context_payload
             return encoder_features, decoder_features
         # DataParallel cannot reliably expose Python-side state mutated inside
         # replicas. Returning graph-connected [1] tensors makes gather preserve
@@ -1146,6 +1163,13 @@ class GeneralizedDinomaly(nn.Module):
             name: value.reshape(1)
             for name, value in self.auxiliary_losses(detach=False).items()
         }
+        if return_context:
+            return (
+                encoder_features,
+                decoder_features,
+                packed_auxiliary,
+                context_payload,
+            )
         return encoder_features, decoder_features, packed_auxiliary
 
     def _normality_adapter(self) -> CompositionalNormalityAdapter | None:

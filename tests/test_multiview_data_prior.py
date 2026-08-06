@@ -158,6 +158,30 @@ class NormalPriorTests(unittest.TestCase):
         self.assertTrue(torch.all(calibrated > 0))
         self.assertTrue(torch.all(calibrated <= raw))
 
+    def test_single_view_calibration_accepts_batched_one_dimensional_masks(self) -> None:
+        config = minimal_config()
+        stats = {
+            "median": torch.zeros(1, 2, 2),
+            "mad": torch.ones(1, 2, 2),
+        }
+        prior = NormalPrior(
+            {
+                "metadata": {},
+                "category_view": {},
+                "view_global": {"0": stats, "1": stats},
+            }
+        )
+        raw = torch.ones(2, 1, 2, 2)
+        calibrated = prior.calibrate(
+            raw,
+            categories=["a", "b"],
+            view_ids=torch.tensor([0, 1]),
+            valid_view_mask=torch.ones(2, dtype=torch.bool),
+            config=config,
+        )
+        self.assertEqual(calibrated.shape, raw.shape)
+        self.assertTrue(torch.all(calibrated > 0))
+
     def test_checkpoint_fingerprint_mismatch_is_rejected(self) -> None:
         config = minimal_config()
         checkpoint = ROOT / "outputs" / f"unittest_prior_{os.getpid()}.pt"
@@ -182,6 +206,9 @@ class NormalPriorTests(unittest.TestCase):
     def test_prior_fitter_is_hardwired_to_train_dataset(self) -> None:
         source = inspect.getsource(fit_normal_prior)
         self.assertIn("build_train_dataset", source)
+        self.assertIn("build_competition_train_dataset", source)
+        self.assertIn('dataset_config["train_dir"]', source)
+        self.assertNotIn('dataset_config["test_dir"]', source)
         self.assertNotIn("RealIADVarietyDataset", source)
 
 

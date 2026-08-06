@@ -24,6 +24,7 @@ from realiad_dinomaly2.competition_data import (  # noqa: E402
 )
 from realiad_dinomaly2.competition_submission import (  # noqa: E402
     generate_competition_submission,
+    resolve_competition_checkpoint,
 )
 from realiad_dinomaly2.config import (  # noqa: E402
     dump_resolved_config,
@@ -35,6 +36,7 @@ from realiad_dinomaly2.runtime import (  # noqa: E402
     atomic_write_json,
     utc_now,
 )
+from realiad_dinomaly2.normal_prior import fit_normal_prior  # noqa: E402
 from realiad_dinomaly2.train_engine import train  # noqa: E402
 
 
@@ -266,6 +268,26 @@ def main() -> int:
         # torchrun workers stop here; rank 0 alone writes the shared package.
         if not is_primary:
             return 0
+        checkpoint_path = resolve_competition_checkpoint(
+            output_dir,
+            args.checkpoint,
+        )
+        if bool(
+            config["evaluation"].get("normal_prior", {}).get("enabled", False)
+        ):
+            _write_state(
+                output_dir,
+                status="fitting_normal_prior",
+                next_action=(
+                    "Fit or strictly validate Train-normal category/view priors."
+                ),
+                checkpoint=str(checkpoint_path),
+            )
+            fit_normal_prior(
+                config,
+                checkpoint_path,
+                categories=audit["category_names"],
+            )
         if args.skip_inference:
             _write_state(
                 output_dir,

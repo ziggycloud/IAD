@@ -18,9 +18,12 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from realiad_dinomaly2.competition_data import (  # noqa: E402
     CompetitionFolderDataset,
+    CompetitionObjectDataset,
     scan_competition_split,
 )
 from realiad_dinomaly2.competition_submission import (  # noqa: E402
+    _aggregate_object_score,
+    _top_ratio_score,
     build_submission_zip,
     validate_submission_layout,
 )
@@ -66,6 +69,15 @@ class CompetitionDataTests(unittest.TestCase):
             item = dataset[0]
             self.assertEqual(tuple(item["image"].shape), (3, 14, 14))
             self.assertEqual(item["group_folder"], "part_a/S0001")
+            object_dataset = CompetitionObjectDataset(
+                manifest.views, image_size=14, crop_size=14
+            )
+            object_item = object_dataset[0]
+            self.assertEqual(tuple(object_item["images"].shape), (5, 3, 14, 14))
+            self.assertEqual(object_item["view_ids"].tolist(), list(range(5)))
+            self.assertTrue(object_item["valid_view_mask"].all())
+            means = object_item["images"].mean(dim=(1, 2, 3))
+            self.assertTrue((means[1:] > means[:-1]).all())
 
     def test_scan_rejects_missing_view(self) -> None:
         with _temporary_directory() as root:
@@ -79,6 +91,28 @@ class CompetitionDataTests(unittest.TestCase):
         self.assertEqual(config["dataset"]["type"], "competition_folders")
         self.assertTrue(Path(config["dataset"]["train_dir"]).is_absolute())
         self.assertTrue(Path(config["dataset"]["test_dir"]).is_absolute())
+        self.assertTrue(config["model"]["multi_view"]["enabled"])
+        self.assertEqual(config["training"]["effective_batch_size"], 12)
+
+    def test_object_score_modes_keep_single_view_anomaly(self) -> None:
+        maps = [np.zeros((4, 4), dtype=np.float32) for _ in range(5)]
+        maps[3][0, 0] = 10.0
+        legacy = _aggregate_object_score(
+            maps, 0.1, mode="legacy_concat_topk"
+        )
+        self.assertEqual(legacy, _top_ratio_score(maps, 0.1))
+        score = _aggregate_object_score(
+            maps,
+            0.1,
+            mode="visibility_aware",
+            visibility=np.asarray([1.0, 1.0, 1.0, 0.0, 1.0]),
+            visibility_max_blend=0.5,
+        )
+        self.assertGreater(score, 0.0)
+        self.assertGreaterEqual(
+            score,
+            0.5 * _aggregate_object_score(maps, 0.1, mode="max"),
+        )
 
 
 class CompetitionPackageTests(unittest.TestCase):

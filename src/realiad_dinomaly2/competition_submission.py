@@ -12,18 +12,25 @@ from typing import Any, Iterable
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from .competition_data import (
     CompetitionFolderDataset,
     CompetitionManifest,
+    CompetitionObjectDataset,
     CompetitionView,
     scan_competition_split,
 )
 from .config import config_fingerprint
 from .losses import anomaly_map
 from .modeling import build_model, load_trainable_state_dict
+from .normal_prior import (
+    file_sha256,
+    load_normal_prior,
+    normal_prior_path,
+)
 from .runtime import (
     amp_dtype,
     atomic_write_json,
@@ -75,6 +82,16 @@ def _submission_signature(
         "test_manifest_sha256": _manifest_digest(manifest),
         "submission": config["submission"],
     }
+    if bool(config["evaluation"].get("normal_prior", {}).get("enabled", False)):
+        prior_path = normal_prior_path(config)
+        if not prior_path.is_file():
+            raise FileNotFoundError(
+                f"Competition normal prior does not exist: {prior_path}"
+            )
+        payload["normal_prior"] = {
+            "path": str(prior_path),
+            "sha256": file_sha256(prior_path),
+        }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
     )
@@ -82,7 +99,7 @@ def _submission_signature(
 
 
 def _loader(
-    dataset: CompetitionFolderDataset,
+    dataset: Dataset[dict[str, Any]],
     config: dict[str, Any],
 ) -> DataLoader:
     submission = config["submission"]
@@ -148,6 +165,57 @@ def _top_ratio_score(arrays: list[np.ndarray], ratio: float) -> float:
     count = max(1, int(flattened.size * ratio))
     top_values = np.partition(flattened, flattened.size - count)[-count:]
     return float(top_values.mean(dtype=np.float64))
+
+
+def _aggregate_object_score(
+    arrays: list[np.ndarray],
+    ratio: float,
+    *,
+    mode: str = "legacy_concat_topk",
+    visibility: np.ndarray | None = None,
+    softmax_temperature: float = 0.25,
+    visibility_max_blend: float = 0.5,
+) -> float:
+    """YAML-selectable five-view classification aggregation."""
+
+    if len(arrays) != 5:
+        raise ValueError(f"object score requires five maps, got {len(arrays)}")
+    if mode == "legacy_concat_topk":
+        return _top_ratio_score(arrays, ratio)
+    per_view = np.asarray(
+        [_top_ratio_score([array], ratio) for array in arrays],
+        dtype=np.float64,
+    )
+    if mode == "max":
+        return float(per_view.max())
+    if mode == "softmax":
+        if softmax_temperature <= 0:
+            raise ValueError("softmax_temperature must be positive")
+        logits = per_view / softmax_temperature
+        logits -= logits.max()
+        weights = np.exp(logits)
+        weights /= weights.sum()
+        return float(np.dot(weights, per_view))
+    if mode == "visibility_aware":
+        if visibility is None or visibility.shape != (5,):
+            raise ValueError("visibility_aware aggregation requires five weights")
+        weights = np.clip(visibility.astype(np.float64), 0.0, None)
+        if not float(weights.sum()) > 0:
+            weights = np.full(5, 0.2, dtype=np.float64)
+        else:
+            weights /= weights.sum()
+        if not 0.0 <= visibility_max_blend <= 1.0:
+            raise ValueError("visibility_max_blend must be in [0, 1]")
+        weighted = float(np.dot(weights, per_view))
+        # The max component preserves defects visible in only one camera.
+        return float(
+            visibility_max_blend * per_view.max()
+            + (1.0 - visibility_max_blend) * weighted
+        )
+    raise ValueError(
+        "object_score_aggregation must be legacy_concat_topk, max, softmax, "
+        "or visibility_aware"
+    )
 
 
 def _probability_like_score(raw_score: float) -> float:
@@ -364,6 +432,16 @@ def generate_competition_submission(
     bundle.model.eval()
 
     submission = config["submission"]
+    evaluation = config["evaluation"]
+    multi_view_config = dict(config["model"].get("multi_view", {}))
+    multi_view_enabled = bool(multi_view_config.get("enabled", False))
+    normal_prior = None
+    if bool(evaluation.get("normal_prior", {}).get("enabled", False)):
+        normal_prior = load_normal_prior(
+            normal_prior_path(config),
+            config,
+            checkpoint_path,
+        )
     mask_size = int(submission.get("mask_size", 448))
     lower_quantile = float(submission.get("lower_quantile", 0.001))
     upper_quantile = float(submission.get("upper_quantile", 0.99999))
@@ -371,6 +449,15 @@ def generate_competition_submission(
         submission.get(
             "object_top_ratio", config["evaluation"]["object_top_ratio"]
         )
+    )
+    aggregation_mode = str(
+        submission.get("object_score_aggregation", "legacy_concat_topk")
+    )
+    aggregation_temperature = float(
+        submission.get("object_score_softmax_temperature", 0.25)
+    )
+    visibility_max_blend = float(
+        submission.get("visibility_max_blend", 0.5)
     )
     gaussian = GaussianFilter(
         kernel_size=int(config["evaluation"]["gaussian_kernel_size"]),
@@ -403,36 +490,135 @@ def generate_competition_submission(
             category,
             len(category_views),
         )
-        dataset = CompetitionFolderDataset(
-            category_views,
-            image_size=int(dataset_config["image_size"]),
-            crop_size=int(dataset_config["crop_size"]),
-        )
+        if multi_view_enabled:
+            dataset = CompetitionObjectDataset(
+                category_views,
+                image_size=int(dataset_config["image_size"]),
+                crop_size=int(dataset_config["crop_size"]),
+                num_views=int(multi_view_config.get("num_views", 5)),
+                missing_view_policy=str(
+                    multi_view_config.get("missing_view_policy", "error")
+                ),
+            )
+        else:
+            dataset = CompetitionFolderDataset(
+                category_views,
+                image_size=int(dataset_config["image_size"]),
+                crop_size=int(dataset_config["crop_size"]),
+            )
         maps: list[np.ndarray] = []
+        visibility_by_group: dict[str, np.ndarray] = {}
         for batch in _loader(dataset, config):
-            images = batch["image"].to(
-                device,
-                non_blocking=bool(config["runtime"]["pin_memory"]),
-            )
-            with autocast_context(dtype, device):
-                encoder_features, decoder_features = bundle.model(images)
-                current = anomaly_map(
-                    encoder_features,
-                    decoder_features,
-                    output_size=mask_size,
-                    layer_weights=evaluation.get(
-                        "anomaly_map_layer_weights"
-                    ),
-                    align_corners=bool(
-                        evaluation.get("anomaly_map_align_corners", True)
-                    ),
+            if multi_view_enabled:
+                images = batch["images"].to(
+                    device,
+                    non_blocking=bool(config["runtime"]["pin_memory"]),
                 )
-            current = gaussian(current.to(dtype=torch.float32))
-            current = current.clamp_(min=0.0)
-            maps.extend(
-                array
-                for array in current[:, 0].cpu().numpy().astype(np.float32)
-            )
+                view_ids = batch["view_ids"].to(device, non_blocking=True)
+                valid_view_mask = batch["valid_view_mask"].to(
+                    device, non_blocking=True
+                )
+                category_names = [str(value) for value in batch["category"]]
+                with autocast_context(dtype, device):
+                    (
+                        encoder_features,
+                        decoder_features,
+                        context_output,
+                    ) = bundle.model(
+                        images,
+                        view_ids=view_ids,
+                        valid_view_mask=valid_view_mask,
+                        return_context=True,
+                    )
+                    current = anomaly_map(
+                        encoder_features,
+                        decoder_features,
+                        output_size=int(dataset_config["crop_size"]) // 14,
+                        layer_weights=evaluation.get(
+                            "anomaly_map_layer_weights"
+                        ),
+                        align_corners=bool(
+                            evaluation.get("anomaly_map_align_corners", True)
+                        ),
+                    )
+                if normal_prior is not None:
+                    current = normal_prior.calibrate(
+                        current,
+                        categories=category_names,
+                        view_ids=view_ids,
+                        valid_view_mask=valid_view_mask,
+                        config=config,
+                    )
+                batch_size, view_count = current.shape[:2]
+                current = F.interpolate(
+                    current.float().reshape(
+                        batch_size * view_count,
+                        *current.shape[2:],
+                    ),
+                    size=(mask_size, mask_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                current = gaussian(current).clamp_(min=0.0).reshape(
+                    batch_size,
+                    view_count,
+                    1,
+                    mask_size,
+                    mask_size,
+                )
+                visibility = context_output["visibility_weights"].float().cpu()
+                group_folders = [str(value) for value in batch["group_folder"]]
+                for batch_index, group_folder in enumerate(group_folders):
+                    visibility_by_group[group_folder] = (
+                        visibility[batch_index].numpy().astype(np.float64)
+                    )
+                    maps.extend(
+                        array
+                        for array in current[batch_index, :, 0]
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32)
+                    )
+            else:
+                images = batch["image"].to(
+                    device,
+                    non_blocking=bool(config["runtime"]["pin_memory"]),
+                )
+                category_names = [str(value) for value in batch["category"]]
+                view_ids = batch["view_id"].to(device, dtype=torch.long)
+                valid_view_mask = torch.ones_like(view_ids, dtype=torch.bool)
+                with autocast_context(dtype, device):
+                    encoder_features, decoder_features = bundle.model(images)
+                    current = anomaly_map(
+                        encoder_features,
+                        decoder_features,
+                        output_size=int(dataset_config["crop_size"]) // 14,
+                        layer_weights=evaluation.get(
+                            "anomaly_map_layer_weights"
+                        ),
+                        align_corners=bool(
+                            evaluation.get("anomaly_map_align_corners", True)
+                        ),
+                    )
+                if normal_prior is not None:
+                    current = normal_prior.calibrate(
+                        current,
+                        categories=category_names,
+                        view_ids=view_ids,
+                        valid_view_mask=valid_view_mask,
+                        config=config,
+                    )
+                current = F.interpolate(
+                    current.float(),
+                    size=(mask_size, mask_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                current = gaussian(current).clamp_(min=0.0)
+                maps.extend(
+                    array
+                    for array in current[:, 0].cpu().numpy().astype(np.float32)
+                )
         if len(maps) != len(category_views):
             raise RuntimeError(
                 f"Inference count mismatch for {category}: "
@@ -457,8 +643,16 @@ def generate_competition_submission(
         for group_folder in dict.fromkeys(
             view.group_folder for view in category_views
         ):
-            raw_score = _top_ratio_score(
-                grouped_maps[group_folder], object_top_ratio
+            raw_score = _aggregate_object_score(
+                grouped_maps[group_folder],
+                object_top_ratio,
+                mode=aggregation_mode,
+                visibility=visibility_by_group.get(
+                    group_folder,
+                    np.full(5, 0.2, dtype=np.float64),
+                ),
+                softmax_temperature=aggregation_temperature,
+                visibility_max_blend=visibility_max_blend,
             )
             rows.append(
                 {
@@ -478,6 +672,12 @@ def generate_competition_submission(
                     "upper": upper,
                     "lower_quantile": lower_quantile,
                     "upper_quantile": upper_quantile,
+                },
+                "object_score_aggregation": {
+                    "mode": aggregation_mode,
+                    "top_ratio": object_top_ratio,
+                    "softmax_temperature": aggregation_temperature,
+                    "visibility_max_blend": visibility_max_blend,
                 },
                 "rows": rows,
             },

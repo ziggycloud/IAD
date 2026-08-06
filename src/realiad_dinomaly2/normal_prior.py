@@ -8,6 +8,7 @@ from typing import Any, Iterable, Sequence
 import torch
 from torch.utils.data import DataLoader
 
+from .competition_data import build_competition_train_dataset
 from .config import config_fingerprint
 from .data import build_train_dataset
 from .losses import anomaly_map
@@ -94,6 +95,15 @@ class NormalPrior:
                 device=raw_maps.device,
                 dtype=torch.bool,
             )
+            if valid_view_mask.ndim == 1:
+                if valid_view_mask.numel() == view_count:
+                    valid_view_mask = valid_view_mask.unsqueeze(0).expand(
+                        batch_size, -1
+                    )
+                elif view_count == 1 and valid_view_mask.numel() == batch_size:
+                    valid_view_mask = valid_view_mask.unsqueeze(1)
+        if valid_view_mask.shape != (batch_size, view_count):
+            raise ValueError("valid_view_mask must have shape [B,V]")
         calibrated = raw_maps.clone()
         threshold = float(prior_config.get("threshold", 2.0))
         temperature = float(prior_config.get("temperature", 0.5))
@@ -254,21 +264,35 @@ def fit_normal_prior(
     multi_view_config = dict(config["model"].get("multi_view", {}))
     multi_view_enabled = bool(multi_view_config.get("enabled", False))
     num_views = int(multi_view_config.get("num_views", 5))
-    dataset = build_train_dataset(
-        json_dir=Path(config["dataset"]["json_dir"]),
-        image_dir=Path(
-            config["dataset"].get("train_image_dir")
-            or config["dataset"]["image_dir"]
-        ),
-        categories=category_list,
-        image_size=int(config["dataset"]["image_size"]),
-        crop_size=int(config["dataset"]["crop_size"]),
-        multi_view_enabled=multi_view_enabled,
-        num_views=num_views,
-        missing_view_policy=str(
-            multi_view_config.get("missing_view_policy", "error")
-        ),
+    dataset_config = config["dataset"]
+    missing_view_policy = str(
+        multi_view_config.get("missing_view_policy", "error")
     )
+    if dataset_config.get("type") == "competition_folders":
+        dataset, _ = build_competition_train_dataset(
+            train_dir=Path(dataset_config["train_dir"]),
+            categories=category_list,
+            category_limit=None,
+            image_size=int(dataset_config["image_size"]),
+            crop_size=int(dataset_config["crop_size"]),
+            multi_view_enabled=multi_view_enabled,
+            num_views=num_views,
+            missing_view_policy=missing_view_policy,
+        )
+    else:
+        dataset = build_train_dataset(
+            json_dir=Path(dataset_config["json_dir"]),
+            image_dir=Path(
+                dataset_config.get("train_image_dir")
+                or dataset_config["image_dir"]
+            ),
+            categories=category_list,
+            image_size=int(dataset_config["image_size"]),
+            crop_size=int(dataset_config["crop_size"]),
+            multi_view_enabled=multi_view_enabled,
+            num_views=num_views,
+            missing_view_policy=missing_view_policy,
+        )
 
     device = resolve_device(str(config["runtime"]["device"]))
     dtype = (
@@ -324,7 +348,11 @@ def fit_normal_prior(
         else:
             images = batch["image"].to(device, non_blocking=True)
             categories_batch = [str(value) for value in batch["category"]]
-            view_ids = batch["view_id"].to(device, dtype=torch.long) - 1
+            view_ids = batch["view_id"].to(device, dtype=torch.long)
+            if dataset_config.get("type") != "competition_folders":
+                # Real-IAD names cameras C1..C5; competition filenames are
+                # already zero-based 0.png..4.png.
+                view_ids = view_ids - 1
             valid_view_mask = torch.ones_like(view_ids, dtype=torch.bool)
             with autocast_context(dtype, device):
                 encoder_features, decoder_features = bundle.model(images)

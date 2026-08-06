@@ -1,5 +1,8 @@
 # 比赛分割调优与训练稳定性说明
 
+五视角网络、数据 shape、辅助损失、正常先验 artifact 与恢复规则的完整说明见
+[MULTIVIEW_ARCHITECTURE.md](MULTIVIEW_ARCHITECTURE.md)。
+
 ## 1. 为什么 P-AUROC 高，但 P-AUPR / P-F1max 只有 0.5–0.6
 
 这是典型的像素类别极不平衡现象。背景像素远多于微小缺陷，少量物体边缘被打成高分时，P-AUROC 仍可能很高；但这些边缘像素的面积常常比真实缺陷还大，会直接降低 precision，进而压低 P-AUPR 和 P-F1max。
@@ -23,7 +26,7 @@
 - 高斯平滑：建议先比较 sigma 0、1、2，原来的 4 通常不利于小缺陷 precision。
 - 梯度保护：记录裁剪前总范数和每个参数组范数，超过阈值时跳过 optimizer step。
 
-稳定版默认值是 LR 3e-4、Adam epsilon 1e-8、500-step warmup、cosine、Loose Loss 2000-step 渐进到 0.7、sigma 2、两层权重 `[0.35, 0.65]`。输出目录使用新的 `*_stable_v2`，避免恢复已经失稳的 optimizer 状态。
+稳定版默认值是 LR 3e-4、Adam epsilon 1e-8、500-step warmup、cosine、Loose Loss 2000-step 渐进到 0.7、sigma 2、两层权重 `[0.35, 0.65]`。五视角版本使用独立的 `*_v3` 输出目录，避免恢复单视角 optimizer 状态。
 
 建议一次只改变一个变量，优先顺序如下：
 
@@ -34,31 +37,23 @@
 
 不要使用 Test_A 标签反向训练或按测试标签选阈值。若比赛允许本地验证，应该仅从 Train 的正常样本中留出少量 normal validation，用于监控正常边缘响应和训练稳定性；它不能直接估计缺陷 P-AUPR。
 
-## 3. 五视角思路是否可行
+## 3. 已实现的五视角联合架构
 
-方向可行，但不建议把五张图按通道直接 concat 后做像素级相等约束。五台相机有视差、遮挡和可见面差异，同一物理缺陷在不同视角中不一定可见，也不位于同一像素坐标。硬一致性可能把只在一个视角可见的真实缺陷抹掉。
+当前默认实现不拼接 RGB，也不施加跨相机像素对齐约束。一个 `Sxxxx` 的五张图组成
+一个 object batch 元素；共享冻结 DINO 编码器产生五组 patch token，再由带 view
+embedding 的 robust pooling、两层 Set Attention 和 visibility head 产生 object context、
+per-view cross-view context 与可靠性。跨视角信息只通过 router conditioning 和有界
+FiLM 调制 normality adapter，原始 encoder patch value 不会 residual 到 decoder。
 
-更合适的无监督方案分两阶段：
+训练仍只使用正常 Train 的逐视角 feature reconstruction，并可配置
+view-dropout consistency、context variance、visibility balance 和 attention entropy。
+网络从不读取 category ID。推理继续生成五张独立异常图；visibility-aware object score
+混入可配置 max 分量，因此某一视角独有的高异常不会因其余视角正常而被硬置零。
 
-### 阶段 A：正常边缘先验（优先实现）
-
-利用 Train 全是正常样本且相机编号固定这一点，按“类别 + 视角”统计正常异常图的 median 和 MAD / 高分位图。推理时对 raw anomaly map 做软校准：
-
-```text
-calibrated = relu(raw - median_normal - k * MAD_normal)
-```
-
-这会压掉在正常样本中反复出现的轮廓高响应，又不会要求五个视角像素对齐。若零件姿态有抖动，可以先在 DINO patch 特征上做小范围匹配或软配准。该方法完全使用正常 Train，不需要异常标签，最直接针对当前 precision 问题。
-
-### 阶段 B：五视角 set-context 网络
-
-1. 五个视角分别经过共享 DINO 编码器，不在原图通道维 concat。
-2. 用 permutation-aware Set Transformer 或 cross-view attention 聚合物体级正常上下文，并加入 camera/view embedding。
-3. 将聚合上下文反馈给五个视角各自的 decoder。
-4. 训练目标仍是每视角正常特征重建；额外加入正常数据上的 object-context consistency，而不是异常 mask 一致性。
-5. 推理时保留每个视角自己的异常图，只用 visibility-aware 的软共识加权，不能要求五视角都高才判异常。
-
-这条路线能学习“同一物体的五个正常观测应该共同解释”，但仅靠正常数据无法学习“真实缺陷跨视角一定长什么样”。因此应先做阶段 A，确认边缘假阳性确实下降，再投入阶段 B。
+正常边缘先验也已实现：先在 32×32 patch 网格上，用 Train 正常图拟合每个
+category/view 的 median 与 MAD，并同时保存 view-global fallback。校准使用平滑 sigmoid
+gate 而不是 hard ReLU，保留局部排序。artifact 记录版本、checkpoint SHA、配置指纹、
+类别、视角、尺寸与统计参数；任何不匹配都会报错。Test_A 从不进入 prior dataloader。
 
 ## 4. 这次梯度突然变高的解释
 
@@ -77,7 +72,7 @@ calibrated = relu(raw - median_normal - k * MAD_normal)
 
 ## 5. 运行和覆盖示例
 
-默认稳定配置：
+默认五视角配置（effective object batch 12，等效 view batch 60）：
 
 ```bash
 python run_competition_pipeline.py
