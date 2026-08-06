@@ -269,21 +269,203 @@ class RealIADVarietyDataset(Dataset[dict[str, Any]]):
         return item
 
 
+def group_records_by_object(
+    records: Sequence[Record],
+    *,
+    num_views: int = 5,
+    missing_view_policy: str = "error",
+) -> list[tuple[str, tuple[int | None, ...]]]:
+    """Group Real-IAD records into ordered, validated camera sets.
+
+    Real-IAD camera names are one-based (``C1`` ... ``C5``), while the model
+    contract is deliberately zero-based.  Returning record indices keeps the
+    grouping deterministic and avoids copying manifest objects.
+    """
+
+    if num_views <= 0:
+        raise ValueError("num_views must be positive")
+    if missing_view_policy not in {
+        "error",
+        "pad_and_mask",
+        "drop_incomplete",
+    }:
+        raise ValueError(
+            "missing_view_policy must be error, pad_and_mask, or "
+            "drop_incomplete"
+        )
+
+    grouped: dict[str, list[int | None]] = {}
+    for index, record in enumerate(records):
+        camera_id = int(record.view_id)
+        if not 1 <= camera_id <= num_views:
+            raise ValueError(
+                f"{record.category}/{record.object_id} has out-of-range "
+                f"camera/view id {camera_id}; expected C1..C{num_views}"
+            )
+        view_id = camera_id - 1
+        slots = grouped.setdefault(record.object_id, [None] * num_views)
+        if slots[view_id] is not None:
+            previous = records[int(slots[view_id])]
+            raise ValueError(
+                f"{record.category}/{record.object_id} contains duplicate "
+                f"view {view_id}: {previous.image_path!r} and "
+                f"{record.image_path!r}"
+            )
+        slots[view_id] = index
+
+    result: list[tuple[str, tuple[int | None, ...]]] = []
+    for object_id in sorted(grouped):
+        slots = grouped[object_id]
+        missing = [index for index, value in enumerate(slots) if value is None]
+        if missing:
+            if missing_view_policy == "error":
+                category = records[next(value for value in slots if value is not None)].category
+                raise ValueError(
+                    f"{category}/{object_id} is missing views {missing}; "
+                    f"policy={missing_view_policy}"
+                )
+            if missing_view_policy == "drop_incomplete":
+                continue
+        result.append((object_id, tuple(slots)))
+    if not result:
+        raise ValueError("multi-view grouping produced no usable objects")
+    return result
+
+
+class RealIADMultiViewDataset(Dataset[dict[str, Any]]):
+    """One dataset item is one object with ordered camera views."""
+
+    def __init__(
+        self,
+        json_dir: Path,
+        image_dir: Path,
+        category: str,
+        phase: str,
+        image_size: int,
+        crop_size: int,
+        *,
+        num_views: int = 5,
+        missing_view_policy: str = "error",
+        max_objects: int | None = None,
+        image_label_policy: str = "visible_defect",
+        missing_anomaly_mask_policy: str = "include_as_normal_view",
+        mask_resize_semantics: str = "upstream_bilinear_nonzero",
+    ) -> None:
+        self.base = RealIADVarietyDataset(
+            json_dir=json_dir,
+            image_dir=image_dir,
+            category=category,
+            phase=phase,
+            image_size=image_size,
+            crop_size=crop_size,
+            max_items=None,
+            image_label_policy=image_label_policy,
+            missing_anomaly_mask_policy=missing_anomaly_mask_policy,
+            mask_resize_semantics=mask_resize_semantics,
+        )
+        self.category = category
+        self.phase = phase
+        self.num_views = int(num_views)
+        self.crop_size = int(crop_size)
+        groups = group_records_by_object(
+            self.base.records,
+            num_views=self.num_views,
+            missing_view_policy=missing_view_policy,
+        )
+        if max_objects is not None:
+            groups = groups[: int(max_objects)]
+        if not groups:
+            raise ValueError(f"{category} has no usable multi-view objects")
+        self.groups = groups
+
+    def __len__(self) -> int:
+        return len(self.groups)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        object_id, slots = self.groups[index]
+        loaded: list[dict[str, Any] | None] = [
+            None if item_index is None else self.base[int(item_index)]
+            for item_index in slots
+        ]
+        template = next(item for item in loaded if item is not None)
+        images: list[torch.Tensor] = []
+        labels: list[int] = []
+        pixel_valid: list[bool] = []
+        masks: list[torch.Tensor] = []
+        image_paths: list[str] = []
+        valid_views: list[bool] = []
+        object_labels: list[int] = []
+        for item in loaded:
+            if item is None:
+                images.append(torch.zeros_like(template["image"]))
+                labels.append(0)
+                object_labels.append(0)
+                image_paths.append("")
+                valid_views.append(False)
+                if self.phase == "test":
+                    masks.append(
+                        torch.zeros(
+                            (1, self.crop_size, self.crop_size),
+                            dtype=torch.float32,
+                        )
+                    )
+                    pixel_valid.append(False)
+                continue
+            images.append(item["image"])
+            labels.append(int(item["label"]))
+            object_labels.append(int(item["object_label"]))
+            image_paths.append(str(item["image_path"]))
+            valid_views.append(True)
+            if self.phase == "test":
+                masks.append(item["mask"])
+                pixel_valid.append(bool(item["pixel_valid"]))
+
+        result: dict[str, Any] = {
+            "images": torch.stack(images, dim=0),
+            "view_ids": torch.arange(self.num_views, dtype=torch.long),
+            "valid_view_mask": torch.tensor(valid_views, dtype=torch.bool),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "object_label": max(object_labels),
+            "category": self.category,
+            "object_id": object_id,
+            "image_paths": tuple(image_paths),
+        }
+        if self.phase == "test":
+            result["masks"] = torch.stack(masks, dim=0)
+            result["pixel_valid"] = torch.tensor(pixel_valid, dtype=torch.bool)
+        return result
+
+
 def build_train_dataset(
     json_dir: Path,
     image_dir: Path,
     categories: Iterable[str],
     image_size: int,
     crop_size: int,
+    *,
+    multi_view_enabled: bool = False,
+    num_views: int = 5,
+    missing_view_policy: str = "error",
 ) -> ConcatDataset[dict[str, Any]]:
+    dataset_class = (
+        RealIADMultiViewDataset if multi_view_enabled else RealIADVarietyDataset
+    )
     datasets = [
-        RealIADVarietyDataset(
+        dataset_class(
             json_dir=json_dir,
             image_dir=image_dir,
             category=category,
             phase="train",
             image_size=image_size,
             crop_size=crop_size,
+            **(
+                {
+                    "num_views": num_views,
+                    "missing_view_policy": missing_view_policy,
+                }
+                if multi_view_enabled
+                else {}
+            ),
         )
         for category in categories
     ]

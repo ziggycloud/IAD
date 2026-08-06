@@ -1,6 +1,6 @@
 experiment:
-  name: generalized_dinomaly_realiad_seen50_unseen50_vitl448_stable_v2
-  output_dir: outputs/generalized_dinomaly_seen50_unseen50_vitl448_stable_v2
+  name: multiview_generalized_dinomaly_seen50_unseen50_vitl448_v3
+  output_dir: outputs/multiview_generalized_dinomaly_seen50_unseen50_vitl448_v3
   seed: 20260803
 
 protocol:
@@ -51,17 +51,27 @@ model:
       router_balance: 1.0
       router_entropy_penalty: 0.05
       expert_diversity: 0.05
+  multi_view:
+    enabled: true
+    num_views: 5
+    context_dim: 384
+    num_set_layers: 2
+    num_heads: 6
+    view_embedding: true
+    view_dropout_probability: 0.2
+    visibility_temperature: 1.0
+    cross_view_dropout: 0.1
+    missing_view_policy: error
+    variance_target: 1.0
 
 training:
-  # With this seed, 6k x global batch 64 = 384k views ~= 61.5 passes over
-  # the 6,240 seen-train views, about 23% fewer normalized epochs than the
-  # original 100k x batch-16 run over all 19,955 train views.
+  # Batch units are objects. Effective object batch 12 is exactly 60 views,
+  # close to the old 64-view batch without accidentally processing 320 views.
   total_steps: 6000
-  effective_batch_size: 64
-  # Per GPU. Probe 32 first on the target 40 GB card, then fall back while
-  # keeping the global effective batch fixed at 64.
+  effective_batch_size: 12
+  # Per GPU, in objects. The probe executes a real five-view forward/backward.
   micro_batch_size: auto
-  batch_candidates: [32, 16, 8, 4, 2, 1]
+  batch_candidates: [3, 2, 1]
   memory_headroom_mb: 2500
   amp: true
   amp_dtype: bfloat16
@@ -82,6 +92,11 @@ training:
   loose_loss_warmup_steps: 2000
   loose_loss_final_discard: 0.7
   generalized_regularization_weight: 0.01
+  multi_view_auxiliary_weights:
+    context_consistency: 0.01
+    context_variance: 0.001
+    visibility_balance: 0.001
+    attention_entropy: 0.001
   gradient_clip_norm: 0.1
   gradient_guard:
     skip_step_norm: 1.0
@@ -93,7 +108,8 @@ training:
 
 evaluation:
   amp: true
-  batch_size: 8
+  # Object batch; equivalent view batch is 10.
+  batch_size: 2
   num_workers: 4
   resize_mask: 256
   image_top_ratio: 0.01
@@ -104,6 +120,18 @@ evaluation:
   anomaly_map_align_corners: false
   metric_bins: 1000
   resume: true
+  normal_prior:
+    enabled: true
+    resolution: patch
+    category_view_enabled: true
+    unseen_fallback: view_global
+    statistic: median_mad
+    threshold: 2.0
+    temperature: 0.5
+    blend: 0.8
+    eps: 1.0e-6
+    batch_size: 2
+    num_workers: 4
 
 latency:
   warmup_iterations: 10

@@ -324,6 +324,48 @@ def _trainable_parameters(bundle: ModelBundle) -> list[torch.nn.Parameter]:
     ]
 
 
+def _multi_view_settings(config: dict[str, Any]) -> tuple[bool, int, str]:
+    settings = dict(config["model"].get("multi_view", {}))
+    return (
+        bool(settings.get("enabled", False)),
+        int(settings.get("num_views", 5)),
+        str(settings.get("missing_view_policy", "error")),
+    )
+
+
+def _auxiliary_weights(config: dict[str, Any]) -> dict[str, float] | None:
+    weights = dict(
+        config["model"].get("generalized", {}).get("auxiliary_weights", {})
+    )
+    weights.update(
+        {
+            str(name): float(value)
+            for name, value in config["training"]
+            .get("multi_view_auxiliary_weights", {})
+            .items()
+        }
+    )
+    return weights or None
+
+
+def _batch_model_inputs(
+    batch: dict[str, Any],
+    config: dict[str, Any],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    enabled, _, _ = _multi_view_settings(config)
+    image_key = "images" if enabled else "image"
+    images = batch[image_key].to(
+        device,
+        non_blocking=bool(config["runtime"]["pin_memory"]),
+    )
+    if not enabled:
+        return images, None, None
+    view_ids = batch["view_ids"].to(device, non_blocking=True)
+    valid_view_mask = batch["valid_view_mask"].to(device, non_blocking=True)
+    return images, view_ids, valid_view_mask
+
+
 def _optimizer_group_gradient_norms(optimizer) -> dict[str, float]:
     """Return pre-clipping L2 norms, grouped for spike diagnosis."""
     result: dict[str, float] = {}
@@ -362,12 +404,25 @@ def _run_probe(
     optimizer = build_optimizer(bundle, config)
     scaler = make_grad_scaler(dtype, device)
     crop_size = int(config["dataset"]["crop_size"])
+    multi_view_enabled, num_views, _ = _multi_view_settings(config)
+    synthetic_shape = (
+        (candidate, num_views, 3, crop_size, crop_size)
+        if multi_view_enabled
+        else (candidate, 3, crop_size, crop_size)
+    )
     synthetic = torch.randn(
-        candidate,
-        3,
-        crop_size,
-        crop_size,
+        *synthetic_shape,
         device=device,
+    )
+    view_ids = (
+        torch.arange(num_views, device=device).unsqueeze(0).expand(candidate, -1)
+        if multi_view_enabled
+        else None
+    )
+    valid_view_mask = (
+        torch.ones((candidate, num_views), dtype=torch.bool, device=device)
+        if multi_view_enabled
+        else None
     )
     optimizer.zero_grad(set_to_none=True)
     torch.cuda.reset_peak_memory_stats(device)
@@ -375,9 +430,7 @@ def _run_probe(
     regularization_weight = float(
         config["training"].get("generalized_regularization_weight", 0.0)
     )
-    auxiliary_weights = config["model"].get("generalized", {}).get(
-        "auxiliary_weights"
-    )
+    auxiliary_weights = _auxiliary_weights(config)
     with autocast_context(dtype, device):
         (
             encoder_features,
@@ -388,12 +441,15 @@ def _run_probe(
             bundle.model,
             synthetic,
             weights=auxiliary_weights,
+            view_ids=view_ids,
+            valid_view_mask=valid_view_mask,
         )
         reconstruction = reconstruction_loss(
             encoder_features,
             decoder_features,
             discard_rate=0.0,
             loose_loss=bool(config["model"]["loose_loss"]),
+            valid_view_mask=valid_view_mask,
         )
         loss = (
             reconstruction + regularization_weight * regularizer
@@ -415,6 +471,8 @@ def _run_probe(
     peak_reserved = torch.cuda.max_memory_reserved(device)
     result = {
         "batch_size": candidate,
+        "batch_unit": "objects" if multi_view_enabled else "views",
+        "equivalent_view_batch_size": candidate * num_views,
         "status": "ok",
         "loss": float(loss.detach().cpu()),
         "reconstruction_loss": float(reconstruction.detach().cpu()),
@@ -436,6 +494,8 @@ def _run_probe(
         auxiliary,
         loss,
         synthetic,
+        view_ids,
+        valid_view_mask,
         optimizer,
         scaler,
     )
@@ -455,6 +515,7 @@ def choose_batch_size(
     world_size: int = 1,
 ) -> BatchChoice:
     training = config["training"]
+    multi_view_enabled, num_views, _ = _multi_view_settings(config)
     effective = int(training["effective_batch_size"])
     requested = training["micro_batch_size"]
     if requested != "auto":
@@ -539,6 +600,13 @@ def choose_batch_size(
                         "selected_micro_batch_size": choice.micro_batch_size,
                         "accumulation_steps": choice.accumulation_steps,
                         "effective_batch_size": choice.effective_batch_size,
+                        "batch_unit": (
+                            "objects" if multi_view_enabled else "views"
+                        ),
+                        "effective_view_batch_size": (
+                            choice.effective_batch_size
+                            * (num_views if multi_view_enabled else 1)
+                        ),
                         "world_size": choice.world_size,
                         "global_micro_batch_size": (
                             choice.global_micro_batch_size
@@ -627,6 +695,7 @@ def save_checkpoint(
     batch_choice: BatchChoice,
     rng_states: list[dict[str, Any]] | None = None,
 ) -> None:
+    multi_view_enabled, num_views, _ = _multi_view_settings(config)
     atomic_torch_save(
         path,
         {
@@ -639,10 +708,18 @@ def save_checkpoint(
             "micro_batch_size": batch_choice.micro_batch_size,
             "accumulation_steps": batch_choice.accumulation_steps,
             "effective_batch_size": batch_choice.effective_batch_size,
+            "batch_unit": "objects" if multi_view_enabled else "views",
+            "effective_view_batch_size": (
+                batch_choice.effective_batch_size * num_views
+            ),
             "global_micro_batch_size": batch_choice.global_micro_batch_size,
             "world_size": batch_choice.world_size,
             "model": trainable_state_dict(bundle),
             "optimizer": optimizer.state_dict(),
+            "scheduler": {
+                "completed_steps": completed_steps,
+                "config": dict(config["training"].get("scheduler", {})),
+            },
             "scaler": scaler.state_dict(),
             "rng_state": _rng_state(),
             "rng_states": rng_states,
@@ -948,17 +1025,23 @@ def _train_impl(
         requested=config["dataset"]["categories"],
         limit=config["dataset"].get("category_limit"),
     )
+    multi_view_enabled, num_views, missing_view_policy = _multi_view_settings(config)
     dataset = build_train_dataset(
         json_dir=json_dir,
         image_dir=image_dir,
         categories=categories,
         image_size=int(config["dataset"]["image_size"]),
         crop_size=int(config["dataset"]["crop_size"]),
+        multi_view_enabled=multi_view_enabled,
+        num_views=num_views,
+        missing_view_policy=missing_view_policy,
     )
     logger.info(
-        "训练 manifest：%d 类，%d 张正常视图",
+        "训练 manifest：%d 类，%d 个%s（等效 %d 张正常视图）",
         len(categories),
         len(dataset),
+        "对象" if multi_view_enabled else "视图",
+        len(dataset) * (num_views if multi_view_enabled else 1),
     )
 
     state: dict[str, Any] = {
@@ -997,6 +1080,14 @@ def _train_impl(
             )
         load_trainable_state_dict(bundle, checkpoint["model"])
         completed_steps = int(checkpoint["completed_steps"])
+        scheduler_state = checkpoint.get("scheduler")
+        if scheduler_state is not None:
+            if int(scheduler_state.get("completed_steps", -1)) != completed_steps:
+                raise ValueError("checkpoint scheduler step is inconsistent")
+            if dict(scheduler_state.get("config", {})) != dict(
+                config["training"].get("scheduler", {})
+            ):
+                raise ValueError("checkpoint scheduler config is inconsistent")
         checkpoint_world_size = int(checkpoint.get("world_size", 1))
         if checkpoint_world_size != context.world_size:
             raise ValueError(
@@ -1062,12 +1153,16 @@ def _train_impl(
             f"checkpoint 已完成 {completed_steps} 步，超过配置 {total_steps}"
         )
     logger.info(
-        "运行 batch：per-GPU micro=%d, global micro=%d, accumulate=%d, "
-        "effective=%d；从 step=%d 开始",
+        "运行 batch（单位=%s）：per-GPU micro=%d, global micro=%d, "
+        "accumulate=%d, effective=%d, equivalent views=%d；从 step=%d 开始",
+        "objects" if multi_view_enabled else "views",
         batch_choice.micro_batch_size,
         batch_choice.global_micro_batch_size,
         batch_choice.accumulation_steps,
         batch_choice.effective_batch_size,
+        batch_choice.effective_batch_size * (
+            num_views if multi_view_enabled else 1
+        ),
         completed_steps,
     )
     protocol_notes: list[str] = []
@@ -1093,6 +1188,11 @@ def _train_impl(
             "multi_gpu_strategy": context.strategy,
             "accumulation_steps": batch_choice.accumulation_steps,
             "effective_batch_size": batch_choice.effective_batch_size,
+            "batch_unit": "objects" if multi_view_enabled else "views",
+            "effective_view_batch_size": (
+                batch_choice.effective_batch_size
+                * (num_views if multi_view_enabled else 1)
+            ),
             "next_action": "继续训练；中断后重新运行 train.ps1 将自动续跑",
             "protocol_notes": protocol_notes,
         }
@@ -1120,9 +1220,7 @@ def _train_impl(
                 "generalized_regularization_weight", 0.0
             )
         )
-        auxiliary_weights = config["model"].get("generalized", {}).get(
-            "auxiliary_weights"
-        )
+        auxiliary_weights = _auxiliary_weights(config)
         started = time.perf_counter()
         interval_started = started
         consecutive_skipped_steps = 0
@@ -1175,9 +1273,10 @@ def _train_impl(
                     batch_choice.accumulation_steps
                 ):
                     batch = next(iterator)
-                    images = batch["image"].to(
+                    images, view_ids, valid_view_mask = _batch_model_inputs(
+                        batch,
+                        config,
                         device,
-                        non_blocking=bool(config["runtime"]["pin_memory"]),
                     )
                     synchronize = (
                         not context.is_ddp
@@ -1200,12 +1299,15 @@ def _train_impl(
                                 bundle.model,
                                 images,
                                 weights=auxiliary_weights,
+                                view_ids=view_ids,
+                                valid_view_mask=valid_view_mask,
                             )
                             reconstruction = reconstruction_loss(
                                 encoder_features,
                                 decoder_features,
                                 discard_rate=discard_rate,
                                 loose_loss=bool(config["model"]["loose_loss"]),
+                                valid_view_mask=valid_view_mask,
                             )
                             raw_loss = (
                                 reconstruction
@@ -1350,6 +1452,13 @@ def _train_impl(
                         "global_micro_batch_size": (
                             batch_choice.global_micro_batch_size
                         ),
+                        "batch_unit": (
+                            "objects" if multi_view_enabled else "views"
+                        ),
+                        "effective_view_batch_size": (
+                            batch_choice.effective_batch_size
+                            * (num_views if multi_view_enabled else 1)
+                        ),
                         "world_size": context.world_size,
                         "accumulation_steps": batch_choice.accumulation_steps,
                         "eta_seconds": eta_seconds,
@@ -1472,10 +1581,19 @@ def _train_impl(
                 "created_at": utc_now(),
                 "config_fingerprint": config_fingerprint(config),
                 "completed_steps": total_steps,
+                "scheduler": {
+                    "completed_steps": total_steps,
+                    "config": dict(config["training"].get("scheduler", {})),
+                },
                 "model": trainable_state_dict(bundle),
                 "backbone": bundle.backbone_name,
                 "world_size": context.world_size,
                 "effective_batch_size": batch_choice.effective_batch_size,
+                "batch_unit": "objects" if multi_view_enabled else "views",
+                "effective_view_batch_size": (
+                    batch_choice.effective_batch_size
+                    * (num_views if multi_view_enabled else 1)
+                ),
                 "global_micro_batch_size": (
                     batch_choice.global_micro_batch_size
                 ),
@@ -1561,6 +1679,7 @@ def _probe_batch_impl(
         logger=logger,
         output_dir=output_dir,
     )
+    multi_view_enabled, num_views, _ = _multi_view_settings(config)
     result = {
         "status": "batch_tuned",
         "updated_at": utc_now(),
@@ -1574,6 +1693,10 @@ def _probe_batch_impl(
         "world_size": choice.world_size,
         "accumulation_steps": choice.accumulation_steps,
         "effective_batch_size": choice.effective_batch_size,
+        "batch_unit": "objects" if multi_view_enabled else "views",
+        "effective_view_batch_size": (
+            choice.effective_batch_size * (num_views if multi_view_enabled else 1)
+        ),
         "next_action": "运行 train.ps1；训练启动时会重新确认当前可用显存",
         "environment": environment_summary(device),
     }

@@ -14,6 +14,8 @@ from .config import PROJECT_ROOT
 from .generalized_model import (
     CompositionalNormalityAdapter,
     GeneralizedDinomaly,
+    MultiViewContextEncoder,
+    MultiViewGeneralizedDinomaly,
     combine_auxiliary_losses,
 )
 
@@ -140,10 +142,14 @@ class ModelBundle:
     backbone_name: str
     backbone_weights_path: Path
     backbone_sha256: str
+    multi_view_context: nn.Module | None = None
 
     @property
     def trainable(self) -> nn.ModuleList:
-        return nn.ModuleList([self.bottleneck, self.decoder])
+        modules: list[nn.Module] = [self.bottleneck, self.decoder]
+        if self.multi_view_context is not None:
+            modules.append(self.multi_view_context)
+        return nn.ModuleList(modules)
 
 
 def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
@@ -178,11 +184,24 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
     dropout = float(model_config["dropout"])
     architecture = str(model_config.get("architecture", "dinomaly2")).lower()
     generalized_names = {"generalized", "category_generalized", "cg_dinomaly"}
+    multi_view_config = dict(model_config.get("multi_view", {}))
+    multi_view_enabled = bool(multi_view_config.get("enabled", False))
+    multi_view_context: MultiViewContextEncoder | None = None
+    if multi_view_enabled and architecture not in generalized_names:
+        raise ValueError(
+            "model.multi_view.enabled requires model.architecture=category_generalized"
+        )
     if architecture in generalized_names:
         generalized = dict(model_config.get("generalized", {}))
         latent_dim = int(generalized.get("latent_dim", 256))
         if latent_dim <= 0:
             raise ValueError("model.generalized.latent_dim must be positive")
+        context_dim = int(multi_view_config.get("context_dim", latent_dim))
+        if multi_view_enabled and context_dim != latent_dim:
+            raise ValueError(
+                "model.multi_view.context_dim must equal generalized.latent_dim "
+                "because cross-view context conditions the normality adapter"
+            )
         bottleneck = nn.ModuleList(
             [
                 nn.Sequential(
@@ -212,9 +231,38 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
                     dropout=float(
                         generalized.get("expert_dropout", dropout)
                     ),
+                    multi_view_conditioning=multi_view_enabled,
                 ),
             ]
         )
+        if multi_view_enabled:
+            multi_view_context = MultiViewContextEncoder(
+                dim=context_dim,
+                num_views=int(multi_view_config.get("num_views", 5)),
+                num_layers=int(multi_view_config.get("num_set_layers", 2)),
+                num_heads=int(multi_view_config.get("num_heads", 6)),
+                trim_ratio=float(
+                    multi_view_config.get(
+                        "router_trim_ratio",
+                        generalized.get("router_trim_ratio", 0.1),
+                    )
+                ),
+                view_embedding=bool(
+                    multi_view_config.get("view_embedding", True)
+                ),
+                view_dropout_probability=float(
+                    multi_view_config.get("view_dropout_probability", 0.2)
+                ),
+                visibility_temperature=float(
+                    multi_view_config.get("visibility_temperature", 1.0)
+                ),
+                dropout=float(
+                    multi_view_config.get("cross_view_dropout", dropout)
+                ),
+                variance_target=float(
+                    multi_view_config.get("variance_target", 1.0)
+                ),
+            )
     elif architecture in {"dinomaly", "dinomaly2", "baseline"}:
         bottleneck = nn.ModuleList(
             [
@@ -258,21 +306,34 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
     encoder_fusion, decoder_fusion = loose_constraint_layers(
         int(model_config["loose_constraint_groups"])
     )
-    model_class = (
-        GeneralizedDinomaly
-        if architecture in generalized_names
-        else symbols["Dinomaly"]
-    )
-    model = model_class(
-        encoder=encoder,
-        bottleneck=bottleneck,
-        decoder=decoder,
-        target_layers=target_layers,
-        remove_class_token=False,
-        fuse_layer_encoder=encoder_fusion,
-        fuse_layer_decoder=decoder_fusion,
-        context_aware_recenter=bool(model_config["context_aware_recenter"]),
-    )
+    if architecture in generalized_names:
+        model_class = (
+            MultiViewGeneralizedDinomaly
+            if multi_view_enabled
+            else GeneralizedDinomaly
+        )
+        model = model_class(
+            encoder=encoder,
+            bottleneck=bottleneck,
+            decoder=decoder,
+            target_layers=target_layers,
+            remove_class_token=False,
+            fuse_layer_encoder=encoder_fusion,
+            fuse_layer_decoder=decoder_fusion,
+            context_aware_recenter=bool(model_config["context_aware_recenter"]),
+            multi_view_context_encoder=multi_view_context,
+        )
+    else:
+        model = symbols["Dinomaly"](
+            encoder=encoder,
+            bottleneck=bottleneck,
+            decoder=decoder,
+            target_layers=target_layers,
+            remove_class_token=False,
+            fuse_layer_encoder=encoder_fusion,
+            fuse_layer_decoder=decoder_fusion,
+            context_aware_recenter=bool(model_config["context_aware_recenter"]),
+        )
     model.init_weights()
     model.to(device)
     return ModelBundle(
@@ -283,6 +344,7 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
         backbone_name=backbone_name,
         backbone_weights_path=weights_path,
         backbone_sha256=weights_sha256,
+        multi_view_context=multi_view_context,
     )
 
 
@@ -316,6 +378,15 @@ def build_optimizer(bundle: ModelBundle, config: dict[str, Any]):
             "group_name": "decoder",
         },
     ]
+    if bundle.multi_view_context is not None:
+        groups.append(
+            {
+                "params": bundle.multi_view_context.parameters(),
+                "lr": base_lr,
+                "initial_lr": base_lr,
+                "group_name": "multi_view_context",
+            }
+        )
     common = {
         "lr": base_lr,
         "betas": betas,
@@ -417,10 +488,13 @@ def set_learning_rate(
 
 
 def trainable_state_dict(bundle: ModelBundle) -> dict[str, Any]:
-    return {
+    state = {
         "bottleneck": bundle.bottleneck.state_dict(),
         "decoder": bundle.decoder.state_dict(),
     }
+    if bundle.multi_view_context is not None:
+        state["multi_view_context"] = bundle.multi_view_context.state_dict()
+    return state
 
 
 def load_trainable_state_dict(
@@ -430,6 +504,19 @@ def load_trainable_state_dict(
 ) -> None:
     bundle.bottleneck.load_state_dict(state["bottleneck"], strict=strict)
     bundle.decoder.load_state_dict(state["decoder"], strict=strict)
+    stored_multi_view = state.get("multi_view_context")
+    if bundle.multi_view_context is None:
+        if strict and stored_multi_view is not None:
+            raise ValueError(
+                "checkpoint contains multi-view parameters but multi-view is disabled"
+            )
+    elif stored_multi_view is None:
+        if strict:
+            raise ValueError(
+                "multi-view model requires checkpoint multi_view_context parameters"
+            )
+    else:
+        bundle.multi_view_context.load_state_dict(stored_multi_view, strict=strict)
 
 
 def parameter_summary(bundle: ModelBundle) -> dict[str, int]:
@@ -467,6 +554,8 @@ def forward_with_regularization(
     model: nn.Module,
     images: torch.Tensor,
     weights: dict[str, float] | None = None,
+    view_ids: torch.Tensor | None = None,
+    valid_view_mask: torch.Tensor | None = None,
 ) -> tuple[
     list[torch.Tensor],
     list[torch.Tensor],
@@ -485,6 +574,8 @@ def forward_with_regularization(
     if isinstance(unwrapped, GeneralizedDinomaly):
         encoder_features, decoder_features, gathered = model(
             images,
+            view_ids=view_ids,
+            valid_view_mask=valid_view_mask,
             return_auxiliary=True,
         )
         reduced = {name: value.mean() for name, value in gathered.items()}

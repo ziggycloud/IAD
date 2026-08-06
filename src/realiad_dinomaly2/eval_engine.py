@@ -13,7 +13,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .config import PROJECT_ROOT, config_fingerprint
-from .data import RealIADVarietyDataset, discover_categories
+from .data import (
+    RealIADMultiViewDataset,
+    RealIADVarietyDataset,
+    discover_categories,
+)
 from .losses import anomaly_map
 from .metrics import (
     GaussianFilter,
@@ -24,6 +28,12 @@ from .metrics import (
     top_ratio_mean,
 )
 from .modeling import build_model, load_trainable_state_dict
+from .normal_prior import (
+    NormalPrior,
+    file_sha256,
+    load_normal_prior,
+    normal_prior_path,
+)
 from .runtime import (
     amp_dtype,
     append_jsonl,
@@ -102,6 +112,16 @@ def _evaluation_signature(
             "missing_anomaly_mask_policy"
         ],
     }
+    if bool(config["evaluation"].get("normal_prior", {}).get("enabled", False)):
+        prior_path = normal_prior_path(config)
+        if not prior_path.is_file():
+            raise FileNotFoundError(
+                f"normal prior artifact does not exist: {prior_path}"
+            )
+        payload["normal_prior"] = {
+            "path": str(prior_path),
+            "sha256": file_sha256(prior_path),
+        }
     encoded = json.dumps(
         payload,
         sort_keys=True,
@@ -139,34 +159,60 @@ def evaluate_category(
     dtype: torch.dtype | None,
     logger,
     scratch_dir: Path,
+    normal_prior: NormalPrior | None = None,
 ) -> dict[str, Any]:
     dataset_config = config["dataset"]
     evaluation = config["evaluation"]
-    dataset = RealIADVarietyDataset(
-        json_dir=Path(dataset_config["json_dir"]),
-        image_dir=Path(dataset_config["image_dir"]),
-        category=category,
-        phase="test",
-        image_size=int(dataset_config["image_size"]),
-        crop_size=int(dataset_config["crop_size"]),
-        max_items=evaluation.get("max_test_images_per_category"),
-        image_label_policy=str(dataset_config["image_label_policy"]),
-        missing_anomaly_mask_policy=str(
+    multi_view_config = dict(config["model"].get("multi_view", {}))
+    multi_view_enabled = bool(multi_view_config.get("enabled", False))
+    common_dataset_args = {
+        "json_dir": Path(dataset_config["json_dir"]),
+        "image_dir": Path(dataset_config["image_dir"]),
+        "category": category,
+        "phase": "test",
+        "image_size": int(dataset_config["image_size"]),
+        "crop_size": int(dataset_config["crop_size"]),
+        "image_label_policy": str(dataset_config["image_label_policy"]),
+        "missing_anomaly_mask_policy": str(
             dataset_config["missing_anomaly_mask_policy"]
         ),
-        mask_resize_semantics=str(
+        "mask_resize_semantics": str(
             dataset_config.get(
                 "mask_resize_semantics",
                 "upstream_bilinear_nonzero",
             )
         ),
-    )
+    }
+    if multi_view_enabled:
+        max_images = evaluation.get("max_test_images_per_category")
+        max_objects = (
+            None
+            if max_images is None
+            else max(1, int(max_images) // int(multi_view_config.get("num_views", 5)))
+        )
+        dataset = RealIADMultiViewDataset(
+            **common_dataset_args,
+            num_views=int(multi_view_config.get("num_views", 5)),
+            missing_view_policy=str(
+                multi_view_config.get("missing_view_policy", "error")
+            ),
+            max_objects=max_objects,
+        )
+    else:
+        dataset = RealIADVarietyDataset(
+            **common_dataset_args,
+            max_items=evaluation.get("max_test_images_per_category"),
+        )
     loader = _loader(dataset, config)
     resize_mask = int(evaluation["resize_mask"])
     pixel_accumulator = SpoolingPixelMetricAccumulator(
         device=device,
         bins=int(evaluation["metric_bins"]),
-        capacity=len(dataset),
+        capacity=(
+            len(dataset) * int(multi_view_config.get("num_views", 5))
+            if multi_view_enabled
+            else len(dataset)
+        ),
         height=resize_mask,
         width=resize_mask,
         scratch_dir=scratch_dir,
@@ -191,63 +237,138 @@ def evaluate_category(
     bundle.model.eval()
 
     for batch in loader:
-        images = batch["image"].to(
-            device,
-            non_blocking=bool(config["runtime"]["pin_memory"]),
-        )
-        with autocast_context(dtype, device):
-            encoder_features, decoder_features = bundle.model(images)
-            maps = anomaly_map(
-                encoder_features,
-                decoder_features,
-                output_size=int(dataset_config["crop_size"]),
-                layer_weights=evaluation.get("anomaly_map_layer_weights"),
-                align_corners=bool(
-                    evaluation.get("anomaly_map_align_corners", True)
-                ),
+        if multi_view_enabled:
+            images = batch["images"].to(
+                device,
+                non_blocking=bool(config["runtime"]["pin_memory"]),
             )
-        maps = maps.to(dtype=torch.float32)
-        maps = F.interpolate(
-            maps,
+            view_ids = batch["view_ids"].to(device, non_blocking=True)
+            valid_view_mask = batch["valid_view_mask"].to(
+                device, non_blocking=True
+            )
+            category_names = [str(value) for value in batch["category"]]
+            with autocast_context(dtype, device):
+                encoder_features, decoder_features = bundle.model(
+                    images,
+                    view_ids=view_ids,
+                    valid_view_mask=valid_view_mask,
+                )
+                patch_maps = anomaly_map(
+                    encoder_features,
+                    decoder_features,
+                    output_size=int(dataset_config["crop_size"]) // 14,
+                    layer_weights=evaluation.get("anomaly_map_layer_weights"),
+                    align_corners=bool(
+                        evaluation.get("anomaly_map_align_corners", True)
+                    ),
+                )
+            if normal_prior is not None:
+                patch_maps = normal_prior.calibrate(
+                    patch_maps,
+                    categories=category_names,
+                    view_ids=view_ids,
+                    valid_view_mask=valid_view_mask,
+                    config=config,
+                )
+            batch_size, view_count = patch_maps.shape[:2]
+            flat_maps = patch_maps.float().reshape(
+                batch_size * view_count,
+                *patch_maps.shape[2:],
+            )
+            labels_tensor = batch["labels"].to(dtype=torch.uint8).reshape(-1)
+            masks = batch["masks"].to(device, non_blocking=True).reshape(
+                batch_size * view_count,
+                *batch["masks"].shape[2:],
+            )
+            pixel_valid = batch["pixel_valid"].to(dtype=torch.bool).reshape(-1)
+            valid_flat = valid_view_mask.reshape(-1)
+            object_ids = [str(value) for value in batch["object_id"]]
+            flat_object_ids = [
+                object_ids[object_index]
+                for object_index in range(batch_size)
+                for _ in range(view_count)
+            ]
+            flat_categories = [
+                category_names[object_index]
+                for object_index in range(batch_size)
+                for _ in range(view_count)
+            ]
+        else:
+            images = batch["image"].to(
+                device,
+                non_blocking=bool(config["runtime"]["pin_memory"]),
+            )
+            category_names = [str(value) for value in batch["category"]]
+            view_ids = batch["view_id"].to(device, dtype=torch.long) - 1
+            valid_view_mask = torch.ones_like(view_ids, dtype=torch.bool)
+            with autocast_context(dtype, device):
+                encoder_features, decoder_features = bundle.model(images)
+                patch_maps = anomaly_map(
+                    encoder_features,
+                    decoder_features,
+                    output_size=int(dataset_config["crop_size"]) // 14,
+                    layer_weights=evaluation.get("anomaly_map_layer_weights"),
+                    align_corners=bool(
+                        evaluation.get("anomaly_map_align_corners", True)
+                    ),
+                )
+            if normal_prior is not None:
+                patch_maps = normal_prior.calibrate(
+                    patch_maps,
+                    categories=category_names,
+                    view_ids=view_ids,
+                    valid_view_mask=valid_view_mask,
+                    config=config,
+                )
+            flat_maps = patch_maps.float()
+            labels_tensor = batch["label"].to(dtype=torch.uint8)
+            masks = batch["mask"].to(device, non_blocking=True)
+            pixel_valid = batch["pixel_valid"].to(dtype=torch.bool)
+            valid_flat = valid_view_mask
+            flat_object_ids = [str(value) for value in batch["object_id"]]
+            flat_categories = category_names
+
+        flat_maps = F.interpolate(
+            flat_maps,
             size=(resize_mask, resize_mask),
             mode="bilinear",
             align_corners=False,
         )
-        maps = gaussian(maps)
-        masks = batch["mask"].to(device, non_blocking=True)
+        flat_maps = gaussian(flat_maps)
         masks = F.interpolate(
             masks,
             size=(resize_mask, resize_mask),
             mode="nearest",
         )
         masks = (masks > 0.5).to(torch.uint8)
-
-        labels_tensor = batch["label"].to(dtype=torch.uint8)
         scores_tensor = top_ratio_mean(
-            maps,
+            flat_maps,
             ratio=float(evaluation["image_top_ratio"]),
         )
-        image_labels.extend(int(value) for value in labels_tensor.tolist())
-        image_scores.extend(float(value) for value in scores_tensor.cpu().tolist())
+        valid_cpu = valid_flat.to(device="cpu", dtype=torch.bool)
+        image_labels.extend(
+            int(value) for value in labels_tensor[valid_cpu].tolist()
+        )
+        image_scores.extend(
+            float(value) for value in scores_tensor.cpu()[valid_cpu].tolist()
+        )
 
-        pixel_valid = batch["pixel_valid"].to(dtype=torch.bool)
-        if bool(pixel_valid.any()):
-            valid_device = pixel_valid.to(device)
+        metric_valid = pixel_valid & valid_cpu
+        if bool(metric_valid.any()):
+            valid_device = metric_valid.to(device)
             pixel_accumulator.add(
-                maps[valid_device, 0],
+                flat_maps[valid_device, 0],
                 masks[valid_device, 0],
             )
-            pixel_count += int(pixel_valid.sum())
+            pixel_count += int(metric_valid.sum())
 
-        object_ids = list(batch["object_id"])
-        categories = list(batch["category"])
-        for index, object_id in enumerate(object_ids):
+        for index in valid_cpu.nonzero(as_tuple=False).flatten().tolist():
             object_accumulator.add(
-                object_key=f"{categories[index]}/{object_id}",
-                anomaly_map=maps[index, 0],
+                object_key=f"{flat_categories[index]}/{flat_object_ids[index]}",
+                anomaly_map=flat_maps[index, 0],
                 image_label=int(labels_tensor[index]),
             )
-        image_count += int(images.shape[0])
+        image_count += int(valid_cpu.sum())
 
     image_result = binary_metrics(image_labels, image_scores)
     pixel_result = pixel_accumulator.summary()
@@ -518,6 +639,13 @@ def evaluate(
             "checkpoint 所用 DINOv2 backbone SHA-256 与当前权重不一致"
         )
     load_trainable_state_dict(bundle, checkpoint_payload["model"])
+    normal_prior = None
+    if bool(config["evaluation"].get("normal_prior", {}).get("enabled", False)):
+        normal_prior = load_normal_prior(
+            normal_prior_path(config),
+            config,
+            checkpoint_path,
+        )
     logger.info(
         "评估 %d 类；checkpoint step=%s；环境=%s",
         len(categories),
@@ -543,6 +671,7 @@ def evaluate(
                 dtype=dtype,
                 logger=logger,
                 scratch_dir=scratch_dir,
+                normal_prior=normal_prior,
             )
             atomic_write_json(result_path, row)
             append_jsonl(
