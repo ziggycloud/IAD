@@ -246,7 +246,7 @@ mask 按类别做无标签、严格单调的 8-bit 分位数标定，以充分�
 完成后读取：
 
 ```text
-outputs/generalized_dinomaly_competition_seen50_vitl448/
+outputs/generalized_dinomaly_competition_seen50_vitl448_stable_v2/
 ├── competition_data_audit.json
 ├── competition_pipeline_state.json
 ├── checkpoints/final_model.pt
@@ -270,3 +270,6 @@ python run_competition_pipeline.py `
   --set runtime.device_ids=[0] `
   --set submission.batch_size=2
 ```
+
+分割边缘假阳性、五视角无监督建模、梯度爆炸诊断和 YAML 调参说明见
+[COMPETITION_TUNING.md](COMPETITION_TUNING.md)。

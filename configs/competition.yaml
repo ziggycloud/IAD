@@ -1,6 +1,7 @@
 experiment:
-  name: generalized_dinomaly_competition_seen50_vitl448
-  output_dir: outputs/generalized_dinomaly_competition_seen50_vitl448
+  name: generalized_dinomaly_competition_seen50_vitl448_stable_v2
+  # A new directory is intentional: do not resume the already destabilized run.
+  output_dir: outputs/generalized_dinomaly_competition_seen50_vitl448_stable_v2
   seed: 20260803
 
 dataset:
@@ -50,18 +51,39 @@ training:
   memory_headroom_mb: 3000
   amp: true
   amp_dtype: bfloat16
-  learning_rate: 0.001
+  # 1e-3 became unstable when total_steps was extended to 15k. Start with
+  # 3e-4; tune [1e-4, 3e-4, 5e-4] before changing the architecture.
+  learning_rate: 0.0003
   first_bottleneck_lr_scale: 0.2
   weight_decay: 0.0001
   adam_betas: [0.9, 0.999]
-  adam_epsilon: 1.0e-10
-  warmup_steps: 300
-  lr_step_offset: 1
-  final_lr_ratio: 0.1
-  loose_loss_warmup_steps: 800
-  loose_loss_final_discard: 0.9
+  adam_epsilon: 1.0e-8
+  optimizer:
+    # Supported: stable_adamw, adamw, adam.
+    type: stable_adamw
+    amsgrad: false
+    stable_clip_threshold: 1.0
+  scheduler:
+    # Supported: cosine, linear, polynomial, constant, step, multistep.
+    type: cosine
+    warmup_steps: 500
+    min_lr_ratio: 0.05
+    step_offset: 1
+    # polynomial: power: 2.0
+    # step: step_size: 1500, gamma: 0.5
+    # multistep: milestones: [2500, 4500], gamma: 0.3
+  # A slower, less aggressive Loose Loss avoids locking onto persistent
+  # normal edges as the only hard tokens.
+  loose_loss_warmup_steps: 2000
+  loose_loss_final_discard: 0.7
   generalized_regularization_weight: 0.01
   gradient_clip_norm: 0.1
+  gradient_guard:
+    # The logged norm is measured before clipping. Skip only catastrophic
+    # outliers; after three consecutive skips stop and preserve the last ckpt.
+    skip_step_norm: 1.0
+    max_consecutive_skips: 3
+    fail_on_nonfinite: true
   log_every: 20
   checkpoint_every: 250
   auto_resume: true
@@ -75,7 +97,12 @@ evaluation:
   image_top_ratio: 0.01
   object_top_ratio: 0.01
   gaussian_kernel_size: 5
-  gaussian_sigma: 4.0
+  # Sigma 4 spreads a narrow edge response into a wide false-positive halo.
+  gaussian_sigma: 2.0
+  # Two Loose-Constraint feature groups: reduce the shallow/high-frequency
+  # group and emphasize the deeper semantic group. [1, 1] is the old behavior.
+  anomaly_map_layer_weights: [0.35, 0.65]
+  anomaly_map_align_corners: false
   metric_bins: 1000
   resume: true
 
