@@ -1,0 +1,128 @@
+experiment:
+  name: generalized_dinomaly_competition_seen50_vitl448_stable_v2
+  # A new directory is intentional: do not resume the already destabilized run.
+  output_dir: outputs/generalized_dinomaly_competition_seen50_vitl448_stable_v2
+  seed: 20260803
+
+dataset:
+  type: competition_folders
+  train_dir: data/competition/Train
+  test_dir: data/competition/Test_A
+  categories: all
+  category_limit: null
+  expected_categories: 50
+  expected_train_samples_per_category: 20
+  expected_test_samples_per_category: 15
+  image_size: 448
+  crop_size: 448
+  train_mode: all_views
+
+model:
+  # Keep the same category-generalized model used by run_unseen_pipeline.py.
+  architecture: category_generalized
+  backbone: dinov2reg_vit_large_14
+  backbone_weights_dir: third_party/Dinomaly2/backbones/weights
+  dropout: 0.2
+  linear_attention: true
+  loose_constraint_groups: 2
+  loose_loss: true
+  context_aware_recenter: true
+  generalized:
+    latent_dim: 384
+    num_references: 512
+    reference_top_k: 32
+    reference_temperature: 0.1
+    router_top_k: 3
+    router_temperature: 1.0
+    router_trim_ratio: 0.1
+    expert_dropout: 0.1
+    auxiliary_weights:
+      reference_balance: 1.0
+      router_balance: 1.0
+      router_entropy_penalty: 0.05
+      expert_diversity: 0.05
+
+training:
+  # 6k x global batch 64 over 5,000 views is about 76.8 passes.
+  total_steps: 6000
+  effective_batch_size: 64
+  micro_batch_size: auto
+  batch_candidates: [16, 8, 4, 2, 1]
+  memory_headroom_mb: 3000
+  amp: true
+  amp_dtype: bfloat16
+  # 1e-3 became unstable when total_steps was extended to 15k. Start with
+  # 3e-4; tune [1e-4, 3e-4, 5e-4] before changing the architecture.
+  learning_rate: 0.0003
+  first_bottleneck_lr_scale: 0.2
+  weight_decay: 0.0001
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  optimizer:
+    # Supported: stable_adamw, adamw, adam.
+    type: stable_adamw
+    amsgrad: false
+    stable_clip_threshold: 1.0
+  scheduler:
+    # Supported: cosine, linear, polynomial, constant, step, multistep.
+    type: cosine
+    warmup_steps: 500
+    min_lr_ratio: 0.05
+    step_offset: 1
+    # polynomial: power: 2.0
+    # step: step_size: 1500, gamma: 0.5
+    # multistep: milestones: [2500, 4500], gamma: 0.3
+  # A slower, less aggressive Loose Loss avoids locking onto persistent
+  # normal edges as the only hard tokens.
+  loose_loss_warmup_steps: 2000
+  loose_loss_final_discard: 0.7
+  generalized_regularization_weight: 0.01
+  gradient_clip_norm: 0.1
+  gradient_guard:
+    # The logged norm is measured before clipping. Skip only catastrophic
+    # outliers; after three consecutive skips stop and preserve the last ckpt.
+    skip_step_norm: 1.0
+    max_consecutive_skips: 3
+    fail_on_nonfinite: true
+  log_every: 20
+  checkpoint_every: 250
+  auto_resume: true
+
+evaluation:
+  # Used by competition inference; no labels or local metrics are required.
+  amp: true
+  batch_size: 4
+  num_workers: 4
+  resize_mask: 448
+  image_top_ratio: 0.01
+  object_top_ratio: 0.01
+  gaussian_kernel_size: 5
+  # Sigma 4 spreads a narrow edge response into a wide false-positive halo.
+  gaussian_sigma: 2.0
+  # Two Loose-Constraint feature groups: reduce the shallow/high-frequency
+  # group and emphasize the deeper semantic group. [1, 1] is the old behavior.
+  anomaly_map_layer_weights: [0.35, 0.65]
+  anomaly_map_align_corners: false
+  metric_bins: 1000
+  resume: true
+
+submission:
+  mask_size: 448
+  batch_size: 4
+  num_workers: 4
+  object_top_ratio: 0.01
+  # Per-category monotonic 8-bit calibration. The extreme upper quantile keeps
+  # anomalous peaks from being collapsed while using the PNG range efficiently.
+  lower_quantile: 0.001
+  upper_quantile: 0.99999
+
+runtime:
+  device: cuda:0
+  multi_gpu_strategy: auto
+  distributed_backend: auto
+  device_ids: [0, 1]
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  deterministic: false

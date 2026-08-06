@@ -201,6 +201,10 @@ def evaluate_category(
                 encoder_features,
                 decoder_features,
                 output_size=int(dataset_config["crop_size"]),
+                layer_weights=evaluation.get("anomaly_map_layer_weights"),
+                align_corners=bool(
+                    evaluation.get("anomaly_map_align_corners", True)
+                ),
             )
         maps = maps.to(dtype=torch.float32)
         maps = F.interpolate(

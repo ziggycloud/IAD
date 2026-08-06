@@ -19,8 +19,8 @@ dataset:
   # run_unseen_pipeline.py replaces this with the persisted 50 seen classes.
   categories: all
   category_limit: null
-  image_size: 392
-  crop_size: 392
+  image_size: 448
+  crop_size: 448
   train_mode: all_views
   image_label_policy: visible_defect
   missing_anomaly_mask_policy: include_as_normal_view

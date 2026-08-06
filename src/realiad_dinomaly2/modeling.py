@@ -289,36 +289,62 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
 def build_optimizer(bundle: ModelBundle, config: dict[str, Any]):
     symbols = _load_upstream_symbols()
     train_config = config["training"]
+    optimizer_config = dict(train_config.get("optimizer", {}))
+    optimizer_type = str(
+        optimizer_config.get("type", "stable_adamw")
+    ).lower()
     base_lr = float(train_config["learning_rate"])
     first_lr = base_lr * float(train_config["first_bottleneck_lr_scale"])
     betas = tuple(float(value) for value in train_config["adam_betas"])
-    optimizer = symbols["StableAdamW"](
-        [
-            {
-                "params": bundle.bottleneck[0].parameters(),
-                "lr": first_lr,
-                "initial_lr": first_lr,
-                "group_name": "bottleneck_first",
-            },
-            {
-                "params": bundle.bottleneck[1].parameters(),
-                "lr": base_lr,
-                "initial_lr": base_lr,
-                "group_name": "bottleneck_rest",
-            },
-            {
-                "params": bundle.decoder.parameters(),
-                "lr": base_lr,
-                "initial_lr": base_lr,
-                "group_name": "decoder",
-            },
-        ],
-        lr=base_lr,
-        betas=betas,
-        weight_decay=float(train_config["weight_decay"]),
-        amsgrad=False,
-        eps=float(train_config["adam_epsilon"]),
-    )
+    groups = [
+        {
+            "params": bundle.bottleneck[0].parameters(),
+            "lr": first_lr,
+            "initial_lr": first_lr,
+            "group_name": "bottleneck_first",
+        },
+        {
+            "params": bundle.bottleneck[1].parameters(),
+            "lr": base_lr,
+            "initial_lr": base_lr,
+            "group_name": "bottleneck_rest",
+        },
+        {
+            "params": bundle.decoder.parameters(),
+            "lr": base_lr,
+            "initial_lr": base_lr,
+            "group_name": "decoder",
+        },
+    ]
+    common = {
+        "lr": base_lr,
+        "betas": betas,
+        "weight_decay": float(train_config["weight_decay"]),
+        "amsgrad": bool(optimizer_config.get("amsgrad", False)),
+        "eps": float(train_config["adam_epsilon"]),
+    }
+    if optimizer_type == "stable_adamw":
+        optimizer = symbols["StableAdamW"](
+            groups,
+            **common,
+            clip_threshold=float(
+                optimizer_config.get("stable_clip_threshold", 1.0)
+            ),
+        )
+    elif optimizer_type == "adamw":
+        optimizer = torch.optim.AdamW(groups, **common)
+    elif optimizer_type == "adam":
+        common.pop("weight_decay")
+        optimizer = torch.optim.Adam(
+            groups,
+            **common,
+            weight_decay=float(train_config["weight_decay"]),
+        )
+    else:
+        raise ValueError(
+            "training.optimizer.type must be stable_adamw, adamw, or adam; "
+            f"got {optimizer_type!r}"
+        )
     return optimizer
 
 
@@ -329,10 +355,16 @@ def set_learning_rate(
     warmup_steps: int,
     final_ratio: float,
     step_offset: int = 1,
+    scheduler_config: dict[str, Any] | None = None,
 ) -> list[float]:
-    """Set the LR for the next optimizer step, following the paper schedule."""
+    """Set the next-step LR using a warmup plus a YAML-selected schedule."""
     import math
 
+    scheduler = dict(scheduler_config or {})
+    scheduler_type = str(scheduler.get("type", "cosine")).lower()
+    warmup_steps = int(scheduler.get("warmup_steps", warmup_steps))
+    final_ratio = float(scheduler.get("min_lr_ratio", final_ratio))
+    step_offset = int(scheduler.get("step_offset", step_offset))
     schedule_step = completed_steps + step_offset
     if schedule_step < 0:
         raise ValueError("schedule_step 不能为负数")
@@ -344,8 +376,37 @@ def set_learning_rate(
             1.0,
             max(0.0, (schedule_step - warmup_steps) / denominator),
         )
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        factor = final_ratio + (1.0 - final_ratio) * cosine
+        if scheduler_type == "cosine":
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            factor = final_ratio + (1.0 - final_ratio) * cosine
+        elif scheduler_type == "linear":
+            factor = 1.0 - (1.0 - final_ratio) * progress
+        elif scheduler_type == "polynomial":
+            power = float(scheduler.get("power", 1.0))
+            factor = final_ratio + (1.0 - final_ratio) * (
+                (1.0 - progress) ** power
+            )
+        elif scheduler_type == "constant":
+            factor = 1.0
+        elif scheduler_type == "step":
+            step_size = int(scheduler.get("step_size", 1000))
+            if step_size <= 0:
+                raise ValueError("scheduler step_size must be > 0")
+            gamma = float(scheduler.get("gamma", 0.1))
+            after_warmup = max(0, schedule_step - warmup_steps)
+            factor = max(final_ratio, gamma ** (after_warmup // step_size))
+        elif scheduler_type == "multistep":
+            gamma = float(scheduler.get("gamma", 0.1))
+            milestones = sorted(
+                int(value) for value in scheduler.get("milestones", [])
+            )
+            decays = sum(schedule_step >= milestone for milestone in milestones)
+            factor = max(final_ratio, gamma**decays)
+        else:
+            raise ValueError(
+                "scheduler type must be cosine, linear, polynomial, constant, "
+                f"step, or multistep; got {scheduler_type!r}"
+            )
 
     values: list[float] = []
     for group in optimizer.param_groups:
