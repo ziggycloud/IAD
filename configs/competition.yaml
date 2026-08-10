@@ -1,7 +1,7 @@
 experiment:
-  name: information_density_dinomaly2_competition_vitl448_v1
-  # Information-density checkpoints are incompatible with the original baseline.
-  output_dir: outputs/information_density_dinomaly2_competition_vitl448_v1
+  name: difficulty_moe_dinomaly2_competition_vitl448_v1
+  # Difficulty-MoE checkpoints are incompatible with earlier bottlenecks.
+  output_dir: outputs/difficulty_moe_dinomaly2_competition_vitl448_v1
   seed: 20260803
 
 dataset:
@@ -18,8 +18,8 @@ dataset:
   train_mode: all_views
 
 model:
-  # Preserve upstream Dinomaly2 and upgrade only its 1024 -> 256 bottleneck.
-  architecture: information_density_dinomaly2
+  # Preserve upstream Dinomaly2; modify only the competition bottleneck.
+  architecture: difficulty_moe_dinomaly2
   backbone: dinov2reg_vit_large_14
   backbone_weights_dir: third_party/Dinomaly2/backbones/weights
   dropout: 0.2
@@ -45,6 +45,17 @@ model:
     initial_expected_error: 0.1
     # Subtract only a bounded, difficulty-weighted part of expected normal error.
     calibration_blend: 0.35
+    moe:
+      # Low/mid/high experts receive progressively wider latent prefixes.
+      expert_input_widths: [64, 128, 256]
+      expert_hidden_dims: [1024, 2048, 4096]
+      routing_centers: [0.17, 0.50, 0.83]
+      routing_temperature: 0.10
+      # First learn reconstruction and difficulty, then switch to sparse top-1.
+      routing_warmup_steps: 1500
+      routing_ramp_steps: 1000
+      hard_routing_start_step: 2500
+      target_load: [0.60, 0.30, 0.10]
     auxiliary_weights:
       difficulty_prediction: 1.0
       difficulty_budget: 0.1
@@ -52,6 +63,14 @@ model:
       difficulty_mean: 0.0
       capacity_mid_usage: 0.0
       capacity_high_usage: 0.0
+      moe_load_balance: 0.1
+      moe_route_entropy: 0.01
+      moe_soft_low_usage: 0.0
+      moe_soft_mid_usage: 0.0
+      moe_soft_high_usage: 0.0
+      moe_hard_low_usage: 0.0
+      moe_hard_mid_usage: 0.0
+      moe_hard_high_usage: 0.0
   generalized:
     latent_dim: 384
     num_references: 512

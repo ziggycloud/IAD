@@ -93,12 +93,24 @@ class CompetitionDataTests(unittest.TestCase):
         self.assertTrue(Path(config["dataset"]["test_dir"]).is_absolute())
         self.assertEqual(
             config["model"]["architecture"],
-            "information_density_dinomaly2",
+            "difficulty_moe_dinomaly2",
         )
         self.assertFalse(config["model"]["multi_view"]["enabled"])
         self.assertEqual(
             config["model"]["information_density"]["channel_widths"],
             [64, 128, 256],
+        )
+        self.assertEqual(
+            config["model"]["information_density"]["moe"][
+                "expert_input_widths"
+            ],
+            [64, 128, 256],
+        )
+        self.assertEqual(
+            config["model"]["information_density"]["moe"][
+                "hard_routing_start_step"
+            ],
+            2500,
         )
         self.assertEqual(
             config["training"][

@@ -226,8 +226,8 @@ python run_unseen_pipeline.py
 
 比赛数据直接按 `category/Sxxxx/0.png..4.png` 读取，不需要官方 JSON，也不读取
 任何标签。默认配置使用 DINOv2-register ViT-L/14 和上游 DInomaly2 主体，只在
-`1024 → 256` bottleneck 中加入上下文困难度估计及 `64/128/256` 连续嵌套通道，
-并把输入对齐到提交 mask 的 448 × 448：
+`1024 → 256 → 1024` bottleneck 中加入上下文困难度估计、`64/128/256` 连续嵌套
+通道和低/中/高难度三个独立重建专家，并把输入对齐到提交 mask 的 448 × 448：
 
 ```powershell
 # 一键：审计 → 正常 Train 训练 → 正常 Train prior → Test_A 推理 → 校验并打 ZIP
@@ -252,9 +252,10 @@ Set Transformer 联合架构。分类分数聚合由
 缺陷被软共识抹掉。
 
 困难度估计器只观察中心 patch 之外的邻域和全局 special tokens。前 1500 step
-保持原始 256 通道全开，随后用 1000 step 平滑启用动态容量；训练日志中的
-`difficulty_prediction`、`difficulty_mean`、`capacity_mid_usage` 和
-`capacity_high_usage` 用于监控难度预测与容量退化。
+保持原始 256 通道和高容量专家，随后用 1000 step 平滑启用软路由；从 2500 step
+开始按困难度执行稀疏 top-1 专家分派。重建梯度不会反向操纵困难度路由，估计器只由
+正常重建误差监督、预算和负载均衡约束训练。日志中的 `difficulty_prediction`、
+`moe_load_balance`、`moe_soft_*_usage` 和 `moe_hard_*_usage` 用于监控路由是否退化。
 
 正常边缘先验仅扫描 Train 正常图，并把 checkpoint/config fingerprint 写入 artifact；
 不匹配时拒绝复用。Test_A 只在 prior 保存后进入推理，不参与统计或阈值选择。
@@ -262,7 +263,7 @@ Set Transformer 联合架构。分类分数聚合由
 完成后读取：
 
 ```text
-outputs/information_density_dinomaly2_competition_vitl448_v1/
+outputs/difficulty_moe_dinomaly2_competition_vitl448_v1/
 ├── competition_data_audit.json
 ├── competition_pipeline_state.json
 ├── checkpoints/final_model.pt
@@ -280,7 +281,7 @@ outputs/information_density_dinomaly2_competition_vitl448_v1/
 `submission.zip` 已检查 CSV 行数/顺序、分数范围、全部 448 × 448 单通道 mask、
 ZIP 根目录结构和 CRC，可直接手动上传。推理按类别落盘；中断后重复同一命令会跳过
 已完整生成的类别。训练 batch 以单张 view 为单位，默认 effective batch 是 12；自动
-显存探测执行真实单视角 information-density forward/backward。单张 GPU 可用：
+显存探测执行真实单视角 difficulty-MoE forward/backward。单张 GPU 可用：
 
 ```powershell
 python run_competition_pipeline.py `

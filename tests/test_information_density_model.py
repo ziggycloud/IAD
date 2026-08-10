@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from realiad_dinomaly2.information_density_model import (
+    DifficultyRoutedMoE,
     InformationDensityDinomaly,
     InformationDensityDownProjection,
     calibrate_information_density_map,
@@ -70,10 +71,53 @@ class _TinyDinomaly(nn.Module):
         return [target], [decoded]
 
 
+class _TinyMoEDinomaly(_TinyDinomaly):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bottleneck = nn.ModuleList(
+            [
+                InformationDensityDownProjection(
+                    input_dim=8,
+                    latent_dim=6,
+                    num_special_tokens=2,
+                    dropout=0.0,
+                    hidden_dim=4,
+                    channel_widths=(2, 4, 6),
+                    channel_thresholds=(0.33, 0.66),
+                    capacity_warmup_steps=3,
+                    capacity_ramp_steps=2,
+                    initial_expected_error=0.1,
+                    emit_routing=True,
+                ),
+                DifficultyRoutedMoE(
+                    latent_dim=6,
+                    output_dim=8,
+                    num_special_tokens=2,
+                    dropout=0.0,
+                    expert_input_widths=(2, 4, 6),
+                    expert_hidden_dims=(4, 6, 8),
+                    routing_centers=(0.17, 0.5, 0.83),
+                    routing_temperature=0.1,
+                    routing_warmup_steps=3,
+                    routing_ramp_steps=2,
+                    hard_routing_start_step=5,
+                    target_load=(0.6, 0.3, 0.1),
+                ),
+            ]
+        )
+
+
 class InformationDensityTests(unittest.TestCase):
     def _make_model(self) -> InformationDensityDinomaly:
         model = InformationDensityDinomaly(
             _TinyDinomaly(), calibration_blend=0.35
+        )
+        model.init_weights()
+        return model
+
+    def _make_moe_model(self) -> InformationDensityDinomaly:
+        model = InformationDensityDinomaly(
+            _TinyMoEDinomaly(), calibration_blend=0.35
         )
         model.init_weights()
         return model
@@ -196,6 +240,81 @@ class InformationDensityTests(unittest.TestCase):
         self.assertNotEqual(
             float(model.down_projection.residual_mean), 99.0
         )
+
+    def test_three_experts_follow_low_mid_high_difficulty(self) -> None:
+        model = self._make_moe_model()
+        moe = model.difficulty_moe
+        assert moe is not None
+        difficulty = torch.tensor([[[0.05], [0.5], [0.95]]])
+        assignment = moe.routing_probabilities(difficulty).argmax(dim=-1)
+        self.assertEqual(assignment.tolist(), [[0, 1, 2]])
+
+    def test_moe_warmup_uses_original_high_capacity_path(self) -> None:
+        model = self._make_moe_model().train()
+        moe = model.difficulty_moe
+        assert moe is not None
+        model.set_training_step(0)
+        latent = torch.randn(2, 6, 6)
+        difficulty = torch.rand(2, 4, 1)
+        actual = moe((latent, difficulty))
+        expected = moe.experts[-1](latent)
+        self.assertTrue(torch.allclose(actual, expected))
+
+    def test_hard_routing_dispatches_only_selected_expert(self) -> None:
+        model = self._make_moe_model().eval()
+        moe = model.difficulty_moe
+        assert moe is not None
+        with torch.no_grad():
+            for expert_index, expert in enumerate(moe.experts):
+                for parameter in expert.parameters():
+                    parameter.zero_()
+                final = expert.network[3]
+                assert isinstance(final, nn.Linear)
+                final.bias.fill_(float(expert_index + 1))
+        latent = torch.randn(1, 5, 6)
+        difficulty = torch.tensor([[[0.05], [0.5], [0.95]]])
+        reconstructed = moe((latent, difficulty))
+        self.assertTrue(torch.equal(reconstructed[:, :2], torch.full_like(
+            reconstructed[:, :2], 3.0
+        )))
+        self.assertEqual(reconstructed[0, 2:, 0].tolist(), [1.0, 2.0, 3.0])
+
+    def test_reconstruction_cannot_manipulate_moe_difficulty_router(self) -> None:
+        model = self._make_moe_model().train()
+        model.set_training_step(4)
+        encoder, decoder = model(torch.randn(2, 18, 8))
+        reconstruction = 1.0 - F.cosine_similarity(
+            encoder[0].flatten(1), decoder[0].flatten(1), dim=1
+        ).mean()
+        reconstruction.backward()
+        final = model.down_projection.estimator[-1]
+        assert isinstance(final, nn.Linear)
+        self.assertIsNone(final.weight.grad)
+
+        model.zero_grad(set_to_none=True)
+        _, _, regularizer, auxiliary = forward_with_regularization(
+            model,
+            torch.randn(2, 18, 8),
+            weights={
+                "difficulty_prediction": 1.0,
+                "moe_load_balance": 0.1,
+                "moe_route_entropy": 0.01,
+            },
+        )
+        regularizer.backward()
+        self.assertIsNotNone(final.weight.grad)
+        self.assertIn("moe_load_balance", auxiliary)
+        self.assertIn("moe_hard_high_usage", auxiliary)
+
+    def test_moe_checkpoint_contains_all_three_experts(self) -> None:
+        model = self._make_moe_model()
+        keys = set(model.state_dict())
+        for expert_index in range(3):
+            self.assertIn(
+                "base_model.bottleneck.1.experts."
+                f"{expert_index}.network.0.weight",
+                keys,
+            )
 
 
 if __name__ == "__main__":

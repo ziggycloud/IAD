@@ -19,6 +19,7 @@ from .generalized_model import (
     combine_auxiliary_losses,
 )
 from .information_density_model import (
+    DifficultyRoutedMoE,
     InformationDensityDinomaly,
     InformationDensityDownProjection,
 )
@@ -193,6 +194,12 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
         "information_density_dinomaly2",
         "adaptive_dinomaly2",
     }
+    difficulty_moe_names = {
+        "information_density_moe",
+        "information_density_moe_dinomaly2",
+        "difficulty_moe_dinomaly2",
+    }
+    adaptive_names = information_density_names | difficulty_moe_names
     multi_view_config = dict(model_config.get("multi_view", {}))
     multi_view_enabled = bool(multi_view_config.get("enabled", False))
     multi_view_context: MultiViewContextEncoder | None = None
@@ -272,8 +279,60 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
                     multi_view_config.get("variance_target", 1.0)
                 ),
             )
-    elif architecture in information_density_names:
+    elif architecture in adaptive_names:
         density = dict(model_config.get("information_density", {}))
+        use_difficulty_moe = architecture in difficulty_moe_names
+        moe = dict(density.get("moe", {}))
+        reconstruction: nn.Module
+        if use_difficulty_moe:
+            reconstruction = DifficultyRoutedMoE(
+                latent_dim=256,
+                output_dim=embed_dim,
+                num_special_tokens=1 + int(encoder.num_register_tokens),
+                dropout=dropout,
+                expert_input_widths=tuple(
+                    int(value)
+                    for value in moe.get(
+                        "expert_input_widths", [64, 128, 256]
+                    )
+                ),
+                expert_hidden_dims=tuple(
+                    int(value)
+                    for value in moe.get(
+                        "expert_hidden_dims", [1024, 2048, 4096]
+                    )
+                ),
+                routing_centers=tuple(
+                    float(value)
+                    for value in moe.get(
+                        "routing_centers", [0.17, 0.5, 0.83]
+                    )
+                ),
+                routing_temperature=float(
+                    moe.get("routing_temperature", 0.1)
+                ),
+                routing_warmup_steps=int(
+                    moe.get("routing_warmup_steps", 1500)
+                ),
+                routing_ramp_steps=int(
+                    moe.get("routing_ramp_steps", 1000)
+                ),
+                hard_routing_start_step=int(
+                    moe.get("hard_routing_start_step", 2500)
+                ),
+                target_load=tuple(
+                    float(value)
+                    for value in moe.get("target_load", [0.6, 0.3, 0.1])
+                ),
+            )
+        else:
+            reconstruction = nn.Sequential(
+                nn.Linear(256, embed_dim * 4),
+                nn.GELU(),
+                nn.Dropout(p=dropout),
+                nn.Linear(embed_dim * 4, embed_dim),
+                nn.Dropout(p=dropout),
+            )
         bottleneck = nn.ModuleList(
             [
                 InformationDensityDownProjection(
@@ -316,14 +375,9 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
                     initial_expected_error=float(
                         density.get("initial_expected_error", 0.1)
                     ),
+                    emit_routing=use_difficulty_moe,
                 ),
-                nn.Sequential(
-                    nn.Linear(256, embed_dim * 4),
-                    nn.GELU(),
-                    nn.Dropout(p=dropout),
-                    nn.Linear(embed_dim * 4, embed_dim),
-                    nn.Dropout(p=dropout),
-                ),
+                reconstruction,
             ]
         )
     elif architecture in {"dinomaly", "dinomaly2", "baseline"}:
@@ -345,7 +399,7 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
     else:
         raise ValueError(
             "model.architecture must be dinomaly2, information_density_dinomaly2, "
-            "or generalized, "
+            "difficulty_moe_dinomaly2, or generalized, "
             f"got {architecture!r}"
         )
 
@@ -398,7 +452,7 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
             fuse_layer_decoder=decoder_fusion,
             context_aware_recenter=bool(model_config["context_aware_recenter"]),
         )
-        if architecture in information_density_names:
+        if architecture in adaptive_names:
             density = dict(model_config.get("information_density", {}))
             model = InformationDensityDinomaly(
                 base_model=base_model,

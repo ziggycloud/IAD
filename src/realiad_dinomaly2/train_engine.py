@@ -367,6 +367,9 @@ def _regularization_weight(config: dict[str, Any]) -> float:
         "information_density",
         "information_density_dinomaly2",
         "adaptive_dinomaly2",
+        "information_density_moe",
+        "information_density_moe_dinomaly2",
+        "difficulty_moe_dinomaly2",
     }:
         return float(
             config["training"].get(
@@ -923,9 +926,14 @@ def _wrap_parallel_model(
             output_device=context.device_ids[0],
         )
     elif context.is_ddp:
+        unwrapped = getattr(bundle.model, "module", bundle.model)
+        has_sparse_experts = getattr(
+            unwrapped, "difficulty_moe", None
+        ) is not None
         kwargs: dict[str, Any] = {
             "broadcast_buffers": False,
-            "find_unused_parameters": False,
+            # Top-1 routing can leave an expert unused on an individual rank.
+            "find_unused_parameters": has_sparse_experts,
         }
         if context.device.type == "cuda":
             kwargs.update(

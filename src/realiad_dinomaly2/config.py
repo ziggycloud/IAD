@@ -76,7 +76,13 @@ def _validate(config: dict[str, Any]) -> None:
         "information_density_dinomaly2",
         "adaptive_dinomaly2",
     }
-    if architecture in information_density_names:
+    difficulty_moe_names = {
+        "information_density_moe",
+        "information_density_moe_dinomaly2",
+        "difficulty_moe_dinomaly2",
+    }
+    adaptive_names = information_density_names | difficulty_moe_names
+    if architecture in adaptive_names:
         if dataset_type != "competition_folders":
             raise ValueError(
                 "information-density Dinomaly2 is currently scoped to the "
@@ -151,6 +157,61 @@ def _validate(config: dict[str, Any]) -> None:
                 "model.information_density.auxiliary_weights must contain "
                 "non-negative weights"
             )
+        if architecture in difficulty_moe_names:
+            moe = density.get("moe")
+            if not isinstance(moe, dict):
+                raise ValueError("model.information_density.moe must be a mapping")
+            expert_widths = [
+                int(value) for value in moe.get("expert_input_widths", [])
+            ]
+            if len(expert_widths) != 3 or expert_widths != widths:
+                raise ValueError(
+                    "MoE expert_input_widths must equal the three "
+                    "information-density channel_widths"
+                )
+            expert_hidden = [
+                int(value) for value in moe.get("expert_hidden_dims", [])
+            ]
+            if len(expert_hidden) != 3 or any(
+                value <= 0 for value in expert_hidden
+            ):
+                raise ValueError(
+                    "MoE expert_hidden_dims must contain three positive values"
+                )
+            centers = [
+                float(value) for value in moe.get("routing_centers", [])
+            ]
+            if (
+                len(centers) != 3
+                or any(not 0.0 < value < 1.0 for value in centers)
+                or any(
+                    left >= right
+                    for left, right in zip(centers, centers[1:])
+                )
+            ):
+                raise ValueError(
+                    "MoE routing_centers must be three increasing values in (0, 1)"
+                )
+            if float(moe.get("routing_temperature", 0.0)) <= 0:
+                raise ValueError("MoE routing_temperature must be positive")
+            routing_warmup = int(moe.get("routing_warmup_steps", -1))
+            routing_ramp = int(moe.get("routing_ramp_steps", -1))
+            hard_start = int(moe.get("hard_routing_start_step", -1))
+            if routing_warmup < 0 or routing_ramp < 0:
+                raise ValueError("MoE routing warmup/ramp must be non-negative")
+            if hard_start < routing_warmup + routing_ramp:
+                raise ValueError(
+                    "MoE hard routing must start after the soft-routing ramp"
+                )
+            target_load = [
+                float(value) for value in moe.get("target_load", [])
+            ]
+            if len(target_load) != 3 or any(
+                value <= 0 for value in target_load
+            ):
+                raise ValueError(
+                    "MoE target_load must contain three positive values"
+                )
     multi_view = model.get("multi_view", {})
     if not isinstance(multi_view, dict):
         raise ValueError("model.multi_view must be a mapping")
@@ -294,7 +355,7 @@ def _validate(config: dict[str, Any]) -> None:
         raise ValueError(
             "information_density_regularization_weight must be >= 0"
         )
-    if architecture in information_density_names:
+    if architecture in adaptive_names:
         density = model["information_density"]
         transition_steps = int(density["capacity_warmup_steps"]) + int(
             density["capacity_ramp_steps"]
@@ -303,6 +364,12 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError(
                 "information-density warmup + ramp must finish before total_steps"
             )
+        if architecture in difficulty_moe_names:
+            hard_start = int(density["moe"]["hard_routing_start_step"])
+            if hard_start >= int(training["total_steps"]):
+                raise ValueError(
+                    "MoE hard routing must start before total_steps"
+                )
     multi_view_weights = training.get("multi_view_auxiliary_weights", {})
     if not isinstance(multi_view_weights, dict) or any(
         float(value) < 0 for value in multi_view_weights.values()

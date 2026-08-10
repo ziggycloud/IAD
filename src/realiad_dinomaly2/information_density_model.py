@@ -37,6 +37,7 @@ class InformationDensityDownProjection(nn.Module):
         capacity_ramp_steps: int = 1000,
         residual_ema_decay: float = 0.99,
         initial_expected_error: float = 0.1,
+        emit_routing: bool = False,
     ) -> None:
         super().__init__()
         widths = tuple(int(value) for value in channel_widths)
@@ -86,6 +87,7 @@ class InformationDensityDownProjection(nn.Module):
         self.capacity_ramp_steps = int(capacity_ramp_steps)
         self.residual_ema_decay = float(residual_ema_decay)
         self.initial_expected_error = float(initial_expected_error)
+        self.emit_routing = bool(emit_routing)
         self.training_step = 0
 
         self.projection = nn.Linear(input_dim, latent_dim)
@@ -203,7 +205,9 @@ class InformationDensityDownProjection(nn.Module):
             mask = 1.0 - blend * (1.0 - mask)
         return mask
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, tokens: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if tokens.ndim != 3 or tokens.shape[-1] != self.input_dim:
             raise ValueError(
                 "information-density projection expects [B, N, input_dim]"
@@ -236,7 +240,10 @@ class InformationDensityDownProjection(nn.Module):
         self._last_channel_mask = channel_mask
         self._last_side = side
         projected = self.projection(tokens) * channel_mask
-        return self.dropout(projected)
+        projected = self.dropout(projected)
+        if self.emit_routing:
+            return projected, difficulty
+        return projected
 
     def update_auxiliary(self, residual_map: torch.Tensor) -> None:
         if self._last_expected_error is None or self._last_difficulty is None:
@@ -332,6 +339,251 @@ class InformationDensityDownProjection(nn.Module):
         )
 
 
+class DifficultyReconstructionExpert(nn.Module):
+    """One difficulty-specific reconstruction path."""
+
+    def __init__(
+        self,
+        input_width: int,
+        hidden_dim: int,
+        output_dim: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        if input_width <= 0 or hidden_dim <= 0 or output_dim <= 0:
+            raise ValueError("MoE expert dimensions must be positive")
+        self.input_width = int(input_width)
+        self.network = nn.Sequential(
+            nn.Linear(input_width, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, output_dim),
+            nn.Dropout(p=dropout),
+        )
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.network(latent[..., : self.input_width])
+
+
+class DifficultyRoutedMoE(nn.Module):
+    """Three reconstruction experts selected by predicted normal difficulty.
+
+    Training begins with the high-capacity expert only, then ramps into soft
+    routing.  Once the difficulty estimator is stable, top-1 sparse dispatch
+    is used.  Reconstruction gradients never update routing decisions; the
+    estimator remains governed by its explicit normal-difficulty objectives.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        output_dim: int,
+        num_special_tokens: int,
+        dropout: float,
+        expert_input_widths: Sequence[int] = (64, 128, 256),
+        expert_hidden_dims: Sequence[int] = (1024, 2048, 4096),
+        routing_centers: Sequence[float] = (0.17, 0.5, 0.83),
+        routing_temperature: float = 0.1,
+        routing_warmup_steps: int = 1500,
+        routing_ramp_steps: int = 1000,
+        hard_routing_start_step: int = 2500,
+        target_load: Sequence[float] = (0.6, 0.3, 0.1),
+    ) -> None:
+        super().__init__()
+        widths = tuple(int(value) for value in expert_input_widths)
+        hidden = tuple(int(value) for value in expert_hidden_dims)
+        centers = tuple(float(value) for value in routing_centers)
+        loads = tuple(float(value) for value in target_load)
+        if len(widths) != 3 or len(hidden) != 3 or len(centers) != 3:
+            raise ValueError("difficulty MoE requires exactly three experts")
+        if widths[-1] != latent_dim or any(
+            left >= right for left, right in zip(widths, widths[1:])
+        ):
+            raise ValueError(
+                "expert_input_widths must increase and end at latent_dim"
+            )
+        if any(value <= 0 for value in hidden):
+            raise ValueError("expert_hidden_dims must be positive")
+        if any(not 0.0 < value < 1.0 for value in centers) or any(
+            left >= right for left, right in zip(centers, centers[1:])
+        ):
+            raise ValueError("routing_centers must increase within (0, 1)")
+        if routing_temperature <= 0:
+            raise ValueError("routing_temperature must be positive")
+        if routing_warmup_steps < 0 or routing_ramp_steps < 0:
+            raise ValueError("MoE routing warmup/ramp must be non-negative")
+        if hard_routing_start_step < routing_warmup_steps + routing_ramp_steps:
+            raise ValueError(
+                "hard routing must start after the soft-routing ramp"
+            )
+        if len(loads) != 3 or any(value <= 0 for value in loads):
+            raise ValueError("target_load must contain three positive values")
+
+        self.latent_dim = int(latent_dim)
+        self.output_dim = int(output_dim)
+        self.num_special_tokens = int(num_special_tokens)
+        self.expert_input_widths = widths
+        self.routing_temperature = float(routing_temperature)
+        self.routing_warmup_steps = int(routing_warmup_steps)
+        self.routing_ramp_steps = int(routing_ramp_steps)
+        self.hard_routing_start_step = int(hard_routing_start_step)
+        self.training_step = 0
+        self.experts = nn.ModuleList(
+            [
+                DifficultyReconstructionExpert(
+                    input_width=width,
+                    hidden_dim=hidden_dim,
+                    output_dim=output_dim,
+                    dropout=dropout,
+                )
+                for width, hidden_dim in zip(widths, hidden, strict=True)
+            ]
+        )
+        self.register_buffer(
+            "routing_centers",
+            torch.tensor(centers, dtype=torch.float32),
+        )
+        normalized_load = torch.tensor(loads, dtype=torch.float32)
+        normalized_load = normalized_load / normalized_load.sum()
+        self.register_buffer("target_load", normalized_load)
+        self._last_auxiliary: dict[str, torch.Tensor] = {}
+        self._last_assignment: torch.Tensor | None = None
+
+    def set_training_step(self, completed_steps: int) -> None:
+        self.training_step = max(0, int(completed_steps))
+
+    def routing_probabilities(
+        self, difficulty: torch.Tensor
+    ) -> torch.Tensor:
+        if difficulty.ndim != 3 or difficulty.shape[-1] != 1:
+            raise ValueError("difficulty must have shape [B, N, 1]")
+        centers = self.routing_centers.to(difficulty).view(1, 1, 3)
+        logits = -(difficulty - centers).abs() / self.routing_temperature
+        return torch.softmax(logits, dim=-1)
+
+    def _routing_blend(self) -> float:
+        if not self.training:
+            return 1.0
+        if self.training_step < self.routing_warmup_steps:
+            return 0.0
+        if self.routing_ramp_steps == 0:
+            return 1.0
+        elapsed = self.training_step - self.routing_warmup_steps
+        return min(1.0, max(0.0, elapsed / self.routing_ramp_steps))
+
+    def _soft_reconstruct(
+        self,
+        patches: torch.Tensor,
+        routing: torch.Tensor,
+        blend: float,
+    ) -> torch.Tensor:
+        if blend == 0.0:
+            return self.experts[-1](patches)
+        expert_outputs = torch.stack(
+            [expert(patches) for expert in self.experts], dim=2
+        )
+        high_only = routing.new_zeros(routing.shape)
+        high_only[..., -1] = 1.0
+        effective = high_only + blend * (routing.detach() - high_only)
+        return (expert_outputs * effective.unsqueeze(-1)).sum(dim=2)
+
+    def _hard_reconstruct(
+        self,
+        patches: torch.Tensor,
+        assignment: torch.Tensor,
+    ) -> torch.Tensor:
+        flat_patches = patches.reshape(-1, patches.shape[-1])
+        flat_assignment = assignment.reshape(-1)
+        reconstructed = patches.new_zeros(
+            flat_patches.shape[0], self.output_dim
+        )
+        for expert_index, expert in enumerate(self.experts):
+            selected = torch.nonzero(
+                flat_assignment == expert_index, as_tuple=False
+            ).flatten()
+            if selected.numel() == 0:
+                continue
+            expert_output = expert(flat_patches.index_select(0, selected))
+            reconstructed = reconstructed.index_copy(
+                0, selected, expert_output
+            )
+        return reconstructed.reshape(
+            patches.shape[0], patches.shape[1], self.output_dim
+        )
+
+    def _update_auxiliary(
+        self,
+        routing: torch.Tensor,
+        assignment: torch.Tensor,
+    ) -> None:
+        usage = routing.mean(dim=(0, 1))
+        target = self.target_load.to(usage)
+        load_balance = (
+            target * (target.clamp_min(1e-8).log() - usage.clamp_min(1e-8).log())
+        ).sum()
+        route_entropy = -(
+            routing.clamp_min(1e-8) * routing.clamp_min(1e-8).log()
+        ).sum(dim=-1).mean()
+        hard_usage = F.one_hot(assignment, num_classes=3).to(routing).mean(
+            dim=(0, 1)
+        )
+        self._last_auxiliary = {
+            "moe_load_balance": load_balance,
+            "moe_route_entropy": route_entropy,
+            "moe_soft_low_usage": usage[0],
+            "moe_soft_mid_usage": usage[1],
+            "moe_soft_high_usage": usage[2],
+            "moe_hard_low_usage": hard_usage[0],
+            "moe_hard_mid_usage": hard_usage[1],
+            "moe_hard_high_usage": hard_usage[2],
+        }
+
+    def forward(
+        self,
+        routed: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        if not isinstance(routed, tuple) or len(routed) != 2:
+            raise TypeError("difficulty MoE expects (latent, difficulty)")
+        latent, difficulty = routed
+        if latent.ndim != 3 or latent.shape[-1] != self.latent_dim:
+            raise ValueError("MoE latent must have shape [B, N, latent_dim]")
+        patch_count = latent.shape[1] - self.num_special_tokens
+        if difficulty.shape != (latent.shape[0], patch_count, 1):
+            raise ValueError("MoE difficulty shape does not match patch tokens")
+
+        special = latent[:, : self.num_special_tokens]
+        patches = latent[:, self.num_special_tokens :]
+        routing = self.routing_probabilities(difficulty)
+        assignment = routing.detach().argmax(dim=-1)
+        hard = not self.training or (
+            self.training_step >= self.hard_routing_start_step
+        )
+        if hard:
+            reconstructed_patches = self._hard_reconstruct(
+                patches, assignment
+            )
+        else:
+            reconstructed_patches = self._soft_reconstruct(
+                patches, routing, self._routing_blend()
+            )
+        reconstructed_special = self.experts[-1](special)
+        self._last_assignment = assignment
+        self._update_auxiliary(routing, assignment)
+        return torch.cat(
+            [reconstructed_special, reconstructed_patches], dim=1
+        )
+
+    def auxiliary_losses(
+        self, detach: bool = False
+    ) -> dict[str, torch.Tensor]:
+        if detach:
+            return {
+                name: value.detach()
+                for name, value in self._last_auxiliary.items()
+            }
+        return dict(self._last_auxiliary)
+
+
 class InformationDensityDinomaly(nn.Module):
     """Dinomaly-compatible wrapper that transports graph-connected losses."""
 
@@ -365,6 +617,18 @@ class InformationDensityDinomaly(nn.Module):
 
     def set_training_step(self, completed_steps: int) -> None:
         self.down_projection.set_training_step(completed_steps)
+        moe = self.difficulty_moe
+        if moe is not None:
+            moe.set_training_step(completed_steps)
+
+    @property
+    def difficulty_moe(self) -> DifficultyRoutedMoE | None:
+        if len(self.base_model.bottleneck) < 2:
+            return None
+        reconstruction = self.base_model.bottleneck[1]
+        if isinstance(reconstruction, DifficultyRoutedMoE):
+            return reconstruction
+        return None
 
     @staticmethod
     def _token_residual(
@@ -403,7 +667,11 @@ class InformationDensityDinomaly(nn.Module):
     def auxiliary_losses(
         self, detach: bool = False
     ) -> dict[str, torch.Tensor]:
-        return self.down_projection.auxiliary_losses(detach=detach)
+        losses = self.down_projection.auxiliary_losses(detach=detach)
+        moe = self.difficulty_moe
+        if moe is not None:
+            losses.update(moe.auxiliary_losses(detach=detach))
+        return losses
 
     def regularization_loss(
         self, weights: Mapping[str, float] | None = None
