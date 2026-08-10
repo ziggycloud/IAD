@@ -1,7 +1,7 @@
 experiment:
-  name: multiview_generalized_dinomaly_competition_vitl448_v3
-  # Multi-view checkpoints are incompatible with the old per-view run.
-  output_dir: outputs/multiview_generalized_dinomaly_competition_vitl448_v3
+  name: dinomaly2_competition_vitl448
+  # Keep original-Dinomaly2 checkpoints isolated from incompatible generalized runs.
+  output_dir: outputs/dinomaly2_competition_vitl448
   seed: 20260803
 
 dataset:
@@ -18,8 +18,8 @@ dataset:
   train_mode: all_views
 
 model:
-  # Keep the same category-generalized model used by run_unseen_pipeline.py.
-  architecture: category_generalized
+  # Use the original upstream Dinomaly2 encoder-bottleneck-decoder architecture.
+  architecture: dinomaly2
   backbone: dinov2reg_vit_large_14
   backbone_weights_dir: third_party/Dinomaly2/backbones/weights
   dropout: 0.2
@@ -42,7 +42,9 @@ model:
       router_entropy_penalty: 0.05
       expert_diversity: 0.05
   multi_view:
-    enabled: true
+    # Competition still consumes all five views, but Dinomaly2 processes each
+    # view independently, matching the upstream multi-view training entrypoint.
+    enabled: false
     num_views: 5
     context_dim: 384
     num_set_layers: 2
