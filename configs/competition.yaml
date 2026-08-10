@@ -1,7 +1,7 @@
 experiment:
-  name: dinomaly2_competition_vitl448
-  # Keep original-Dinomaly2 checkpoints isolated from incompatible generalized runs.
-  output_dir: outputs/dinomaly2_competition_vitl448
+  name: information_density_dinomaly2_competition_vitl448_v1
+  # Information-density checkpoints are incompatible with the original baseline.
+  output_dir: outputs/information_density_dinomaly2_competition_vitl448_v1
   seed: 20260803
 
 dataset:
@@ -18,8 +18,8 @@ dataset:
   train_mode: all_views
 
 model:
-  # Use the original upstream Dinomaly2 encoder-bottleneck-decoder architecture.
-  architecture: dinomaly2
+  # Preserve upstream Dinomaly2 and upgrade only its 1024 -> 256 bottleneck.
+  architecture: information_density_dinomaly2
   backbone: dinov2reg_vit_large_14
   backbone_weights_dir: third_party/Dinomaly2/backbones/weights
   dropout: 0.2
@@ -27,6 +27,31 @@ model:
   loose_constraint_groups: 2
   loose_loss: true
   context_aware_recenter: true
+  information_density:
+    # The first 64 channels always remain open.  Context-predicted difficulty
+    # continuously opens the next 64 and final 128 channels.
+    hidden_dim: 64
+    channel_widths: [64, 128, 256]
+    channel_thresholds: [0.33, 0.66]
+    channel_temperature: 0.08
+    # Difficulty is measured relative to an EMA of normal reconstruction error.
+    difficulty_z_threshold: 0.5
+    difficulty_temperature: 0.5
+    target_budget: 0.3
+    # Learn difficulty with the original 256-channel path before changing capacity.
+    capacity_warmup_steps: 1500
+    capacity_ramp_steps: 1000
+    residual_ema_decay: 0.99
+    initial_expected_error: 0.1
+    # Subtract only a bounded, difficulty-weighted part of expected normal error.
+    calibration_blend: 0.35
+    auxiliary_weights:
+      difficulty_prediction: 1.0
+      difficulty_budget: 0.1
+      difficulty_smoothness: 0.01
+      difficulty_mean: 0.0
+      capacity_mid_usage: 0.0
+      capacity_high_usage: 0.0
   generalized:
     latent_dim: 384
     num_references: 512
@@ -94,6 +119,7 @@ training:
   loose_loss_warmup_steps: 2000
   loose_loss_final_discard: 0.7
   generalized_regularization_weight: 0.01
+  information_density_regularization_weight: 0.1
   multi_view_auxiliary_weights:
     context_consistency: 0.01
     context_variance: 0.001

@@ -12,6 +12,7 @@ from .competition_data import build_competition_train_dataset
 from .config import config_fingerprint
 from .data import build_train_dataset
 from .losses import anomaly_map
+from .information_density_model import calibrate_information_density_map
 from .modeling import build_model, load_trainable_state_dict
 from .runtime import (
     amp_dtype,
@@ -362,7 +363,9 @@ def fit_normal_prior(
                     output_size=side,
                     layer_weights=layer_weights,
                     align_corners=align_corners,
-                ).unsqueeze(1)
+                )
+                maps = calibrate_information_density_map(bundle.model, maps)
+                maps = maps.unsqueeze(1)
             view_ids = view_ids.unsqueeze(1)
             valid_view_mask = valid_view_mask.unsqueeze(1)
 

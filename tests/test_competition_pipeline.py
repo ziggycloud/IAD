@@ -91,8 +91,21 @@ class CompetitionDataTests(unittest.TestCase):
         self.assertEqual(config["dataset"]["type"], "competition_folders")
         self.assertTrue(Path(config["dataset"]["train_dir"]).is_absolute())
         self.assertTrue(Path(config["dataset"]["test_dir"]).is_absolute())
-        self.assertEqual(config["model"]["architecture"], "dinomaly2")
+        self.assertEqual(
+            config["model"]["architecture"],
+            "information_density_dinomaly2",
+        )
         self.assertFalse(config["model"]["multi_view"]["enabled"])
+        self.assertEqual(
+            config["model"]["information_density"]["channel_widths"],
+            [64, 128, 256],
+        )
+        self.assertEqual(
+            config["training"][
+                "information_density_regularization_weight"
+            ],
+            0.1,
+        )
         self.assertEqual(config["training"]["effective_batch_size"], 12)
 
     def test_object_score_modes_keep_single_view_anomaly(self) -> None:

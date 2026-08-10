@@ -25,6 +25,7 @@ from .competition_data import (
 )
 from .config import config_fingerprint
 from .losses import anomaly_map
+from .information_density_model import calibrate_information_density_map
 from .modeling import build_model, load_trainable_state_dict
 from .normal_prior import (
     file_sha256,
@@ -540,6 +541,9 @@ def generate_competition_submission(
                         align_corners=bool(
                             evaluation.get("anomaly_map_align_corners", True)
                         ),
+                    )
+                    current = calibrate_information_density_map(
+                        bundle.model, current
                     )
                 if normal_prior is not None:
                     current = normal_prior.calibrate(

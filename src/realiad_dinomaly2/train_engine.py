@@ -34,6 +34,7 @@ from .modeling import (
     set_learning_rate,
     trainable_state_dict,
 )
+from .information_density_model import set_information_density_step
 from .runtime import (
     amp_dtype,
     append_jsonl,
@@ -346,7 +347,35 @@ def _auxiliary_weights(config: dict[str, Any]) -> dict[str, float] | None:
             .items()
         }
     )
+    weights.update(
+        {
+            str(name): float(value)
+            for name, value in config["model"]
+            .get("information_density", {})
+            .get("auxiliary_weights", {})
+            .items()
+        }
+    )
     return weights or None
+
+
+def _regularization_weight(config: dict[str, Any]) -> float:
+    architecture = str(
+        config["model"].get("architecture", "dinomaly2")
+    ).lower()
+    if architecture in {
+        "information_density",
+        "information_density_dinomaly2",
+        "adaptive_dinomaly2",
+    }:
+        return float(
+            config["training"].get(
+                "information_density_regularization_weight", 0.0
+            )
+        )
+    return float(
+        config["training"].get("generalized_regularization_weight", 0.0)
+    )
 
 
 def _batch_model_inputs(
@@ -428,9 +457,7 @@ def _run_probe(
     optimizer.zero_grad(set_to_none=True)
     torch.cuda.reset_peak_memory_stats(device)
     started = time.perf_counter()
-    regularization_weight = float(
-        config["training"].get("generalized_regularization_weight", 0.0)
-    )
+    regularization_weight = _regularization_weight(config)
     auxiliary_weights = _auxiliary_weights(config)
     with autocast_context(dtype, device):
         (
@@ -1233,11 +1260,7 @@ def _train_impl(
         trainable_parameters = _trainable_parameters(bundle)
         log_every = int(config["training"]["log_every"])
         checkpoint_every = int(config["training"]["checkpoint_every"])
-        regularization_weight = float(
-            config["training"].get(
-                "generalized_regularization_weight", 0.0
-            )
-        )
+        regularization_weight = _regularization_weight(config)
         auxiliary_weights = _auxiliary_weights(config)
         started = time.perf_counter()
         interval_started = started
@@ -1245,6 +1268,7 @@ def _train_impl(
 
         try:
             for step_index in range(completed_steps, total_steps):
+                set_information_density_step(bundle.model, step_index)
                 scheduler_config = dict(
                     config["training"].get("scheduler", {})
                 )

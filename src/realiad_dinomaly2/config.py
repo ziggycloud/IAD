@@ -70,6 +70,87 @@ def _validate(config: dict[str, Any]) -> None:
         raise ValueError("DINOv2/14 要求 crop_size 能被 14 整除")
 
     model = config["model"]
+    architecture = str(model.get("architecture", "dinomaly2")).lower()
+    information_density_names = {
+        "information_density",
+        "information_density_dinomaly2",
+        "adaptive_dinomaly2",
+    }
+    if architecture in information_density_names:
+        if dataset_type != "competition_folders":
+            raise ValueError(
+                "information-density Dinomaly2 is currently scoped to the "
+                "competition pipeline"
+            )
+        density = model.get("information_density")
+        if not isinstance(density, dict):
+            raise ValueError("model.information_density must be a mapping")
+        widths = [int(value) for value in density.get("channel_widths", [])]
+        if (
+            not widths
+            or widths[-1] != 256
+            or widths[0] <= 0
+            or any(left >= right for left, right in zip(widths, widths[1:]))
+        ):
+            raise ValueError(
+                "model.information_density.channel_widths must be strictly "
+                "increasing and end at 256"
+            )
+        thresholds = [
+            float(value)
+            for value in density.get("channel_thresholds", [])
+        ]
+        if (
+            len(thresholds) != len(widths) - 1
+            or any(not 0.0 < value < 1.0 for value in thresholds)
+            or any(
+                left >= right
+                for left, right in zip(thresholds, thresholds[1:])
+            )
+        ):
+            raise ValueError(
+                "model.information_density.channel_thresholds must be strictly "
+                "increasing values in (0, 1)"
+            )
+        for key in ("channel_temperature", "difficulty_temperature"):
+            if float(density.get(key, 0.0)) <= 0:
+                raise ValueError(
+                    f"model.information_density.{key} must be positive"
+                )
+        if int(density.get("hidden_dim", 0)) <= 0:
+            raise ValueError(
+                "model.information_density.hidden_dim must be positive"
+            )
+        if not 0.0 < float(density.get("target_budget", 0.0)) < 1.0:
+            raise ValueError(
+                "model.information_density.target_budget must lie in (0, 1)"
+            )
+        if int(density.get("capacity_warmup_steps", -1)) < 0 or int(
+            density.get("capacity_ramp_steps", -1)
+        ) < 0:
+            raise ValueError(
+                "information-density capacity warmup/ramp must be non-negative"
+            )
+        if not 0.0 <= float(density.get("residual_ema_decay", -1.0)) < 1.0:
+            raise ValueError(
+                "model.information_density.residual_ema_decay must lie in [0, 1)"
+            )
+        if float(density.get("initial_expected_error", 0.0)) <= 0:
+            raise ValueError(
+                "model.information_density.initial_expected_error must be positive"
+            )
+        if not 0.0 <= float(density.get("calibration_blend", -1.0)) <= 1.0:
+            raise ValueError(
+                "model.information_density.calibration_blend must lie in [0, 1]"
+            )
+        auxiliary_weights = density.get("auxiliary_weights", {})
+        if not isinstance(auxiliary_weights, dict) or any(
+            float(value) < 0 for value in auxiliary_weights.values()
+        ):
+            raise ValueError(
+                "model.information_density.auxiliary_weights must contain "
+                "non-negative weights"
+            )
     multi_view = model.get("multi_view", {})
     if not isinstance(multi_view, dict):
         raise ValueError("model.multi_view must be a mapping")
@@ -207,6 +288,21 @@ def _validate(config: dict[str, Any]) -> None:
 
     if float(training.get("generalized_regularization_weight", 0.0)) < 0:
         raise ValueError("generalized_regularization_weight must be >= 0")
+    if float(
+        training.get("information_density_regularization_weight", 0.0)
+    ) < 0:
+        raise ValueError(
+            "information_density_regularization_weight must be >= 0"
+        )
+    if architecture in information_density_names:
+        density = model["information_density"]
+        transition_steps = int(density["capacity_warmup_steps"]) + int(
+            density["capacity_ramp_steps"]
+        )
+        if transition_steps >= int(training["total_steps"]):
+            raise ValueError(
+                "information-density warmup + ramp must finish before total_steps"
+            )
     multi_view_weights = training.get("multi_view_auxiliary_weights", {})
     if not isinstance(multi_view_weights, dict) or any(
         float(value) < 0 for value in multi_view_weights.values()
@@ -382,6 +478,7 @@ def semantic_config(config: dict[str, Any]) -> dict[str, Any]:
             "loose_loss_warmup_steps",
             "loose_loss_final_discard",
             "generalized_regularization_weight",
+            "information_density_regularization_weight",
             "gradient_clip_norm",
         )
     }

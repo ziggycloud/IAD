@@ -18,6 +18,10 @@ from .generalized_model import (
     MultiViewGeneralizedDinomaly,
     combine_auxiliary_losses,
 )
+from .information_density_model import (
+    InformationDensityDinomaly,
+    InformationDensityDownProjection,
+)
 
 
 UPSTREAM_ROOT = PROJECT_ROOT / "third_party" / "Dinomaly2"
@@ -184,6 +188,11 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
     dropout = float(model_config["dropout"])
     architecture = str(model_config.get("architecture", "dinomaly2")).lower()
     generalized_names = {"generalized", "category_generalized", "cg_dinomaly"}
+    information_density_names = {
+        "information_density",
+        "information_density_dinomaly2",
+        "adaptive_dinomaly2",
+    }
     multi_view_config = dict(model_config.get("multi_view", {}))
     multi_view_enabled = bool(multi_view_config.get("enabled", False))
     multi_view_context: MultiViewContextEncoder | None = None
@@ -263,6 +272,60 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
                     multi_view_config.get("variance_target", 1.0)
                 ),
             )
+    elif architecture in information_density_names:
+        density = dict(model_config.get("information_density", {}))
+        bottleneck = nn.ModuleList(
+            [
+                InformationDensityDownProjection(
+                    input_dim=embed_dim,
+                    latent_dim=256,
+                    num_special_tokens=1 + int(encoder.num_register_tokens),
+                    dropout=dropout,
+                    hidden_dim=int(density.get("hidden_dim", 64)),
+                    channel_widths=tuple(
+                        int(value)
+                        for value in density.get(
+                            "channel_widths", [64, 128, 256]
+                        )
+                    ),
+                    channel_thresholds=tuple(
+                        float(value)
+                        for value in density.get(
+                            "channel_thresholds", [0.33, 0.66]
+                        )
+                    ),
+                    channel_temperature=float(
+                        density.get("channel_temperature", 0.08)
+                    ),
+                    difficulty_z_threshold=float(
+                        density.get("difficulty_z_threshold", 0.5)
+                    ),
+                    difficulty_temperature=float(
+                        density.get("difficulty_temperature", 0.5)
+                    ),
+                    target_budget=float(density.get("target_budget", 0.3)),
+                    capacity_warmup_steps=int(
+                        density.get("capacity_warmup_steps", 1500)
+                    ),
+                    capacity_ramp_steps=int(
+                        density.get("capacity_ramp_steps", 1000)
+                    ),
+                    residual_ema_decay=float(
+                        density.get("residual_ema_decay", 0.99)
+                    ),
+                    initial_expected_error=float(
+                        density.get("initial_expected_error", 0.1)
+                    ),
+                ),
+                nn.Sequential(
+                    nn.Linear(256, embed_dim * 4),
+                    nn.GELU(),
+                    nn.Dropout(p=dropout),
+                    nn.Linear(embed_dim * 4, embed_dim),
+                    nn.Dropout(p=dropout),
+                ),
+            ]
+        )
     elif architecture in {"dinomaly", "dinomaly2", "baseline"}:
         bottleneck = nn.ModuleList(
             [
@@ -281,7 +344,8 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
         )
     else:
         raise ValueError(
-            "model.architecture must be dinomaly2 or generalized, "
+            "model.architecture must be dinomaly2, information_density_dinomaly2, "
+            "or generalized, "
             f"got {architecture!r}"
         )
 
@@ -324,7 +388,7 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
             multi_view_context_encoder=multi_view_context,
         )
     else:
-        model = symbols["Dinomaly"](
+        base_model = symbols["Dinomaly"](
             encoder=encoder,
             bottleneck=bottleneck,
             decoder=decoder,
@@ -334,6 +398,16 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
             fuse_layer_decoder=decoder_fusion,
             context_aware_recenter=bool(model_config["context_aware_recenter"]),
         )
+        if architecture in information_density_names:
+            density = dict(model_config.get("information_density", {}))
+            model = InformationDensityDinomaly(
+                base_model=base_model,
+                calibration_blend=float(
+                    density.get("calibration_blend", 0.35)
+                ),
+            )
+        else:
+            model = base_model
     model.init_weights()
     model.to(device)
     return ModelBundle(
@@ -358,26 +432,53 @@ def build_optimizer(bundle: ModelBundle, config: dict[str, Any]):
     base_lr = float(train_config["learning_rate"])
     first_lr = base_lr * float(train_config["first_bottleneck_lr_scale"])
     betas = tuple(float(value) for value in train_config["adam_betas"])
-    groups = [
-        {
-            "params": bundle.bottleneck[0].parameters(),
-            "lr": first_lr,
-            "initial_lr": first_lr,
-            "group_name": "bottleneck_first",
-        },
-        {
-            "params": bundle.bottleneck[1].parameters(),
-            "lr": base_lr,
-            "initial_lr": base_lr,
-            "group_name": "bottleneck_rest",
-        },
-        {
-            "params": bundle.decoder.parameters(),
-            "lr": base_lr,
-            "initial_lr": base_lr,
-            "group_name": "decoder",
-        },
-    ]
+    first_bottleneck = bundle.bottleneck[0]
+    groups = []
+    if isinstance(first_bottleneck, InformationDensityDownProjection):
+        groups.extend(
+            [
+                {
+                    "params": first_bottleneck.projection.parameters(),
+                    "lr": first_lr,
+                    "initial_lr": first_lr,
+                    "group_name": "bottleneck_first",
+                },
+                {
+                    "params": [
+                        *first_bottleneck.context_norm.parameters(),
+                        *first_bottleneck.estimator.parameters(),
+                    ],
+                    "lr": base_lr,
+                    "initial_lr": base_lr,
+                    "group_name": "difficulty_estimator",
+                },
+            ]
+        )
+    else:
+        groups.append(
+            {
+                "params": first_bottleneck.parameters(),
+                "lr": first_lr,
+                "initial_lr": first_lr,
+                "group_name": "bottleneck_first",
+            }
+        )
+    groups.extend(
+        [
+            {
+                "params": bundle.bottleneck[1].parameters(),
+                "lr": base_lr,
+                "initial_lr": base_lr,
+                "group_name": "bottleneck_rest",
+            },
+            {
+                "params": bundle.decoder.parameters(),
+                "lr": base_lr,
+                "initial_lr": base_lr,
+                "group_name": "decoder",
+            },
+        ]
+    )
     if bundle.multi_view_context is not None:
         groups.append(
             {
@@ -571,13 +672,21 @@ def forward_with_regularization(
     """
 
     unwrapped = getattr(model, "module", model)
-    if isinstance(unwrapped, GeneralizedDinomaly):
-        encoder_features, decoder_features, gathered = model(
-            images,
-            view_ids=view_ids,
-            valid_view_mask=valid_view_mask,
-            return_auxiliary=True,
-        )
+    if isinstance(unwrapped, GeneralizedDinomaly) or bool(
+        getattr(unwrapped, "supports_auxiliary_forward", False)
+    ):
+        if isinstance(unwrapped, GeneralizedDinomaly):
+            encoder_features, decoder_features, gathered = model(
+                images,
+                view_ids=view_ids,
+                valid_view_mask=valid_view_mask,
+                return_auxiliary=True,
+            )
+        else:
+            encoder_features, decoder_features, gathered = model(
+                images,
+                return_auxiliary=True,
+            )
         reduced = {name: value.mean() for name, value in gathered.items()}
         regularizer = combine_auxiliary_losses(
             reduced,
