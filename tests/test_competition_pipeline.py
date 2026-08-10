@@ -101,6 +101,10 @@ class CompetitionDataTests(unittest.TestCase):
             [64, 128, 256],
         )
         self.assertEqual(
+            config["model"]["information_density"]["context_scales"],
+            [3, 5],
+        )
+        self.assertEqual(
             config["model"]["information_density"]["moe"][
                 "expert_input_widths"
             ],
@@ -111,6 +115,12 @@ class CompetitionDataTests(unittest.TestCase):
                 "hard_routing_start_step"
             ],
             2500,
+        )
+        self.assertEqual(
+            config["model"]["information_density"]["auxiliary_weights"][
+                "moe_expert_distillation"
+            ],
+            0.05,
         )
         self.assertEqual(
             config["training"][

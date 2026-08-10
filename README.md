@@ -251,11 +251,12 @@ Set Transformer 联合架构。分类分数聚合由
 `visibility_aware` 在无跨视角权重时使用均匀权重并保留 max 分量，避免单相机可见
 缺陷被软共识抹掉。
 
-困难度估计器只观察中心 patch 之外的邻域和全局 special tokens。前 1500 step
-保持原始 256 通道和高容量专家，随后用 1000 step 平滑启用软路由；从 2500 step
-开始按困难度执行稀疏 top-1 专家分派。重建梯度不会反向操纵困难度路由，估计器只由
-正常重建误差监督、预算和负载均衡约束训练。日志中的 `difficulty_prediction`、
-`moe_load_balance`、`moe_soft_*_usage` 和 `moe_hard_*_usage` 用于监控路由是否退化。
+困难度估计器只观察中心 patch 之外的 3×3/5×5 邻域和全局 special tokens，并显式
+编码邻域方差与两个尺度的差异。前 1500 step 保持原始 256 通道和高容量专家，同时
+将高专家的正常重建能力蒸馏给低/中专家；随后用 1000 step 平滑启用软路由，从
+2500 step 开始执行稀疏 top-1 分派。重建与蒸馏梯度都不会反向操纵困难度路由。
+日志中的 `difficulty_prediction`、`local_complexity_mean`、
+`moe_expert_distillation` 和 `moe_*_usage` 用于监控复杂度判断与专家退化。
 
 正常边缘先验仅扫描 Train 正常图，并把 checkpoint/config fingerprint 写入 artifact；
 不匹配时拒绝复用。Test_A 只在 prior 保存后进入推理，不参与统计或阈值选择。
@@ -263,7 +264,7 @@ Set Transformer 联合架构。分类分数聚合由
 完成后读取：
 
 ```text
-outputs/difficulty_moe_dinomaly2_competition_vitl448_v1/
+outputs/multiscale_density_moe_competition_vitl448_v1/
 ├── competition_data_audit.json
 ├── competition_pipeline_state.json
 ├── checkpoints/final_model.pt

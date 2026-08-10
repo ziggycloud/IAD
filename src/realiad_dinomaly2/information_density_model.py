@@ -38,10 +38,12 @@ class InformationDensityDownProjection(nn.Module):
         residual_ema_decay: float = 0.99,
         initial_expected_error: float = 0.1,
         emit_routing: bool = False,
+        context_scales: Sequence[int] = (3, 5),
     ) -> None:
         super().__init__()
         widths = tuple(int(value) for value in channel_widths)
         thresholds = tuple(float(value) for value in channel_thresholds)
+        scales = tuple(int(value) for value in context_scales)
         if not widths or widths[-1] != latent_dim:
             raise ValueError(
                 "information-density channel_widths must end at latent_dim"
@@ -73,6 +75,16 @@ class InformationDensityDownProjection(nn.Module):
             raise ValueError("residual_ema_decay must lie in [0, 1)")
         if initial_expected_error <= 0:
             raise ValueError("initial_expected_error must be positive")
+        if len(scales) < 2 or any(
+            scale < 3 or scale % 2 == 0 for scale in scales
+        ):
+            raise ValueError(
+                "context_scales must contain at least two odd values >= 3"
+            )
+        if any(
+            left >= right for left, right in zip(scales, scales[1:])
+        ):
+            raise ValueError("context_scales must be strictly increasing")
 
         self.input_dim = int(input_dim)
         self.latent_dim = int(latent_dim)
@@ -88,13 +100,20 @@ class InformationDensityDownProjection(nn.Module):
         self.residual_ema_decay = float(residual_ema_decay)
         self.initial_expected_error = float(initial_expected_error)
         self.emit_routing = bool(emit_routing)
+        self.context_scales = scales
         self.training_step = 0
 
         self.projection = nn.Linear(input_dim, latent_dim)
         self.dropout = nn.Dropout(p=dropout)
-        self.context_norm = nn.LayerNorm(input_dim * 2, eps=1e-6)
+        context_dim = input_dim * (len(scales) + 1)
+        complexity_dim = len(scales) + 1
+        self.context_norm = nn.LayerNorm(context_dim, eps=1e-6)
+        self.complexity_encoder = nn.Sequential(
+            nn.Linear(complexity_dim, hidden_dim),
+            nn.GELU(),
+        )
         self.estimator = nn.Sequential(
-            nn.Linear(input_dim * 2, hidden_dim),
+            nn.Linear(context_dim + hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -112,6 +131,7 @@ class InformationDensityDownProjection(nn.Module):
         self._last_expected_error: torch.Tensor | None = None
         self._last_difficulty: torch.Tensor | None = None
         self._last_channel_mask: torch.Tensor | None = None
+        self._last_complexity: torch.Tensor | None = None
         self._last_side: int | None = None
         self._last_auxiliary: dict[str, torch.Tensor] = {}
 
@@ -126,38 +146,62 @@ class InformationDensityDownProjection(nn.Module):
     def set_training_step(self, completed_steps: int) -> None:
         self.training_step = max(0, int(completed_steps))
 
-    def _neighbor_context(self, patches: torch.Tensor, side: int) -> torch.Tensor:
+    def _neighbor_statistics(
+        self,
+        patches: torch.Tensor,
+        side: int,
+        kernel_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, patch_count, channels = patches.shape
         spatial = patches.transpose(1, 2).reshape(
             batch_size, channels, side, side
         )
+        window_area = float(kernel_size * kernel_size)
+        padding = kernel_size // 2
         neighborhood_sum = (
             F.avg_pool2d(
                 spatial,
-                kernel_size=3,
+                kernel_size=kernel_size,
                 stride=1,
-                padding=1,
+                padding=padding,
                 count_include_pad=True,
             )
-            * 9.0
+            * window_area
             - spatial
+        )
+        neighborhood_square_sum = (
+            F.avg_pool2d(
+                spatial.square(),
+                kernel_size=kernel_size,
+                stride=1,
+                padding=padding,
+                count_include_pad=True,
+            )
+            * window_area
+            - spatial.square()
         )
         valid = spatial.new_ones((batch_size, 1, side, side))
         neighbor_count = (
             F.avg_pool2d(
                 valid,
-                kernel_size=3,
+                kernel_size=kernel_size,
                 stride=1,
-                padding=1,
+                padding=padding,
                 count_include_pad=True,
             )
-            * 9.0
+            * window_area
             - 1.0
         ).clamp_min_(1.0)
         context = neighborhood_sum / neighbor_count
-        return context.flatten(2).transpose(1, 2).reshape(
+        second_moment = neighborhood_square_sum / neighbor_count
+        variance = (second_moment - context.square()).clamp_min_(0.0)
+        token_context = context.flatten(2).transpose(1, 2).reshape(
             batch_size, patch_count, channels
         )
+        token_variance = variance.mean(dim=1, keepdim=True).flatten(
+            2
+        ).transpose(1, 2)
+        return token_context, token_variance
 
     def _difficulty_from_expected(
         self, expected_error: torch.Tensor
@@ -220,12 +264,35 @@ class InformationDensityDownProjection(nn.Module):
             )
         special = tokens[:, : self.num_special_tokens]
         patches = tokens[:, self.num_special_tokens :]
-        neighbor_context = self._neighbor_context(patches, side)
+        contexts = []
+        variances = []
+        for scale in self.context_scales:
+            context, variance = self._neighbor_statistics(
+                patches, side, scale
+            )
+            contexts.append(context)
+            variances.append(torch.tanh(torch.log1p(variance)))
         global_context = special.mean(dim=1, keepdim=True).expand(
             -1, patch_count, -1
         )
-        estimator_input = self.context_norm(
-            torch.cat([neighbor_context, global_context], dim=-1)
+        scale_disagreement = (
+            0.5
+            * (
+                1.0
+                - F.cosine_similarity(
+                    contexts[0], contexts[-1], dim=-1
+                ).unsqueeze(-1)
+            )
+        ).clamp_(0.0, 1.0)
+        complexity = torch.cat(
+            [*variances, scale_disagreement], dim=-1
+        )
+        normalized_context = self.context_norm(
+            torch.cat([*contexts, global_context], dim=-1)
+        )
+        encoded_complexity = self.complexity_encoder(complexity)
+        estimator_input = torch.cat(
+            [normalized_context, encoded_complexity], dim=-1
         )
         expected_error = F.softplus(self.estimator(estimator_input)) + 1e-6
         difficulty = self._difficulty_from_expected(expected_error)
@@ -238,6 +305,7 @@ class InformationDensityDownProjection(nn.Module):
         self._last_expected_error = expected_error
         self._last_difficulty = difficulty
         self._last_channel_mask = channel_mask
+        self._last_complexity = complexity
         self._last_side = side
         projected = self.projection(tokens) * channel_mask
         projected = self.dropout(projected)
@@ -281,6 +349,17 @@ class InformationDensityDownProjection(nn.Module):
             "capacity_mid_usage": mid_usage,
             "capacity_high_usage": high_usage,
         }
+        if self._last_complexity is not None:
+            self._last_auxiliary.update(
+                {
+                    "local_complexity_mean": self._last_complexity[
+                        ..., :-1
+                    ].mean(),
+                    "context_scale_disagreement": self._last_complexity[
+                        ..., -1
+                    ].mean(),
+                }
+            )
 
         if self.training and self.training_step <= self.capacity_warmup_steps:
             with torch.no_grad():
@@ -476,16 +555,38 @@ class DifficultyRoutedMoE(nn.Module):
         patches: torch.Tensor,
         routing: torch.Tensor,
         blend: float,
-    ) -> torch.Tensor:
-        if blend == 0.0:
-            return self.experts[-1](patches)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         expert_outputs = torch.stack(
             [expert(patches) for expert in self.experts], dim=2
         )
         high_only = routing.new_zeros(routing.shape)
         high_only[..., -1] = 1.0
         effective = high_only + blend * (routing.detach() - high_only)
-        return (expert_outputs * effective.unsqueeze(-1)).sum(dim=2)
+        reconstructed = (
+            expert_outputs * effective.unsqueeze(-1)
+        ).sum(dim=2)
+        return reconstructed, expert_outputs
+
+    @staticmethod
+    def _distillation_loss(
+        expert_outputs: torch.Tensor | None,
+        routing: torch.Tensor,
+    ) -> torch.Tensor:
+        if expert_outputs is None:
+            return routing.sum() * 0.0
+        teacher = expert_outputs[..., -1, :].detach()
+        terms = []
+        for expert_index in (0, 1):
+            error = F.smooth_l1_loss(
+                expert_outputs[..., expert_index, :],
+                teacher,
+                reduction="none",
+            ).mean(dim=-1)
+            weight = routing[..., expert_index].detach()
+            terms.append(
+                (error * weight).sum() / weight.sum().clamp_min(1e-6)
+            )
+        return torch.stack(terms).mean()
 
     def _hard_reconstruct(
         self,
@@ -515,6 +616,8 @@ class DifficultyRoutedMoE(nn.Module):
         self,
         routing: torch.Tensor,
         assignment: torch.Tensor,
+        expert_outputs: torch.Tensor | None,
+        distillation_scale: float,
     ) -> None:
         usage = routing.mean(dim=(0, 1))
         target = self.target_load.to(usage)
@@ -530,6 +633,8 @@ class DifficultyRoutedMoE(nn.Module):
         self._last_auxiliary = {
             "moe_load_balance": load_balance,
             "moe_route_entropy": route_entropy,
+            "moe_expert_distillation": distillation_scale
+            * self._distillation_loss(expert_outputs, routing),
             "moe_soft_low_usage": usage[0],
             "moe_soft_mid_usage": usage[1],
             "moe_soft_high_usage": usage[2],
@@ -558,17 +663,26 @@ class DifficultyRoutedMoE(nn.Module):
         hard = not self.training or (
             self.training_step >= self.hard_routing_start_step
         )
+        expert_outputs = None
+        distillation_scale = 0.0
         if hard:
             reconstructed_patches = self._hard_reconstruct(
                 patches, assignment
             )
         else:
-            reconstructed_patches = self._soft_reconstruct(
-                patches, routing, self._routing_blend()
+            blend = self._routing_blend()
+            reconstructed_patches, expert_outputs = self._soft_reconstruct(
+                patches, routing, blend
             )
+            distillation_scale = 1.0 - blend
         reconstructed_special = self.experts[-1](special)
         self._last_assignment = assignment
-        self._update_auxiliary(routing, assignment)
+        self._update_auxiliary(
+            routing,
+            assignment,
+            expert_outputs,
+            distillation_scale,
+        )
         return torch.cat(
             [reconstructed_special, reconstructed_patches], dim=1
         )

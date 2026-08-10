@@ -150,6 +150,31 @@ class InformationDensityTests(unittest.TestCase):
         )
         self.assertTrue(bool((active[:, 2:, 4:] < 1.0).any()))
 
+    def test_multiscale_context_measures_local_complexity(self) -> None:
+        model = self._make_model()
+        projection = model.down_projection
+        constant = torch.ones(1, 16, 8)
+        _, constant_variance = projection._neighbor_statistics(
+            constant, side=4, kernel_size=3
+        )
+        heterogeneous = constant.clone()
+        heterogeneous[:, ::2] = -1.0
+        _, heterogeneous_variance = projection._neighbor_statistics(
+            heterogeneous, side=4, kernel_size=3
+        )
+        self.assertTrue(
+            torch.allclose(
+                constant_variance, torch.zeros_like(constant_variance)
+            )
+        )
+        self.assertGreater(float(heterogeneous_variance.mean()), 0.0)
+
+        model.train()
+        model(torch.randn(2, 18, 8))
+        auxiliary = model.auxiliary_losses(detach=True)
+        self.assertIn("local_complexity_mean", auxiliary)
+        self.assertIn("context_scale_disagreement", auxiliary)
+
     def test_auxiliary_supervision_reaches_estimator(self) -> None:
         model = self._make_model().train()
         encoder, decoder, regularizer, auxiliary = forward_with_regularization(
@@ -181,6 +206,7 @@ class InformationDensityTests(unittest.TestCase):
         self.assertTrue(torch.all(calibrated <= raw))
         keys = set(model.down_projection.state_dict())
         self.assertIn("estimator.2.weight", keys)
+        self.assertIn("complexity_encoder.0.weight", keys)
         self.assertIn("residual_mean", keys)
         self.assertIn("residual_variance", keys)
 
@@ -259,6 +285,44 @@ class InformationDensityTests(unittest.TestCase):
         actual = moe((latent, difficulty))
         expected = moe.experts[-1](latent)
         self.assertTrue(torch.allclose(actual, expected))
+
+    def test_distillation_pretrains_low_and_mid_experts(self) -> None:
+        model = self._make_moe_model().train()
+        moe = model.difficulty_moe
+        assert moe is not None
+        model.set_training_step(0)
+        latent = torch.randn(2, 6, 6)
+        difficulty = torch.rand(2, 4, 1)
+        moe((latent, difficulty))
+        auxiliary = moe.auxiliary_losses(detach=False)
+        distillation = auxiliary["moe_expert_distillation"]
+        self.assertGreater(float(distillation.detach()), 0.0)
+        distillation.backward()
+        for expert_index in (0, 1):
+            first = moe.experts[expert_index].network[0]
+            assert isinstance(first, nn.Linear)
+            self.assertIsNotNone(first.weight.grad)
+            self.assertGreater(float(first.weight.grad.abs().sum()), 0.0)
+
+        model.zero_grad(set_to_none=True)
+        model.set_training_step(3)
+        moe((latent, difficulty))
+        ramp_start = moe.auxiliary_losses(
+            detach=True
+        )["moe_expert_distillation"]
+        model.set_training_step(4)
+        moe((latent, difficulty))
+        ramp_middle = moe.auxiliary_losses(
+            detach=True
+        )["moe_expert_distillation"]
+        self.assertTrue(torch.allclose(ramp_middle, 0.5 * ramp_start))
+
+        model.set_training_step(5)
+        moe((latent, difficulty))
+        sparse_distillation = moe.auxiliary_losses(
+            detach=True
+        )["moe_expert_distillation"]
+        self.assertEqual(float(sparse_distillation), 0.0)
 
     def test_hard_routing_dispatches_only_selected_expert(self) -> None:
         model = self._make_moe_model().eval()

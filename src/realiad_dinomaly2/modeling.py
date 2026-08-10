@@ -376,6 +376,12 @@ def build_model(config: dict[str, Any], device: torch.device) -> ModelBundle:
                         density.get("initial_expected_error", 0.1)
                     ),
                     emit_routing=use_difficulty_moe,
+                    context_scales=tuple(
+                        int(value)
+                        for value in density.get(
+                            "context_scales", [3, 5]
+                        )
+                    ),
                 ),
                 reconstruction,
             ]
@@ -500,6 +506,7 @@ def build_optimizer(bundle: ModelBundle, config: dict[str, Any]):
                 {
                     "params": [
                         *first_bottleneck.context_norm.parameters(),
+                        *first_bottleneck.complexity_encoder.parameters(),
                         *first_bottleneck.estimator.parameters(),
                     ],
                     "lr": base_lr,

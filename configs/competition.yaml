@@ -1,7 +1,7 @@
 experiment:
-  name: difficulty_moe_dinomaly2_competition_vitl448_v1
-  # Difficulty-MoE checkpoints are incompatible with earlier bottlenecks.
-  output_dir: outputs/difficulty_moe_dinomaly2_competition_vitl448_v1
+  name: multiscale_density_moe_competition_vitl448_v1
+  # Multiscale-density checkpoints use a wider difficulty estimator input.
+  output_dir: outputs/multiscale_density_moe_competition_vitl448_v1
   seed: 20260803
 
 dataset:
@@ -28,7 +28,10 @@ model:
   loose_loss: true
   context_aware_recenter: true
   information_density:
-    # The first 64 channels always remain open.  Context-predicted difficulty
+    # Both windows exclude the center token. Their variance and disagreement
+    # help distinguish complex normal structures from simple regions.
+    context_scales: [3, 5]
+    # The first 64 channels always remain open. Context-predicted difficulty
     # continuously opens the next 64 and final 128 channels.
     hidden_dim: 64
     channel_widths: [64, 128, 256]
@@ -65,12 +68,17 @@ model:
       capacity_high_usage: 0.0
       moe_load_balance: 0.1
       moe_route_entropy: 0.01
+      # Before sparse routing, teach low/mid experts the high expert's normal
+      # reconstruction without allowing this loss to manipulate the router.
+      moe_expert_distillation: 0.05
       moe_soft_low_usage: 0.0
       moe_soft_mid_usage: 0.0
       moe_soft_high_usage: 0.0
       moe_hard_low_usage: 0.0
       moe_hard_mid_usage: 0.0
       moe_hard_high_usage: 0.0
+      local_complexity_mean: 0.0
+      context_scale_disagreement: 0.0
   generalized:
     latent_dim: 384
     num_references: 512

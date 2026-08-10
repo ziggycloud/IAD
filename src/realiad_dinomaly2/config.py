@@ -127,6 +127,23 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError(
                 "model.information_density.hidden_dim must be positive"
             )
+        context_scales = [
+            int(value) for value in density.get("context_scales", [])
+        ]
+        if len(context_scales) < 2 or any(
+            scale < 3 or scale % 2 == 0 for scale in context_scales
+        ):
+            raise ValueError(
+                "model.information_density.context_scales must contain at "
+                "least two odd values >= 3"
+            )
+        if any(
+            left >= right
+            for left, right in zip(context_scales, context_scales[1:])
+        ):
+            raise ValueError(
+                "model.information_density.context_scales must be increasing"
+            )
         if not 0.0 < float(density.get("target_budget", 0.0)) < 1.0:
             raise ValueError(
                 "model.information_density.target_budget must lie in (0, 1)"
