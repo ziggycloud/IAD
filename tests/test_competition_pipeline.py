@@ -94,6 +94,19 @@ class CompetitionDataTests(unittest.TestCase):
         self.assertEqual(config["model"]["architecture"], "dinomaly2")
         self.assertFalse(config["model"]["multi_view"]["enabled"])
         self.assertEqual(config["training"]["effective_batch_size"], 12)
+        self.assertFalse(config["evaluation"]["normal_prior"]["enabled"])
+        self.assertTrue(config["evaluation"]["clip_fusion"]["enabled"])
+        self.assertEqual(
+            config["evaluation"]["clip_fusion"]["model_name"],
+            "ViT-L-14-336",
+        )
+
+    def test_clip_fusion_rejects_the_old_coordinate_prior(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot be enabled together"):
+            load_config(
+                ROOT / "configs" / "competition.yaml",
+                ["evaluation.normal_prior.enabled=true"],
+            )
 
     def test_object_score_modes_keep_single_view_anomaly(self) -> None:
         maps = [np.zeros((4, 4), dtype=np.float32) for _ in range(5)]

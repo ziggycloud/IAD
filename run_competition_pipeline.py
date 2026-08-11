@@ -19,6 +19,7 @@ from realiad_dinomaly2.bootstrap import ensure_iad_runtime  # noqa: E402
 
 ensure_iad_runtime(ROOT, Path(__file__), sys.argv[1:])
 
+from realiad_dinomaly2.clip_fusion import fit_clip_fusion  # noqa: E402
 from realiad_dinomaly2.competition_data import (  # noqa: E402
     scan_competition_split,
 )
@@ -284,6 +285,23 @@ def main() -> int:
                 checkpoint=str(checkpoint_path),
             )
             fit_normal_prior(
+                config,
+                checkpoint_path,
+                categories=audit["category_names"],
+            )
+        if bool(
+            config["evaluation"].get("clip_fusion", {}).get("enabled", False)
+        ):
+            _write_state(
+                output_dir,
+                status="fitting_clip_fusion",
+                next_action=(
+                    "Fit or validate Train-normal Dinomaly/OpenCLIP fusion "
+                    "scales without reading Test_A."
+                ),
+                checkpoint=str(checkpoint_path),
+            )
+            fit_clip_fusion(
                 config,
                 checkpoint_path,
                 categories=audit["category_names"],

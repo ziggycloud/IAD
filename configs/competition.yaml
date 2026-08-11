@@ -1,7 +1,7 @@
 experiment:
-  name: dinomaly2_competition_vitl448
+  name: dinomaly2_clip_fusion_competition_vitl448_v1
   # Keep original-Dinomaly2 checkpoints isolated from incompatible generalized runs.
-  output_dir: outputs/dinomaly2_competition_vitl448
+  output_dir: outputs/dinomaly2_clip_fusion_competition_vitl448_v1
   seed: 20260803
 
 dataset:
@@ -129,7 +129,9 @@ evaluation:
   metric_bins: 1000
   resume: true
   normal_prior:
-    enabled: true
+    # Fixed-coordinate priors are disabled for this independent CLIP-fusion
+    # ablation. The original Dinomaly2 reconstruction map remains intact.
+    enabled: false
     resolution: patch
     category_view_enabled: true
     unseen_fallback: view_global
@@ -137,6 +139,37 @@ evaluation:
     threshold: 2.0
     temperature: 0.5
     blend: 0.8
+    eps: 1.0e-6
+    batch_size: 2
+    num_workers: 4
+  clip_fusion:
+    enabled: true
+    # Frozen OpenAI CLIP supplies category-conditioned zero-shot semantics.
+    # When offline, download ViT-L-14-336px.pt once and set weights_path.
+    model_name: ViT-L-14-336
+    pretrained: openai
+    weights_path: null
+    image_size: 336
+    # Multi-level dense features follow the late/intermediate aggregation used
+    # by CLIP anomaly-localization work; all layer numbers are one-based.
+    feature_layers: [6, 12, 18, 24]
+    layer_weights: [0.1, 0.2, 0.3, 0.4]
+    local_kernels: [1, 3, 5]
+    local_weights: [0.5, 0.3, 0.2]
+    prompt_temperature: 0.05
+    category_prompt_blend: 0.8
+    global_context_weight: 0.15
+    # Only competition Train normals fit score scales. Test_A is never read.
+    calibration_samples_per_group: 8
+    shoulder_quantile: 0.95
+    tail_quantile: 0.995
+    # Preserve a reconstruction floor for tiny defects that CLIP may miss;
+    # semantic-only and agreement terms recover shape/logical anomalies.
+    reconstruction_floor: 0.35
+    semantic_weight: 0.3
+    agreement_weight: 0.35
+    gate_temperature: 0.5
+    max_normalized_score: 4.0
     eps: 1.0e-6
     batch_size: 2
     num_workers: 4

@@ -23,6 +23,10 @@ from .competition_data import (
     CompetitionView,
     scan_competition_split,
 )
+from .clip_fusion import (
+    clip_fusion_path,
+    load_clip_fusion,
+)
 from .config import config_fingerprint
 from .losses import anomaly_map
 from .modeling import build_model, load_trainable_state_dict
@@ -91,6 +95,16 @@ def _submission_signature(
         payload["normal_prior"] = {
             "path": str(prior_path),
             "sha256": file_sha256(prior_path),
+        }
+    if bool(config["evaluation"].get("clip_fusion", {}).get("enabled", False)):
+        fusion_path = clip_fusion_path(config)
+        if not fusion_path.is_file():
+            raise FileNotFoundError(
+                f"Competition CLIP fusion artifact does not exist: {fusion_path}"
+            )
+        payload["clip_fusion"] = {
+            "path": str(fusion_path),
+            "sha256": file_sha256(fusion_path),
         }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
@@ -442,6 +456,14 @@ def generate_competition_submission(
             config,
             checkpoint_path,
         )
+    clip_fusion = None
+    if bool(evaluation.get("clip_fusion", {}).get("enabled", False)):
+        clip_fusion = load_clip_fusion(
+            clip_fusion_path(config),
+            config,
+            checkpoint_path,
+            device,
+        )
     mask_size = int(submission.get("mask_size", 448))
     lower_quantile = float(submission.get("lower_quantile", 0.001))
     upper_quantile = float(submission.get("upper_quantile", 0.99999))
@@ -549,6 +571,10 @@ def generate_competition_submission(
                         valid_view_mask=valid_view_mask,
                         config=config,
                     )
+                if clip_fusion is not None:
+                    raise ValueError(
+                        "CLIP fusion v1 does not support joint multi-view inference"
+                    )
                 batch_size, view_count = current.shape[:2]
                 current = F.interpolate(
                     current.float().reshape(
@@ -603,6 +629,15 @@ def generate_competition_submission(
                 if normal_prior is not None:
                     current = normal_prior.calibrate(
                         current,
+                        categories=category_names,
+                        view_ids=view_ids,
+                        valid_view_mask=valid_view_mask,
+                        config=config,
+                    )
+                if clip_fusion is not None:
+                    current = clip_fusion.calibrate(
+                        current,
+                        images,
                         categories=category_names,
                         view_ids=view_ids,
                         valid_view_mask=valid_view_mask,

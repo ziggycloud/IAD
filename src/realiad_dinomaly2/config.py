@@ -300,6 +300,106 @@ def _validate(config: dict[str, Any]) -> None:
         blend = float(normal_prior.get("blend", 0.8))
         if not 0.0 <= blend <= 1.0:
             raise ValueError("evaluation.normal_prior.blend must be in [0, 1]")
+    clip_fusion = evaluation.get("clip_fusion", {})
+    if not isinstance(clip_fusion, dict):
+        raise ValueError("evaluation.clip_fusion must be a mapping")
+    if bool(clip_fusion.get("enabled", False)):
+        if dataset_type != "competition_folders":
+            raise ValueError(
+                "evaluation.clip_fusion is restricted to competition_folders"
+            )
+        if bool(multi_view.get("enabled", False)):
+            raise ValueError(
+                "evaluation.clip_fusion requires independent competition views"
+            )
+        if bool(normal_prior.get("enabled", False)):
+            raise ValueError(
+                "normal_prior and clip_fusion cannot be enabled together"
+            )
+        if not str(clip_fusion.get("model_name", "")).strip():
+            raise ValueError("clip_fusion.model_name cannot be empty")
+        if not clip_fusion.get("weights_path") and not str(
+            clip_fusion.get("pretrained", "")
+        ).strip():
+            raise ValueError(
+                "clip_fusion requires pretrained or a local weights_path"
+            )
+        clip_image_size = int(clip_fusion.get("image_size", 336))
+        if clip_image_size <= 0 or clip_image_size % 14 != 0:
+            raise ValueError(
+                "clip_fusion.image_size must be positive and divisible by 14"
+            )
+        feature_layers = [
+            int(value) for value in clip_fusion.get("feature_layers", [])
+        ]
+        if not feature_layers or any(value <= 0 for value in feature_layers):
+            raise ValueError(
+                "clip_fusion.feature_layers must contain positive layer numbers"
+            )
+        if len(feature_layers) != len(set(feature_layers)):
+            raise ValueError("clip_fusion.feature_layers must be unique")
+        layer_weights = clip_fusion.get("layer_weights")
+        if layer_weights is not None:
+            values = [float(value) for value in layer_weights]
+            if len(values) != len(feature_layers) or any(
+                value < 0 for value in values
+            ) or sum(values) <= 0:
+                raise ValueError(
+                    "clip_fusion.layer_weights must match feature_layers and "
+                    "have a positive sum"
+                )
+        local_kernels = [
+            int(value) for value in clip_fusion.get("local_kernels", [1, 3, 5])
+        ]
+        if not local_kernels or any(
+            value <= 0 or value % 2 == 0 for value in local_kernels
+        ):
+            raise ValueError(
+                "clip_fusion.local_kernels must contain positive odd values"
+            )
+        local_weights = clip_fusion.get("local_weights")
+        if local_weights is not None:
+            values = [float(value) for value in local_weights]
+            if len(values) != len(local_kernels) or any(
+                value < 0 for value in values
+            ) or sum(values) <= 0:
+                raise ValueError(
+                    "clip_fusion.local_weights must match local_kernels and "
+                    "have a positive sum"
+                )
+        if float(clip_fusion.get("prompt_temperature", 0.05)) <= 0:
+            raise ValueError("clip_fusion.prompt_temperature must be positive")
+        for key, default in (
+            ("category_prompt_blend", 0.8),
+            ("global_context_weight", 0.15),
+            ("reconstruction_floor", 0.35),
+        ):
+            value = float(clip_fusion.get(key, default))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"clip_fusion.{key} must be in [0, 1]")
+        if int(clip_fusion.get("calibration_samples_per_group", 8)) < 2:
+            raise ValueError(
+                "clip_fusion.calibration_samples_per_group must be at least 2"
+            )
+        shoulder = float(clip_fusion.get("shoulder_quantile", 0.95))
+        tail = float(clip_fusion.get("tail_quantile", 0.995))
+        if not 0.5 < shoulder < tail < 1.0:
+            raise ValueError(
+                "clip_fusion quantiles must satisfy 0.5 < shoulder < tail < 1"
+            )
+        for key, default in (
+            ("semantic_weight", 0.3),
+            ("agreement_weight", 0.35),
+        ):
+            if float(clip_fusion.get(key, default)) < 0:
+                raise ValueError(f"clip_fusion.{key} must be non-negative")
+        for key, default in (
+            ("gate_temperature", 0.5),
+            ("max_normalized_score", 4.0),
+            ("eps", 1e-6),
+        ):
+            if float(clip_fusion.get(key, default)) <= 0:
+                raise ValueError(f"clip_fusion.{key} must be positive")
     cache = config.get("cache")
     if cache is not None:
         if "output_dir" not in cache:
@@ -341,6 +441,9 @@ def resolved_paths(config: dict[str, Any]) -> dict[str, Path]:
             paths["train_image_dir"] = resolve_path(
                 dataset["train_image_dir"]
             )
+    clip_fusion = config.get("evaluation", {}).get("clip_fusion", {})
+    if clip_fusion.get("weights_path"):
+        paths["clip_weights_path"] = resolve_path(clip_fusion["weights_path"])
     return paths
 
 
@@ -357,6 +460,10 @@ def materialize_paths(config: dict[str, Any]) -> dict[str, Any]:
         result["dataset"]["train_image_dir"] = str(paths["train_image_dir"])
     result["experiment"]["output_dir"] = str(paths["output_dir"])
     result["model"]["backbone_weights_dir"] = str(paths["backbone_weights_dir"])
+    if "clip_weights_path" in paths:
+        result["evaluation"]["clip_fusion"]["weights_path"] = str(
+            paths["clip_weights_path"]
+        )
     if "cache" in result and "output_dir" in result["cache"]:
         result["cache"]["output_dir"] = str(resolve_path(result["cache"]["output_dir"]))
     return result
