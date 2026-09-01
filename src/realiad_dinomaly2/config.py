@@ -300,6 +300,22 @@ def _validate(config: dict[str, Any]) -> None:
         blend = float(normal_prior.get("blend", 0.8))
         if not 0.0 <= blend <= 1.0:
             raise ValueError("evaluation.normal_prior.blend must be in [0, 1]")
+        novelty_debias = normal_prior.get("unseen_novelty_debias", {})
+        if not isinstance(novelty_debias, dict):
+            raise ValueError(
+                "evaluation.normal_prior.unseen_novelty_debias must be a mapping"
+            )
+        for key, default in (
+            ("baseline_quantile", 0.5),
+            ("local_blend", 0.5),
+            ("global_retention", 0.25),
+        ):
+            value = float(novelty_debias.get(key, default))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(
+                    "evaluation.normal_prior.unseen_novelty_debias."
+                    f"{key} must be in [0, 1]"
+                )
     cache = config.get("cache")
     if cache is not None:
         if "output_dir" not in cache:

@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from .competition_data import build_competition_train_dataset
 from .config import config_fingerprint
 from .data import build_train_dataset
-from .losses import anomaly_map
+from .losses import anomaly_map, debias_unseen_novelty
 from .modeling import build_model, load_trainable_state_dict
 from .runtime import (
     amp_dtype,
@@ -113,6 +113,11 @@ class NormalPrior:
             prior_config.get("category_view_enabled", True)
         )
         fallback = str(prior_config.get("unseen_fallback", "view_global"))
+        unseen_rows = torch.tensor(
+            [str(category) not in self.category_view for category in categories],
+            dtype=torch.bool,
+            device=raw_maps.device,
+        )
 
         for batch_index, category in enumerate(categories):
             category_stats = self.category_view.get(str(category), {})
@@ -145,6 +150,21 @@ class NormalPrior:
                 )
                 calibrated[batch_index, view_index] = current * (
                     (1.0 - blend) + blend * gate
+                )
+
+        novelty_config = prior_config.get("unseen_novelty_debias", {})
+        if bool(novelty_config.get("enabled", False)):
+            selected = unseen_rows.unsqueeze(1) & valid_view_mask
+            if bool(selected.any()):
+                calibrated[selected] = debias_unseen_novelty(
+                    calibrated[selected],
+                    baseline_quantile=float(
+                        novelty_config.get("baseline_quantile", 0.5)
+                    ),
+                    local_blend=float(novelty_config.get("local_blend", 0.5)),
+                    global_retention=float(
+                        novelty_config.get("global_retention", 0.25)
+                    ),
                 )
         return calibrated[:, 0] if original_ndim == 4 else calibrated
 

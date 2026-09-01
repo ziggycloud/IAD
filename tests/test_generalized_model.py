@@ -52,6 +52,21 @@ class ReferenceAndRouterTests(unittest.TestCase):
             {"reference_balance", "reference_assignment_entropy"},
         )
         self.assertTrue(all(value.ndim == 0 for value in auxiliary.values()))
+        diagnostics = bank.diagnostics(detach=True)
+        self.assertEqual(diagnostics["reference_confidence"].shape, (3,))
+        self.assertEqual(diagnostics["reference_uncertainty"].shape, (3,))
+        self.assertTrue(
+            torch.all(
+                (diagnostics["reference_confidence"] >= -1.0)
+                & (diagnostics["reference_confidence"] <= 1.0)
+            )
+        )
+        self.assertTrue(
+            torch.all(
+                (diagnostics["reference_uncertainty"] >= 0.0)
+                & (diagnostics["reference_uncertainty"] <= 1.0 + 1e-6)
+            )
+        )
         reconstructed.square().mean().backward()
         self.assertIsNotNone(bank.references.grad)
 
@@ -397,6 +412,17 @@ class GeneralizedModelContractTests(unittest.TestCase):
         maps = anomaly_map(encoder_features, decoder_features, output_size=8)
         self.assertEqual(maps.shape, (2, 5, 1, 8, 8))
         self.assertTrue(torch.isfinite(maps).all())
+
+    def test_multi_view_context_reports_reference_familiarity(self) -> None:
+        model = self._make_multi_view_model().eval()
+        _, _, context = model(
+            torch.randn(2, 5, 3, 8, 8),
+            view_ids=torch.arange(5).expand(2, -1),
+            valid_view_mask=torch.ones(2, 5, dtype=torch.bool),
+            return_context=True,
+        )
+        self.assertEqual(context["reference_confidence"].shape, (10,))
+        self.assertEqual(context["reference_uncertainty"].shape, (10,))
 
     def test_valid_mask_blocks_missing_views(self) -> None:
         context = MultiViewContextEncoder(

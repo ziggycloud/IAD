@@ -83,6 +83,12 @@ def minimal_config() -> dict:
                 "temperature": 0.5,
                 "blend": 0.8,
                 "eps": 1e-6,
+                "unseen_novelty_debias": {
+                    "enabled": True,
+                    "baseline_quantile": 0.5,
+                    "local_blend": 1.0,
+                    "global_retention": 0.25,
+                },
             }
         },
         "runtime": {"pin_memory": False},
@@ -181,6 +187,32 @@ class NormalPriorTests(unittest.TestCase):
         )
         self.assertEqual(calibrated.shape, raw.shape)
         self.assertTrue(torch.all(calibrated > 0))
+
+    def test_novelty_debias_changes_only_categories_absent_from_train_prior(self) -> None:
+        config = minimal_config()
+        stats = {
+            "median": torch.zeros(1, 2, 2),
+            "mad": torch.ones(1, 2, 2),
+        }
+        prior = NormalPrior(
+            {
+                "metadata": {},
+                "category_view": {"seen": {"0": stats}},
+                "view_global": {"0": stats},
+            }
+        )
+        raw = torch.full((2, 1, 2, 2), 0.4)
+        raw[:, :, 0, 0] = 1.0
+        calibrated = prior.calibrate(
+            raw,
+            categories=["seen", "unseen"],
+            view_ids=torch.tensor([0, 0]),
+            valid_view_mask=torch.ones(2, dtype=torch.bool),
+            config=config,
+        )
+        seen_ratio = calibrated[0, 0, 0, 0] / calibrated[0, 0, 1, 1]
+        unseen_ratio = calibrated[1, 0, 0, 0] / calibrated[1, 0, 1, 1]
+        self.assertGreater(float(unseen_ratio), float(seen_ratio))
 
     def test_checkpoint_fingerprint_mismatch_is_rejected(self) -> None:
         config = minimal_config()

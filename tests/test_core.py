@@ -20,7 +20,7 @@ from realiad_dinomaly2.metrics import (
     binary_metrics,
     top_ratio_mean,
 )
-from realiad_dinomaly2.losses import anomaly_map
+from realiad_dinomaly2.losses import anomaly_map, debias_unseen_novelty
 from realiad_dinomaly2.modeling import set_learning_rate
 from realiad_dinomaly2.train_engine import (
     DeterministicIterationBatchSampler,
@@ -217,6 +217,23 @@ class StabilityTests(unittest.TestCase):
             align_corners=False,
         )
         self.assertTrue(torch.allclose(result, torch.full_like(result, 0.25)))
+
+    def test_unseen_novelty_debias_suppresses_uniform_shift_not_local_peak(self) -> None:
+        maps = torch.full((1, 1, 4, 4), 0.4)
+        maps[0, 0, 1, 2] = 1.0
+        result = debias_unseen_novelty(
+            maps,
+            baseline_quantile=0.5,
+            local_blend=1.0,
+            global_retention=0.25,
+        )
+        self.assertAlmostEqual(float(result[0, 0, 0, 0]), 0.1, places=6)
+        self.assertAlmostEqual(float(result[0, 0, 1, 2]), 0.7, places=6)
+        self.assertAlmostEqual(
+            float(result[0, 0, 1, 2] - result[0, 0, 0, 0]),
+            float(maps[0, 0, 1, 2] - maps[0, 0, 0, 0]),
+            places=6,
+        )
 
 
 if __name__ == "__main__":

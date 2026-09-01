@@ -130,6 +130,11 @@ evaluation:
     temperature: 0.5
     blend: 0.8
     eps: 1.0e-6
+    unseen_novelty_debias:
+      enabled: true
+      baseline_quantile: 0.5
+      local_blend: 0.5
+      global_retention: 0.25
     batch_size: 2
     num_workers: 4
 

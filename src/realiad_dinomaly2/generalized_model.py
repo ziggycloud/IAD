@@ -443,6 +443,7 @@ class CompositionalReferenceBank(nn.Module):
         self.output_projection = nn.Linear(dim, dim)
         self.output_norm = nn.LayerNorm(dim, eps=1e-6)
         self._last_auxiliary: dict[str, torch.Tensor] = {}
+        self._last_diagnostics: dict[str, torch.Tensor] = {}
         self.reset_reference_parameters()
 
     def reset_reference_parameters(self) -> None:
@@ -460,7 +461,9 @@ class CompositionalReferenceBank(nn.Module):
             dim=-1,
             eps=1e-6,
         )
-        logits = torch.matmul(queries, keys.transpose(0, 1)) / self.temperature
+        similarities = torch.matmul(queries, keys.transpose(0, 1))
+        best_similarity = similarities.max(dim=-1).values
+        logits = similarities / self.temperature
         if self.top_k < self.num_references:
             top_values, top_indices = logits.topk(self.top_k, dim=-1)
             sparse_logits = torch.full_like(logits, -torch.inf)
@@ -480,18 +483,31 @@ class CompositionalReferenceBank(nn.Module):
             usage.clamp_min(1e-8)
             * (usage.clamp_min(1e-8).log() - math.log(uniform))
         ).sum()
-        assignment_entropy = -(
+        token_entropy = -(
             assignments.float().clamp_min(1e-8)
             * assignments.float().clamp_min(1e-8).log()
-        ).sum(dim=-1).mean()
+        ).sum(dim=-1)
+        assignment_entropy = token_entropy.mean()
         self._last_auxiliary = {
             "reference_balance": reference_balance,
             "reference_assignment_entropy": assignment_entropy,
+        }
+        self._last_diagnostics = {
+            "reference_confidence": best_similarity.mean(dim=1),
+            "reference_uncertainty": (
+                token_entropy.mean(dim=1) / math.log(self.num_references)
+            ),
         }
         return reconstruction
 
     def auxiliary_losses(self) -> dict[str, torch.Tensor]:
         return dict(self._last_auxiliary)
+
+    def diagnostics(self, detach: bool = False) -> dict[str, torch.Tensor]:
+        diagnostics = dict(self._last_diagnostics)
+        if detach:
+            return {name: value.detach() for name, value in diagnostics.items()}
+        return diagnostics
 
 
 class CategoryFreeRouter(nn.Module):
@@ -851,6 +867,9 @@ class CompositionalNormalityAdapter(nn.Module):
             return {name: value.detach() for name, value in losses.items()}
         return losses
 
+    def diagnostics(self, detach: bool = False) -> dict[str, torch.Tensor]:
+        return self.reference_bank.diagnostics(detach=detach)
+
     def regularization_loss(
         self,
         weights: Mapping[str, float] | None = None,
@@ -1152,6 +1171,9 @@ class GeneralizedDinomaly(nn.Module):
                 "visibility_weights": context_output.visibility_weights,
                 "attention_weights": context_output.attention_weights,
             }
+        adapter = self._normality_adapter()
+        if adapter is not None:
+            context_payload.update(adapter.diagnostics(detach=False))
         if not return_auxiliary:
             if return_context:
                 return encoder_features, decoder_features, context_payload

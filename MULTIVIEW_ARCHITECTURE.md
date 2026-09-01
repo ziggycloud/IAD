@@ -133,6 +133,26 @@ calibrated = raw * ((1 - blend) + blend * gate)
 当 `blend < 1` 时，任何正的局部响应都不会被硬裁成相同的零值，局部排序能力得以
 保留。校准发生在 patch 网格，之后才上采样、Gaussian、score 和 mask 标定。
 
+### 未见类别的语义新颖性去偏
+
+类别不在 Train prior 中时，较大的全图重建残差既可能代表大面积缺陷，也可能只是
+模型从未见过该物体的正常形状。`unseen_novelty_debias` 只对缺少 category-view
+统计、必须使用 view-global fallback 的类别生效；已见类别结果不变。
+
+它先取每张视图异常图的稳健空间分位数 `b`，再构造局部超额响应：
+
+```text
+local = relu(raw - b)
+contrast = local + global_retention * b
+debiased = (1 - local_blend) * raw + local_blend * contrast
+```
+
+空间上均匀的类别新颖性会被削弱，局部峰值的相对对比度得到保留；
+`global_retention` 保留部分全局响应，避免大面积缺陷被完全消除。Reference Bank 同时
+输出每个视图的 `reference_confidence`（最佳原语余弦相似度）和
+`reference_uncertainty`（归一化 assignment entropy），供日志分析和后续置信度门控
+消融使用。本版本不使用未经 Train 标定的固定阈值改变预测。
+
 `normal_prior.pt` 同时保存：format version、checkpoint 文件 SHA-256、训练语义 config
 fingerprint、Train-only 标记、类别列表、view ID、网格尺寸、统计方法、样本数和校准
 参数。恢复时 checkpoint 或 config 不匹配会直接报错，绝不静默复用。prior fitter 的
@@ -191,6 +211,11 @@ evaluation:
     temperature: 0.5
     blend: 0.8
     eps: 1.0e-6
+    unseen_novelty_debias:
+      enabled: true
+      baseline_quantile: 0.5
+      local_blend: 0.5
+      global_retention: 0.25
 ```
 
 单视角模型消融可设置：

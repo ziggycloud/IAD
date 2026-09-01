@@ -166,3 +166,47 @@ def anomaly_map(
     if multi_view_shape is not None:
         result = result.reshape(*multi_view_shape, *result.shape[1:])
     return result
+
+
+def debias_unseen_novelty(
+    anomaly_maps: torch.Tensor,
+    *,
+    baseline_quantile: float = 0.5,
+    local_blend: float = 0.5,
+    global_retention: float = 0.25,
+) -> torch.Tensor:
+    """Reduce uniform semantic novelty while retaining localized defects.
+
+    A normal object from an unseen category can produce a spatially broad
+    reconstruction residual because its shape is absent from the learned
+    normal references.  Local defects are usually distinguished by their
+    excess over that per-view background.  This transform therefore blends
+    the raw map with a robust local-contrast map while retaining a bounded
+    fraction of the global response for large defects.
+
+    The caller is responsible for selecting only genuinely unseen categories.
+    """
+
+    if anomaly_maps.ndim != 4 or anomaly_maps.shape[1] != 1:
+        raise ValueError("unseen novelty debias expects [B,1,H,W] maps")
+    if not 0.0 <= float(baseline_quantile) <= 1.0:
+        raise ValueError("baseline_quantile must be in [0, 1]")
+    if not 0.0 <= float(local_blend) <= 1.0:
+        raise ValueError("local_blend must be in [0, 1]")
+    if not 0.0 <= float(global_retention) <= 1.0:
+        raise ValueError("global_retention must be in [0, 1]")
+    if anomaly_maps.numel() == 0 or float(local_blend) == 0.0:
+        return anomaly_maps
+
+    flattened = anomaly_maps.float().flatten(start_dim=2)
+    baseline = torch.quantile(
+        flattened,
+        q=float(baseline_quantile),
+        dim=2,
+        keepdim=True,
+    ).reshape(anomaly_maps.shape[0], 1, 1, 1)
+    baseline = baseline.to(dtype=anomaly_maps.dtype)
+    local_excess = (anomaly_maps - baseline).clamp_min(0.0)
+    contrast_map = local_excess + float(global_retention) * baseline
+    blend = float(local_blend)
+    return (1.0 - blend) * anomaly_maps + blend * contrast_map
