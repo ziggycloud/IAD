@@ -513,7 +513,11 @@ def generate_competition_submission(
         maps: list[np.ndarray] = []
         visibility_by_group: dict[str, np.ndarray] = {}
         for batch in _loader(dataset, config):
-            if multi_view_enabled:
+            # Use the dataset payload as the final source of truth. This keeps
+            # inference compatible with resumed runs whose local config/code
+            # was updated between training and Test_B packaging.
+            batch_is_multi_view = "images" in batch
+            if batch_is_multi_view:
                 images = batch["images"].to(
                     device,
                     non_blocking=bool(config["runtime"]["pin_memory"]),

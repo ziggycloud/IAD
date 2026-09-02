@@ -258,7 +258,16 @@ def fit_normal_prior(
     checkpoint_path = Path(checkpoint_path).expanduser().resolve()
     artifact_path = normal_prior_path(config)
     if artifact_path.is_file() and not force:
-        return load_normal_prior(artifact_path, config, checkpoint_path)
+        try:
+            return load_normal_prior(artifact_path, config, checkpoint_path)
+        except ValueError as exc:
+            # A completed/resumed training run may rewrite final_model.pt while
+            # leaving a prior fitted from an earlier checkpoint in place. Do
+            # not reuse that stale artifact, but also do not require users to
+            # delete cache files manually. Other load/deserialization errors
+            # still propagate instead of silently hiding a damaged artifact.
+            if not str(exc).startswith("normal prior/"):
+                raise
 
     category_list = sorted(str(category) for category in categories)
     multi_view_config = dict(config["model"].get("multi_view", {}))
