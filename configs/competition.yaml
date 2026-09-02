@@ -102,9 +102,9 @@ training:
   # 0.1 over-clips routine updates; 0.5 remains conservative for ViT-L.
   gradient_clip_norm: 0.5
   gradient_guard:
-    # Keep a finite catastrophic guard. 1e9 would also admit corrupted finite
-    # gradients; routine large gradients are handled by clipping above.
-    skip_step_norm: 100.0
+    # This 100M-parameter trainable stack starts around norm 170. Keep the
+    # guard well above that normal regime; clipping handles routine gradients.
+    skip_step_norm: 1000.0
     max_consecutive_skips: 3
     fail_on_nonfinite: true
   log_every: 20
