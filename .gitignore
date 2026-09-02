@@ -11,6 +11,7 @@ __pycache__/
 outputs/**
 !outputs/.gitkeep
 /data/
+/.ossutil_checkpoint/
 /2511.00540v2.pdf
 tmp/
 

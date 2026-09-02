@@ -62,6 +62,25 @@ def _validate(config: dict[str, Any]) -> None:
         for key in ("train_dir", "test_dir"):
             if not isinstance(dataset.get(key), (str, Path)):
                 raise ValueError(f"dataset.{key} must be a path")
+        for key in ("categories", "test_categories"):
+            value = dataset.get(key, "all")
+            if value != "all" and not isinstance(value, (list, tuple)):
+                raise ValueError(f"dataset.{key} must be all or a category list")
+        for key in ("category_limit", "test_category_limit"):
+            value = dataset.get(key)
+            if value is not None and int(value) <= 0:
+                raise ValueError(f"dataset.{key} must be null or positive")
+        if not isinstance(dataset.get("require_same_categories", True), bool):
+            raise ValueError("dataset.require_same_categories must be boolean")
+        for key in (
+            "expected_categories",
+            "expected_test_categories",
+            "expected_train_samples_per_category",
+            "expected_test_samples_per_category",
+        ):
+            value = dataset.get(key)
+            if value is not None and int(value) <= 0:
+                raise ValueError(f"dataset.{key} must be null or positive")
     image_size = int(dataset["image_size"])
     crop_size = int(dataset["crop_size"])
     if image_size <= 0 or crop_size <= 0 or crop_size > image_size:
