@@ -1,8 +1,8 @@
 experiment:
-  name: multiview_generalized_dinomaly_competition_vitl448_v3
-  # Multi-view checkpoints are incompatible with the old per-view run.
-  output_dir: outputs/multiview_generalized_dinomaly_competition_vitl448_v3
-  seed: 20260803
+  name: multiview_generalized_dinomaly_competition_vitl448_cosine_v4
+  # Keep this run separate: scheduler/optimizer semantics are checkpoint-bound.
+  output_dir: outputs/multiview_generalized_dinomaly_competition_vitl448_cosine_v4
+  seed: 20260830
 
 dataset:
   type: competition_folders
@@ -72,9 +72,8 @@ training:
   memory_headroom_mb: 3000
   amp: true
   amp_dtype: bfloat16
-  # 1e-3 became unstable when total_steps was extended to 15k. Start with
-  # 3e-4; tune [1e-4, 3e-4, 5e-4] before changing the architecture.
-  learning_rate: 0.0003
+  # Conservative peak LR for the large trainable decoder/reference/router.
+  learning_rate: 0.0001
   first_bottleneck_lr_scale: 0.2
   weight_decay: 0.0001
   adam_betas: [0.9, 0.999]
@@ -83,19 +82,16 @@ training:
     # Supported: stable_adamw, adamw, adam.
     type: stable_adamw
     amsgrad: false
-    stable_clip_threshold: 1.0
+    stable_clip_threshold: 0.5
   scheduler:
-    # Supported: cosine, linear, polynomial, constant, step, multistep.
+    # 500-step linear warmup, then one half-cosine cycle to 5e-6.
     type: cosine
     warmup_steps: 500
     min_lr_ratio: 0.05
     step_offset: 1
-    # polynomial: power: 2.0
-    # step: step_size: 1500, gamma: 0.5
-    # multistep: milestones: [2500, 4500], gamma: 0.3
-  # A slower, less aggressive Loose Loss avoids locking onto persistent
-  # normal edges as the only hard tokens.
-  loose_loss_warmup_steps: 2000
+  # Ramp hard-token rejection more slowly than LR warmup so references first
+  # learn the broad normal manifold before difficult normal edges are removed.
+  loose_loss_warmup_steps: 1500
   loose_loss_final_discard: 0.7
   generalized_regularization_weight: 0.01
   multi_view_auxiliary_weights:
@@ -103,15 +99,16 @@ training:
     context_variance: 0.001
     visibility_balance: 0.001
     attention_entropy: 0.001
-  gradient_clip_norm: 0.1
+  # 0.1 over-clips routine updates; 0.5 remains conservative for ViT-L.
+  gradient_clip_norm: 0.5
   gradient_guard:
-    # The logged norm is measured before clipping. Skip only catastrophic
-    # outliers; after three consecutive skips stop and preserve the last ckpt.
-    skip_step_norm: 1.0
+    # Keep a finite catastrophic guard. 1e9 would also admit corrupted finite
+    # gradients; routine large gradients are handled by clipping above.
+    skip_step_norm: 100.0
     max_consecutive_skips: 3
     fail_on_nonfinite: true
   log_every: 20
-  checkpoint_every: 250
+  checkpoint_every: 500
   auto_resume: true
 
 evaluation:
