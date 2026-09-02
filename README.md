@@ -268,7 +268,7 @@ view-global Normal Prior 和 unseen novelty debias。显式 `--set` 参数优先
 完成后读取：
 
 ```text
-outputs/multiview_generalized_dinomaly_competition_vitl448_v3/
+outputs/multiview_generalized_dinomaly_competition_vitl448_cosine_v4/
 ├── competition_data_audit.json
 ├── competition_pipeline_state.json
 ├── checkpoints/final_model.pt
