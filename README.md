@@ -222,7 +222,7 @@ python run_unseen_pipeline.py
 正常边缘先验及消融方式见
 [MULTIVIEW_ARCHITECTURE.md](MULTIVIEW_ARCHITECTURE.md)。
 
-## 比赛 Train / Test_A 提交流水线
+## 比赛 Train / Test_A / Test_B 提交流水线
 
 比赛数据直接按 `category/Sxxxx/0.png..4.png` 读取，不需要官方 JSON，也不读取
 任何标签。默认配置复用上面的 category-generalized Dinomaly、DINOv2-register
@@ -240,6 +240,12 @@ python run_competition_pipeline.py --skip-train
 
 # 只训练，暂不推理
 python run_competition_pipeline.py --skip-inference
+
+# Test_B：Train 训练/复用 checkpoint → Test_B 推理 → 校验并打 ZIP
+python run_competition_pipeline.py --test-b
+
+# 已有完整 checkpoint 时只执行 Test_B 推理与打包
+python run_competition_pipeline.py --test-b --skip-train
 ```
 
 默认数据路径和配置分别为 `data/competition/Train`、
@@ -248,6 +254,13 @@ python run_competition_pipeline.py --skip-inference
 上下文，但五张异常图和 mask 始终独立。分类分数聚合由
 `submission.object_score_aggregation` 控制；`legacy_concat_topk` 可恢复旧基线，默认
 `visibility_aware` 同时保留 max 分量，避免单相机可见缺陷被软共识抹掉。
+
+Test_B 解压到 `data/competition/Test_B`。`--test-b` 会独立扫描其全部类别，不要求
+类别数、类别名称或每类样本数与 Train/Test_A 相同；Train 中不存在的类别使用
+view-global Normal Prior 和 unseen novelty debias。显式 `--set` 参数优先于该预设，
+因此仍可覆盖 Test_B 路径或恢复严格的数据计数检查。Test_B 不参与训练和 prior 拟合。
+下载使用天池提供的临时 STS 凭证，凭证只通过 `ossutil` 命令传入，不要写入 YAML、
+脚本或 Git；`Test_B.zip` 和 ossutil 断点目录均已被 `.gitignore` 排除。
 
 正常边缘先验仅扫描 Train 正常图，并把 checkpoint/config fingerprint 写入 artifact；
 不匹配时拒绝复用。Test_A 只在 prior 保存后进入推理，不参与统计或阈值选择。

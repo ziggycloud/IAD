@@ -10,7 +10,13 @@ dataset:
   test_dir: data/competition/Test_A
   categories: all
   category_limit: null
+  # Test selection is independent so Test_B may contain categories absent from
+  # Train. The default Test_A policy remains strict and backward compatible.
+  test_categories: all
+  test_category_limit: null
+  require_same_categories: true
   expected_categories: 50
+  expected_test_categories: 50
   expected_train_samples_per_category: 20
   expected_test_samples_per_category: 15
   image_size: 448
