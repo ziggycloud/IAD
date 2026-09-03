@@ -80,6 +80,10 @@ def _submission_signature(
         "checkpoint_mtime_ns": checkpoint_stat.st_mtime_ns,
         "test_root": str(manifest.root),
         "test_manifest_sha256": _manifest_digest(manifest),
+        # Evaluation settings materially change anomaly maps, calibration and
+        # smoothing. Omitting them previously allowed stale category results to
+        # be reused after an inference-parameter change.
+        "evaluation": config["evaluation"],
         "submission": config["submission"],
     }
     if bool(config["evaluation"].get("normal_prior", {}).get("enabled", False)):

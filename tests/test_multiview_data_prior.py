@@ -17,6 +17,7 @@ from realiad_dinomaly2.data import Record, group_records_by_object
 from realiad_dinomaly2.normal_prior import (
     NORMAL_PRIOR_FORMAT_VERSION,
     NormalPrior,
+    _normal_prior_fingerprint,
     file_sha256,
     fit_normal_prior,
     validate_normal_prior,
@@ -223,6 +224,7 @@ class NormalPriorTests(unittest.TestCase):
                 "metadata": {
                     "format_version": NORMAL_PRIOR_FORMAT_VERSION,
                     "config_fingerprint": config_fingerprint(config),
+                    "normal_prior_fingerprint": _normal_prior_fingerprint(config),
                     "checkpoint_sha256": "not-the-checkpoint",
                     "source_split": "Train",
                     "source_labels": "normal_only",

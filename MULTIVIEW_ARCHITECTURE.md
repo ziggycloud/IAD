@@ -147,7 +147,8 @@ contrast = local + global_retention * b
 debiased = (1 - local_blend) * raw + local_blend * contrast
 ```
 
-空间上均匀的类别新颖性会被削弱，局部峰值的相对对比度得到保留；
+该启发式默认关闭；只有经过带标签验证后才建议显式启用。启用时，空间上均匀的类别
+新颖性会被削弱，局部峰值的相对对比度得到保留；
 `global_retention` 保留部分全局响应，避免大面积缺陷被完全消除。Reference Bank 同时
 输出每个视图的 `reference_confidence`（最佳原语余弦相似度）和
 `reference_uncertainty`（归一化 assignment entropy），供日志分析和后续置信度门控
@@ -190,7 +191,7 @@ model:
     view_embedding: true
     view_dropout_probability: 0.2
     visibility_temperature: 1.0
-    cross_view_dropout: 0.1
+    cross_view_dropout: 0.0
     missing_view_policy: error
 
 training:

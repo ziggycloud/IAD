@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -24,6 +25,32 @@ from .runtime import (
 
 
 NORMAL_PRIOR_FORMAT_VERSION = 1
+
+
+def _normal_prior_fingerprint(config: dict[str, Any]) -> str:
+    """Hash only settings that change the fitted Train-normal statistics."""
+
+    evaluation = config["evaluation"]
+    prior = evaluation.get("normal_prior", {})
+    payload = {
+        "training_config_fingerprint": config_fingerprint(config),
+        "evaluation_amp": bool(evaluation.get("amp", False)),
+        "anomaly_map_layer_weights": evaluation.get("anomaly_map_layer_weights"),
+        "anomaly_map_align_corners": bool(
+            evaluation.get("anomaly_map_align_corners", True)
+        ),
+        "normal_prior": {
+            "resolution": prior.get("resolution", "patch"),
+            "category_view_enabled": bool(
+                prior.get("category_view_enabled", True)
+            ),
+            "statistic": prior.get("statistic", "median_mad"),
+            "mad_floor_ratio": float(prior.get("mad_floor_ratio", 0.05)),
+            "eps": float(prior.get("eps", 1e-6)),
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def file_sha256(path: str | Path) -> str:
@@ -144,7 +171,16 @@ class NormalPrior:
                         "normal prior resolution does not match raw patch map: "
                         f"{tuple(median.shape)} != {tuple(current.shape)}"
                     )
-                normalized_excess = (current - median) / (mad + eps)
+                mad_floor = stats.get("mad_floor")
+                if mad_floor is None:
+                    # Backward compatibility is defensive only; current
+                    # fingerprints force legacy artifacts to be rebuilt.
+                    denominator = mad.clamp_min(eps)
+                else:
+                    denominator = mad.clamp_min(
+                        mad_floor.to(device=raw_maps.device, dtype=raw_maps.dtype)
+                    )
+                normalized_excess = (current - median) / denominator
                 gate = torch.sigmoid(
                     (normalized_excess - threshold) / temperature
                 )
@@ -186,6 +222,7 @@ def _prior_metadata(
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": checkpoint_sha256,
         "config_fingerprint": config_fingerprint(config),
+        "normal_prior_fingerprint": _normal_prior_fingerprint(config),
         "categories": sorted(str(category) for category in categories),
         "num_views": int(config["model"].get("multi_view", {}).get("num_views", 5)),
         "resolution": "patch",
@@ -211,6 +248,10 @@ def validate_normal_prior(
     expected_fingerprint = config_fingerprint(config)
     if metadata.get("config_fingerprint") != expected_fingerprint:
         raise ValueError("normal prior/config fingerprint mismatch")
+    if metadata.get("normal_prior_fingerprint") != _normal_prior_fingerprint(
+        config
+    ):
+        raise ValueError("normal prior/evaluation fingerprint mismatch")
     expected_checkpoint_sha = file_sha256(checkpoint_path)
     if metadata.get("checkpoint_sha256") != expected_checkpoint_sha:
         raise ValueError("normal prior/checkpoint fingerprint mismatch")
@@ -253,13 +294,25 @@ def _loader(dataset, config: dict[str, Any]) -> DataLoader:
 
 def _statistics(
     values: list[torch.Tensor],
+    *,
+    mad_floor_ratio: float,
+    eps: float,
 ) -> tuple[dict[str, torch.Tensor], int]:
     if not values:
         raise ValueError("cannot fit prior statistics without samples")
     stacked = torch.stack(values, dim=0).float()
     median = stacked.median(dim=0).values
     mad = (stacked - median).abs().median(dim=0).values
-    return {"median": median, "mad": mad}, int(stacked.shape[0])
+    positive = mad[mad > eps]
+    robust_scale = positive.median() if positive.numel() else mad.new_tensor(eps)
+    mad_floor = torch.maximum(
+        mad.new_tensor(eps), robust_scale * float(mad_floor_ratio)
+    )
+    return {
+        "median": median,
+        "mad": mad,
+        "mad_floor": mad_floor,
+    }, int(stacked.shape[0])
 
 
 @torch.inference_mode()
@@ -411,10 +464,16 @@ def fit_normal_prior(
     category_view: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
     view_global: dict[str, dict[str, torch.Tensor]] = {}
     entries: list[dict[str, Any]] = []
+    mad_floor_ratio = float(prior_config.get("mad_floor_ratio", 0.05))
+    eps = float(prior_config.get("eps", 1e-6))
     for category in sorted(category_values):
         category_view[category] = {}
         for view_id in sorted(category_values[category]):
-            stats, sample_count = _statistics(category_values[category][view_id])
+            stats, sample_count = _statistics(
+                category_values[category][view_id],
+                mad_floor_ratio=mad_floor_ratio,
+                eps=eps,
+            )
             category_view[category][str(view_id)] = stats
             entries.append(
                 {
@@ -427,7 +486,11 @@ def fit_normal_prior(
                 }
             )
     for view_id in sorted(global_values):
-        stats, sample_count = _statistics(global_values[view_id])
+        stats, sample_count = _statistics(
+            global_values[view_id],
+            mad_floor_ratio=mad_floor_ratio,
+            eps=eps,
+        )
         view_global[str(view_id)] = stats
         entries.append(
             {

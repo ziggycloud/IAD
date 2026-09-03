@@ -89,6 +89,22 @@ def _validate(config: dict[str, Any]) -> None:
         raise ValueError("DINOv2/14 要求 crop_size 能被 14 整除")
 
     model = config["model"]
+    generalized = model.get("generalized", {})
+    if generalized:
+        references = int(generalized.get("num_references", 256))
+        reference_top_k = int(generalized.get("reference_top_k", 16))
+        router_top_k = int(generalized.get("router_top_k", 3))
+        if references < 2:
+            raise ValueError("model.generalized.num_references must be >= 2")
+        if not 1 <= reference_top_k <= references:
+            raise ValueError(
+                "model.generalized.reference_top_k must be in [1, num_references]"
+            )
+        if not 1 <= router_top_k <= 3:
+            raise ValueError("model.generalized.router_top_k must be in [1, 3]")
+        for key in ("reference_temperature", "router_temperature"):
+            if float(generalized.get(key, 1.0)) <= 0:
+                raise ValueError(f"model.generalized.{key} must be positive")
     multi_view = model.get("multi_view", {})
     if not isinstance(multi_view, dict):
         raise ValueError("model.multi_view must be a mapping")
@@ -240,6 +256,18 @@ def _validate(config: dict[str, Any]) -> None:
         raise ValueError("image_top_ratio 必须位于 (0, 1]")
     if int(evaluation["metric_bins"]) < 5:
         raise ValueError("metric_bins 不能小于 5")
+    evaluation_aggregation = evaluation.get(
+        "object_score_aggregation", "legacy_concat_topk"
+    )
+    if evaluation_aggregation not in {"legacy_concat_topk", "max", "softmax"}:
+        raise ValueError(
+            "evaluation.object_score_aggregation must be "
+            "legacy_concat_topk, max, or softmax"
+        )
+    if float(evaluation.get("object_score_softmax_temperature", 0.25)) <= 0:
+        raise ValueError(
+            "evaluation.object_score_softmax_temperature must be positive"
+        )
     gaussian_kernel_size = int(evaluation["gaussian_kernel_size"])
     if gaussian_kernel_size <= 0 or gaussian_kernel_size % 2 == 0:
         raise ValueError("evaluation.gaussian_kernel_size must be positive and odd")
@@ -316,6 +344,10 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError("evaluation.normal_prior.temperature must be positive")
         if float(normal_prior.get("eps", 1e-6)) <= 0:
             raise ValueError("evaluation.normal_prior.eps must be positive")
+        if float(normal_prior.get("mad_floor_ratio", 0.05)) < 0:
+            raise ValueError(
+                "evaluation.normal_prior.mad_floor_ratio must be non-negative"
+            )
         blend = float(normal_prior.get("blend", 0.8))
         if not 0.0 <= blend <= 1.0:
             raise ValueError("evaluation.normal_prior.blend must be in [0, 1]")
