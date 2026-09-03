@@ -296,10 +296,13 @@ def main() -> int:
             return 0
 
         if not args.skip_train:
-            _guard_against_active_training(
-                output_dir, args.active_timeout_seconds
-            )
             if is_primary:
+                # Only rank zero owns shared run-state checks and writes. Having
+                # every torchrun worker check the same file allowed a late rank
+                # to mistake rank zero's startup for a duplicate training job.
+                _guard_against_active_training(
+                    output_dir, args.active_timeout_seconds
+                )
                 _write_state(
                     output_dir,
                     status="training",

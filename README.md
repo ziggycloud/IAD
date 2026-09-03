@@ -253,7 +253,8 @@ python run_competition_pipeline.py --test-b --skip-train
 一个 `[5,3,448,448]` 网络样本：共享 DINO 编码器后由 Set Transformer 建模跨视角
 上下文，但五张异常图和 mask 始终独立。分类分数聚合由
 `submission.object_score_aggregation` 控制；`legacy_concat_topk` 可恢复旧基线，默认
-`visibility_aware` 同时保留 max 分量，避免单相机可见缺陷被软共识抹掉。
+`max` 可避免未经异常可靠度监督的 visibility 权重压低单相机可见缺陷；
+`visibility_aware` 保留为显式消融选项。
 
 Test_B 解压到 `data/competition/Test_B`。`--test-b` 会独立扫描其全部类别，不要求
 类别数、类别名称或每类样本数与 Train/Test_A 相同；Train 中不存在的类别使用

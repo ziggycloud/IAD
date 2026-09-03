@@ -23,6 +23,7 @@ import torch.nn.functional as F
 
 DEFAULT_AUXILIARY_WEIGHTS: dict[str, float] = {
     "reference_balance": 1.0,
+    "reference_assignment_entropy": 0.01,
     "router_balance": 1.0,
     "router_entropy_penalty": 0.1,
     "expert_diversity": 0.1,
@@ -93,6 +94,7 @@ class MultiViewContextOutput:
     token_dispersion: torch.Tensor
     visibility_weights: torch.Tensor
     attention_weights: torch.Tensor
+    attention_entropy_penalty: torch.Tensor
 
 
 class SetAttentionBlock(nn.Module):
@@ -304,8 +306,29 @@ class MultiViewContextEncoder(nn.Module):
         attention_weights = contexts.new_zeros(
             (batch_size, 1, view_count, view_count)
         )
+        attention_entropy_terms: list[torch.Tensor] = []
         for block in self.blocks:
             contexts, attention_weights = block(contexts, valid_view_mask)
+            attention = attention_weights.float().clamp_min(0.0)
+            key_mask = valid_view_mask[:, None, None, :]
+            attention = attention * key_mask
+            attention = attention / attention.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-8)
+            entropy = -(
+                attention.clamp_min(1e-8)
+                * attention.clamp_min(1e-8).log()
+            ).sum(dim=-1)
+            maximum = valid_view_mask.sum(dim=1).clamp_min(1).float().log()
+            valid_queries = valid_view_mask[:, None, :].expand_as(entropy)
+            attention_entropy_terms.append(
+                (
+                    entropy
+                    / maximum[:, None, None].clamp_min(1e-8)
+                    * valid_queries
+                ).sum()
+                / valid_queries.sum().clamp_min(1)
+            )
         object_context, cross_view, visibility = self.fusion(
             robust,
             contexts,
@@ -319,6 +342,9 @@ class MultiViewContextEncoder(nn.Module):
             token_dispersion=dispersion,
             visibility_weights=visibility,
             attention_weights=attention_weights,
+            attention_entropy_penalty=torch.stack(
+                attention_entropy_terms
+            ).mean(),
         )
 
     @staticmethod
@@ -348,10 +374,13 @@ class MultiViewContextEncoder(nn.Module):
         )
         output = self._encode_once(patch_tokens, view_ids, valid_view_mask)
 
-        object_context = output.object_context.float()
+        # Use all valid cross-view representations rather than only the object
+        # batch dimension. The old object_context.var(dim=0) had exactly zero
+        # gradient whenever the per-device micro batch was one.
+        variance_samples = output.cross_view_context[valid_view_mask].float()
         context_variance = F.relu(
             self.variance_target
-            - torch.sqrt(object_context.var(dim=0, unbiased=False) + 1e-4)
+            - torch.sqrt(variance_samples.var(dim=0, unbiased=False) + 1e-4)
         ).mean()
         valid_float = valid_view_mask.float()
         observed = valid_float.sum(dim=0)
@@ -362,21 +391,9 @@ class MultiViewContextEncoder(nn.Module):
             (actual_usage - target_usage).square().mean() * self.num_views
         )
 
-        attention = output.attention_weights.float().clamp_min(0.0)
-        key_mask = valid_view_mask[:, None, None, :]
-        attention = attention * key_mask
-        attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        entropy = -(attention.clamp_min(1e-8) * attention.clamp_min(1e-8).log())
-        entropy = entropy.sum(dim=-1)
-        maximum = valid_view_mask.sum(dim=1).clamp_min(1).float().log()
-        entropy_gap = (maximum[:, None, None] - entropy).clamp_min(0.0)
-        valid_queries = valid_view_mask[:, None, :].expand_as(entropy)
-        attention_entropy = (
-            (entropy_gap * valid_queries).sum()
-            / valid_queries.sum().clamp_min(1)
-        )
+        attention_entropy = output.attention_entropy_penalty
 
-        context_consistency = object_context.sum() * 0.0
+        context_consistency = output.object_context.float().sum() * 0.0
         if self.training and self.view_dropout_probability > 0.0:
             dropped_mask = self._drop_views(
                 valid_view_mask,
@@ -540,7 +557,12 @@ class CategoryFreeRouter(nn.Module):
         # sparse router could otherwise starve one expert on its first update.
         output = self.network[-1]
         assert isinstance(output, nn.Linear)
-        nn.init.zeros_(output.weight)
+        if self.top_k < self.num_experts:
+            # A zero-initialized sparse router deterministically selects the
+            # same experts on tied logits and can permanently starve one path.
+            nn.init.trunc_normal_(output.weight, std=0.01, a=-0.03, b=0.03)
+        else:
+            nn.init.zeros_(output.weight)
         nn.init.zeros_(output.bias)
 
     def forward(
@@ -815,9 +837,9 @@ class CompositionalNormalityAdapter(nn.Module):
             routing.float().clamp_min(1e-8)
             * routing.float().clamp_min(1e-8).log()
         ).sum(dim=-1).mean()
-        router_entropy_penalty = (
-            math.log(routing.shape[1]) - entropy
-        ).clamp_min(0.0)
+        # Penalize uncertain per-sample routing. Global router_balance separately
+        # prevents all samples from collapsing onto the same expert.
+        router_entropy_penalty = entropy / math.log(routing.shape[1])
 
         flattened = expert_outputs.float().flatten(start_dim=2)
         diversity_terms = []

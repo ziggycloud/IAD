@@ -170,7 +170,7 @@ model:
     view_embedding: true
     view_dropout_probability: 0.2
     visibility_temperature: 1.0
-    cross_view_dropout: 0.1
+    cross_view_dropout: 0.0
     missing_view_policy: error
 
 training:

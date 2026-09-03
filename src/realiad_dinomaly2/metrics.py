@@ -288,9 +288,21 @@ class SpoolingPixelMetricAccumulator:
 class ObjectScoreAccumulator:
     """Compute top-ratio score across all five views without retaining a class."""
 
-    def __init__(self, top_ratio: float, expected_views: int = 5) -> None:
+    def __init__(
+        self,
+        top_ratio: float,
+        expected_views: int = 5,
+        mode: str = "legacy_concat_topk",
+        softmax_temperature: float = 0.25,
+    ) -> None:
+        if mode not in {"legacy_concat_topk", "max", "softmax"}:
+            raise ValueError("unsupported object score aggregation mode")
+        if softmax_temperature <= 0:
+            raise ValueError("softmax_temperature must be positive")
         self.top_ratio = top_ratio
         self.expected_views = expected_views
+        self.mode = mode
+        self.softmax_temperature = softmax_temperature
         self.pending: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.pending_labels: dict[str, list[int]] = defaultdict(list)
         self.labels: list[int] = []
@@ -313,14 +325,29 @@ class ObjectScoreAccumulator:
     def _finish(self, object_key: str) -> None:
         maps = self.pending.pop(object_key)
         labels = self.pending_labels.pop(object_key)
-        flattened = torch.cat(maps)
-        count = max(1, int(flattened.numel() * self.top_ratio))
-        score = torch.topk(
-            flattened,
-            k=count,
-            largest=True,
-            sorted=False,
-        ).values.mean()
+        if self.mode == "legacy_concat_topk":
+            flattened = torch.cat(maps)
+            count = max(1, int(flattened.numel() * self.top_ratio))
+            score = torch.topk(
+                flattened, k=count, largest=True, sorted=False
+            ).values.mean()
+        else:
+            per_view = []
+            for anomaly_map in maps:
+                count = max(1, int(anomaly_map.numel() * self.top_ratio))
+                per_view.append(
+                    torch.topk(
+                        anomaly_map, k=count, largest=True, sorted=False
+                    ).values.mean()
+                )
+            per_view_scores = torch.stack(per_view)
+            if self.mode == "max":
+                score = per_view_scores.max()
+            else:
+                weights = torch.softmax(
+                    per_view_scores / self.softmax_temperature, dim=0
+                )
+                score = (weights * per_view_scores).sum()
         self.labels.append(max(labels))
         self.scores.append(float(score.cpu()))
         self.view_counts.append(len(maps))

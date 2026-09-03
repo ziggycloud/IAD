@@ -1,6 +1,6 @@
 experiment:
-  name: multiview_generalized_dinomaly_seen50_unseen50_vitl448_v3
-  output_dir: outputs/multiview_generalized_dinomaly_seen50_unseen50_vitl448_v3
+  name: multiview_generalized_dinomaly_seen50_unseen50_vitl448_20260903
+  output_dir: outputs/multiview_generalized_dinomaly_seen50_unseen50_vitl448_20260903
   seed: 20260803
 
 protocol:
@@ -40,14 +40,14 @@ model:
     num_references: 512
     reference_top_k: 32
     reference_temperature: 0.1
-    # Dense routing is intentional: all local/component/global experts receive
-    # gradients from the first step. Set 2 only for a sparse-routing ablation.
-    router_top_k: 3
+    # Route each object/view through two of the three spatial-scale experts.
+    router_top_k: 2
     router_temperature: 1.0
     router_trim_ratio: 0.1
     expert_dropout: 0.1
     auxiliary_weights:
       reference_balance: 1.0
+      reference_assignment_entropy: 0.01
       router_balance: 1.0
       router_entropy_penalty: 0.05
       expert_diversity: 0.05
@@ -60,7 +60,7 @@ model:
     view_embedding: true
     view_dropout_probability: 0.2
     visibility_temperature: 1.0
-    cross_view_dropout: 0.1
+    cross_view_dropout: 0.0
     missing_view_policy: error
     variance_target: 1.0
 
@@ -97,9 +97,9 @@ training:
     context_variance: 0.001
     visibility_balance: 0.001
     attention_entropy: 0.001
-  gradient_clip_norm: 0.1
+  gradient_clip_norm: 0.5
   gradient_guard:
-    skip_step_norm: 1.0
+    skip_step_norm: 1000.0
     max_consecutive_skips: 3
     fail_on_nonfinite: true
   log_every: 20
@@ -114,6 +114,8 @@ evaluation:
   resize_mask: 256
   image_top_ratio: 0.01
   object_top_ratio: 0.01
+  object_score_aggregation: max
+  object_score_softmax_temperature: 0.25
   gaussian_kernel_size: 5
   gaussian_sigma: 2.0
   anomaly_map_layer_weights: [0.35, 0.65]
@@ -130,6 +132,7 @@ evaluation:
     temperature: 0.5
     blend: 0.8
     eps: 1.0e-6
+    mad_floor_ratio: 0.05
     batch_size: 2
     num_workers: 4
 

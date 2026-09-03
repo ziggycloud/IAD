@@ -222,6 +222,12 @@ def evaluate_category(
     object_accumulator = ObjectScoreAccumulator(
         top_ratio=float(evaluation["object_top_ratio"]),
         expected_views=5,
+        mode=str(
+            evaluation.get("object_score_aggregation", "legacy_concat_topk")
+        ),
+        softmax_temperature=float(
+            evaluation.get("object_score_softmax_temperature", 0.25)
+        ),
     )
     gaussian = GaussianFilter(
         kernel_size=int(evaluation["gaussian_kernel_size"]),
@@ -454,8 +460,8 @@ def _report_text(
         )
     else:
         suggestions.append(
-            "当前网络独立处理五个视角，建议验证显式跨视角一致性或可见性加权，"
-            "避免无缺陷可见视角稀释异常证据。"
+            "当前特征级跨视角融合没有带来稳定的对象级收益；应检查融合权重"
+            "是否削弱了仅在单一视角可见的异常证据。"
         )
 
     metric_order = (

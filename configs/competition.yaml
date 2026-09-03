@@ -1,7 +1,7 @@
 experiment:
-  name: multiview_generalized_dinomaly_competition_vitl448_cosine_v4
+  name: multiview_generalized_dinomaly_competition_vitl448_20260903
   # Keep this run separate: scheduler/optimizer semantics are checkpoint-bound.
-  output_dir: outputs/multiview_generalized_dinomaly_competition_vitl448_cosine_v4
+  output_dir: outputs/multiview_generalized_dinomaly_competition_vitl448_20260903
   seed: 20260830
 
 dataset:
@@ -38,12 +38,13 @@ model:
     num_references: 512
     reference_top_k: 32
     reference_temperature: 0.1
-    router_top_k: 3
+    router_top_k: 2
     router_temperature: 1.0
     router_trim_ratio: 0.1
     expert_dropout: 0.1
     auxiliary_weights:
       reference_balance: 1.0
+      reference_assignment_entropy: 0.01
       router_balance: 1.0
       router_entropy_penalty: 0.05
       expert_diversity: 0.05
@@ -56,7 +57,8 @@ model:
     view_embedding: true
     view_dropout_probability: 0.2
     visibility_temperature: 1.0
-    cross_view_dropout: 0.1
+    # Keep the two consistency passes comparable; expert dropout remains active.
+    cross_view_dropout: 0.0
     # Official competition folders must contain exactly 0.png..4.png.
     missing_view_policy: error
     variance_target: 1.0
@@ -120,6 +122,8 @@ evaluation:
   resize_mask: 448
   image_top_ratio: 0.01
   object_top_ratio: 0.01
+  object_score_aggregation: max
+  object_score_softmax_temperature: 0.25
   gaussian_kernel_size: 5
   # Sigma 4 spreads a narrow edge response into a wide false-positive halo.
   gaussian_sigma: 2.0
@@ -139,6 +143,7 @@ evaluation:
     temperature: 0.5
     blend: 0.8
     eps: 1.0e-6
+    mad_floor_ratio: 0.05
     batch_size: 2
     num_workers: 4
 
@@ -153,9 +158,9 @@ submission:
   lower_quantile: 0.001
   upper_quantile: 0.99999
   # Baseline option: legacy_concat_topk. Other options: max, softmax.
-  object_score_aggregation: visibility_aware
+  object_score_aggregation: max
   object_score_softmax_temperature: 0.25
-  # Keep a max component so a defect visible in one camera is not erased.
+  # Retained for compatibility when visibility_aware is selected explicitly.
   visibility_max_blend: 0.5
 
 runtime:
