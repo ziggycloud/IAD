@@ -66,7 +66,8 @@ model:
 training:
   # Object batch 12 equals 60 views. Do not set this to the old view batch 64,
   # which would silently become 320 images per optimizer step.
-  total_steps: 6000
+  # 1000 objects with effective batch 12: 5000 steps is about 60 epochs.
+  total_steps: 5000
   effective_batch_size: 12
   micro_batch_size: auto
   # Per GPU, measured by a real five-view forward/backward probe.
