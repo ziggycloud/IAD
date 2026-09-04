@@ -68,6 +68,9 @@ class FrozenClipBrokenSegmenter(nn.Module):
             model_name,
             pretrained=pretrained,
             device=device,
+            force_quick_gelu=bool(
+                config.get("force_quick_gelu", pretrained == "openai")
+            ),
             force_image_size=image_size,
             cache_dir=str(cache_dir),
         )
@@ -122,6 +125,10 @@ class FrozenClipBrokenSegmenter(nn.Module):
             self._encode_prompts(broken_prompts),
             persistent=False,
         )
+        # ``device=`` above moves the OpenCLIP child module only. These
+        # normalization buffers are created afterwards and would otherwise
+        # remain on CPU, causing the first CUDA input normalization to fail.
+        self.to(device)
 
     @torch.no_grad()
     def _encode_prompts(
