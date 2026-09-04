@@ -128,10 +128,6 @@ def _validate(config: dict[str, Any]) -> None:
         for key in ("model_name", "pretrained", "weights_dir"):
             if not str(unseen_clip.get(key, "")).strip():
                 raise ValueError(f"evaluation.unseen_clip.{key} is required")
-        if not isinstance(unseen_clip.get("force_quick_gelu", True), bool):
-            raise ValueError(
-                "evaluation.unseen_clip.force_quick_gelu must be boolean"
-            )
         if int(unseen_clip.get("image_size", crop_size)) <= 0:
             raise ValueError("evaluation.unseen_clip.image_size must be positive")
         if int(unseen_clip.get("intermediate_layers", 4)) <= 0:

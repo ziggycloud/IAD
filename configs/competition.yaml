@@ -93,8 +93,6 @@ evaluation:
     enabled: true
     model_name: ViT-B-16
     pretrained: openai
-    # OpenAI ViT-B/16 was pretrained with QuickGELU.
-    force_quick_gelu: true
     weights_dir: third_party/OpenCLIP/weights
     image_size: 448
     intermediate_layers: 4
