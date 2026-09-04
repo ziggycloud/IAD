@@ -73,6 +73,7 @@ def _submission_signature(
         "checkpoint_mtime_ns": checkpoint_stat.st_mtime_ns,
         "test_root": str(manifest.root),
         "test_manifest_sha256": _manifest_digest(manifest),
+        "evaluation": config["evaluation"],
         "submission": config["submission"],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
@@ -367,6 +368,23 @@ def generate_competition_submission(
     load_trainable_state_dict(bundle, checkpoint_payload["model"])
     bundle.model.eval()
 
+    clip_config = config["evaluation"].get("unseen_clip", {})
+    train_manifest = scan_competition_split(
+        Path(dataset_config["train_dir"]),
+        requested=dataset_config["categories"],
+        limit=dataset_config.get("category_limit"),
+    )
+    seen_categories = set(train_manifest.categories)
+    unseen_categories = set(manifest.categories) - seen_categories
+    clip_segmenter = None
+    unseen_clip_enabled = bool(clip_config.get("enabled", False))
+    if unseen_clip_enabled and unseen_categories:
+        logger.info(
+            "Frozen CLIP will be loaded lazily for %d unseen categories: %s",
+            len(unseen_categories),
+            sorted(unseen_categories),
+        )
+
     submission = config["submission"]
     mask_size = int(submission.get("mask_size", 448))
     lower_quantile = float(submission.get("lower_quantile", 0.001))
@@ -400,12 +418,21 @@ def generate_competition_submission(
             all_rows.extend(rows)
             continue
 
+        category_uses_clip = (
+            unseen_clip_enabled and category in unseen_categories
+        )
+        if category_uses_clip and clip_segmenter is None:
+            from .clip_semantic import FrozenClipBrokenSegmenter
+
+            clip_segmenter = FrozenClipBrokenSegmenter(clip_config, device)
+            clip_segmenter.eval()
         logger.info(
-            "[%d/%d] infer category %s (%d views)",
+            "[%d/%d] infer category %s (%d views, unseen_clip=%s)",
             index,
             len(manifest.categories),
             category,
             len(category_views),
+            category_uses_clip,
         )
         dataset = CompetitionFolderDataset(
             category_views,
@@ -427,6 +454,31 @@ def generate_competition_submission(
                 )
             current = gaussian(current.to(dtype=torch.float32))
             current = current.clamp_(min=0.0)
+            if category_uses_clip:
+                from .clip_semantic import fuse_unseen_anomaly_map
+
+                assert clip_segmenter is not None
+                del encoder_features, decoder_features
+                broken_probability = clip_segmenter(images)
+                current = fuse_unseen_anomaly_map(
+                    current,
+                    broken_probability,
+                    semantic_weight=float(
+                        clip_config.get("semantic_weight", 0.25)
+                    ),
+                    broken_threshold=float(
+                        clip_config.get("broken_threshold", 0.5)
+                    ),
+                    center_quantile=float(
+                        clip_config.get("center_quantile", 0.5)
+                    ),
+                    upper_quantile=float(
+                        clip_config.get("upper_quantile", 0.995)
+                    ),
+                    global_retention=float(
+                        clip_config.get("global_retention", 0.25)
+                    ),
+                )
             maps.extend(
                 array
                 for array in current[:, 0].cpu().numpy().astype(np.float32)
@@ -471,6 +523,7 @@ def generate_competition_submission(
                 "category": category,
                 "completed_at": utc_now(),
                 "views": len(category_views),
+                "unseen_clip": category_uses_clip,
                 "calibration": {
                     "lower": lower,
                     "upper": upper,

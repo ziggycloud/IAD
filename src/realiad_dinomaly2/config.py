@@ -121,6 +121,52 @@ def _validate(config: dict[str, Any]) -> None:
         raise ValueError("image_top_ratio 必须位于 (0, 1]")
     if int(evaluation["metric_bins"]) < 5:
         raise ValueError("metric_bins 不能小于 5")
+    unseen_clip = evaluation.get("unseen_clip", {})
+    if not isinstance(unseen_clip, dict):
+        raise ValueError("evaluation.unseen_clip must be a mapping")
+    if bool(unseen_clip.get("enabled", False)):
+        for key in ("model_name", "pretrained", "weights_dir"):
+            if not str(unseen_clip.get(key, "")).strip():
+                raise ValueError(f"evaluation.unseen_clip.{key} is required")
+        if int(unseen_clip.get("image_size", crop_size)) <= 0:
+            raise ValueError("evaluation.unseen_clip.image_size must be positive")
+        if int(unseen_clip.get("intermediate_layers", 4)) <= 0:
+            raise ValueError(
+                "evaluation.unseen_clip.intermediate_layers must be positive"
+            )
+        if float(unseen_clip.get("temperature", 0.07)) <= 0:
+            raise ValueError(
+                "evaluation.unseen_clip.temperature must be positive"
+            )
+        for key, default in (
+            ("semantic_weight", 0.25),
+            ("broken_threshold", 0.5),
+            ("center_quantile", 0.5),
+            ("upper_quantile", 0.995),
+            ("global_retention", 0.25),
+        ):
+            value = float(unseen_clip.get(key, default))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(
+                    f"evaluation.unseen_clip.{key} must be in [0, 1]"
+                )
+        if float(unseen_clip.get("center_quantile", 0.5)) >= float(
+            unseen_clip.get("upper_quantile", 0.995)
+        ):
+            raise ValueError(
+                "evaluation.unseen_clip.center_quantile must be below "
+                "upper_quantile"
+            )
+        for key in ("normal_prompts", "broken_prompts"):
+            prompts = unseen_clip.get(key)
+            if (
+                not isinstance(prompts, list)
+                or not prompts
+                or any(not str(prompt).strip() for prompt in prompts)
+            ):
+                raise ValueError(
+                    f"evaluation.unseen_clip.{key} must be a non-empty list"
+                )
     submission = config.get("submission")
     if dataset_type == "competition_folders":
         if not isinstance(submission, dict):

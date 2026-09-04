@@ -87,6 +87,33 @@ evaluation:
   gaussian_sigma: 2.0
   metric_bins: 1000
   resume: true
+  # This branch remains checkpoint-compatible with the baseline. Frozen CLIP
+  # is loaded lazily and used only when a test category is absent from Train.
+  unseen_clip:
+    enabled: true
+    model_name: ViT-B-16
+    pretrained: openai
+    weights_dir: third_party/OpenCLIP/weights
+    image_size: 448
+    intermediate_layers: 4
+    temperature: 0.07
+    # Keep reconstruction dominant because vanilla CLIP localization is coarse.
+    semantic_weight: 0.25
+    broken_threshold: 0.5
+    # Remove broad category novelty while retaining part of the raw response.
+    center_quantile: 0.5
+    upper_quantile: 0.995
+    global_retention: 0.25
+    normal_prompts:
+      - a close-up photo of an intact industrial object
+      - a normal undamaged component
+      - a flawless object surface
+      - a complete object without defects
+    broken_prompts:
+      - a close-up photo of a broken industrial object
+      - a damaged component with a crack or scratch
+      - a defective object with a dent or hole
+      - an object with a missing or deformed part
 
 submission:
   mask_size: 448

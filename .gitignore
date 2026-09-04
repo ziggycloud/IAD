@@ -15,6 +15,7 @@ outputs/**
 tmp/
 
 third_party/Dinomaly2/backbones/weights/
+third_party/OpenCLIP/weights/
 
 *.log
 *.pt

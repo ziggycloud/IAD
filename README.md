@@ -248,6 +248,13 @@ python run_competition_pipeline.py --skip-inference
 5 个视角合并后取异常热图 top 1% 均值，再用严格单调函数映射到 `[0,1]`；
 mask 按类别做无标签、严格单调的 8-bit 分位数标定，以充分利用 PNG 灰度范围。
 
+`0806-competition-clip` 分支会比较 Train 与测试目录中的类别名称。已见类别继续走
+原始 Dinomaly 路径；仅未见类别会懒加载冻结的 OpenCLIP ViT-B/16，通过通用的
+normal/broken 文本提示生成 patch 级破损语义图，并与去除全局类别偏移后的重建图
+保守融合。CLIP 不参与训练，也不写入 Dinomaly checkpoint，因此已有该分支基线权重
+可以继续使用。首次推理未见类别时会把 CLIP 权重下载到
+`third_party/OpenCLIP/weights`。
+
 完成后读取：
 
 ```text
