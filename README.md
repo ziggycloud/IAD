@@ -218,7 +218,7 @@ python run_unseen_pipeline.py
 完整参数、公式和恢复方式见 [UNSEEN_PROTOCOL.md](UNSEEN_PROTOCOL.md)，任务交接状态见
 [UNSEEN_RUN_LOG.md](UNSEEN_RUN_LOG.md)。
 
-## 比赛 Train / Test_A 提交流水线
+## 比赛 Train / Test_A / Test_B 提交流水线
 
 比赛数据直接按 `category/Sxxxx/0.png..4.png` 读取，不需要官方 JSON，也不读取
 任何标签。默认配置复用上面的 category-generalized Dinomaly、DINOv2-register
@@ -234,12 +234,17 @@ python run_competition_pipeline.py --validate-only
 # 已有 final_model.pt 时跳过训练，重新/继续按类别推理和打包
 python run_competition_pipeline.py --skip-train
 
+# 使用同一训练配置推理 Test_B；允许类别和每类样本数不同于 Train
+python run_competition_pipeline.py --test-b --skip-train
+
 # 只训练，暂不推理
 python run_competition_pipeline.py --skip-inference
 ```
 
 默认数据路径和配置分别为 `data/competition/Train`、
-`data/competition/Test_A` 与 `configs/competition.yaml`。分类分数把同一零件的
+`data/competition/Test_A` 与 `configs/competition.yaml`。传入 `--test-b` 后测试
+路径切换到 `data/competition/Test_B`，并自动取消 Test_A 专用的类别及样本数约束。
+分类分数把同一零件的
 5 个视角合并后取异常热图 top 1% 均值，再用严格单调函数映射到 `[0,1]`；
 mask 按类别做无标签、严格单调的 8-bit 分位数标定，以充分利用 PNG 灰度范围。
 

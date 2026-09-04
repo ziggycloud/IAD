@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Train category-generalized Dinomaly on competition Train, infer "
-            "Test_A, and build a validated submission.zip."
+            "a competition test split, and build a validated submission.zip."
         )
     )
     parser.add_argument(
@@ -66,9 +66,17 @@ def parse_args() -> argparse.Namespace:
         help="Repeatable dotted YAML override.",
     )
     parser.add_argument(
+        "--test-b",
+        action="store_true",
+        help=(
+            "Infer data/competition/Test_B, allowing categories and sample "
+            "counts that differ from Train. Explicit --set values take precedence."
+        ),
+    )
+    parser.add_argument(
         "--validate-only",
         action="store_true",
-        help="Audit Train/Test_A layout without loading the model.",
+        help="Audit Train/test layout without loading the model.",
     )
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--skip-inference", action="store_true")
@@ -146,44 +154,62 @@ def _write_state(
 
 def _audit_data(config: dict[str, Any]) -> dict[str, Any]:
     dataset = config["dataset"]
+    train_categories = dataset["categories"]
+    train_category_limit = dataset.get("category_limit")
+    test_categories = dataset.get("test_categories", train_categories)
+    test_category_limit = dataset.get(
+        "test_category_limit", train_category_limit
+    )
     train_manifest = scan_competition_split(
         Path(dataset["train_dir"]),
-        requested=dataset["categories"],
-        limit=dataset.get("category_limit"),
+        requested=train_categories,
+        limit=train_category_limit,
     )
     test_manifest = scan_competition_split(
         Path(dataset["test_dir"]),
-        requested=dataset["categories"],
-        limit=dataset.get("category_limit"),
+        requested=test_categories,
+        limit=test_category_limit,
     )
-    if train_manifest.categories != test_manifest.categories:
-        only_train = sorted(
-            set(train_manifest.categories) - set(test_manifest.categories)
-        )
-        only_test = sorted(
-            set(test_manifest.categories) - set(train_manifest.categories)
-        )
+    same_categories = train_manifest.categories == test_manifest.categories
+    only_train = sorted(
+        set(train_manifest.categories) - set(test_manifest.categories)
+    )
+    only_test = sorted(
+        set(test_manifest.categories) - set(train_manifest.categories)
+    )
+    if bool(dataset.get("require_same_categories", True)) and not same_categories:
         raise ValueError(
-            "Train/Test_A categories differ: "
+            "Train/test categories differ: "
             f"only_train={only_train}, only_test={only_test}"
         )
-    category_limit = dataset.get("category_limit")
-    expected_categories = int(
-        category_limit
-        if category_limit is not None
+    expected_train_categories = (
+        train_category_limit
+        if train_category_limit is not None
         else dataset.get("expected_categories", 50)
     )
-    if len(train_manifest.categories) != expected_categories:
+    if (
+        expected_train_categories is not None
+        and len(train_manifest.categories) != int(expected_train_categories)
+    ):
         raise ValueError(
-            f"Expected {expected_categories} categories, found "
+            f"Expected {expected_train_categories} Train categories, found "
             f"{len(train_manifest.categories)}"
         )
-    expected_train = int(
-        dataset.get("expected_train_samples_per_category", 20)
+    expected_test_categories = dataset.get(
+        "expected_test_categories", expected_train_categories
     )
-    expected_test = int(
-        dataset.get("expected_test_samples_per_category", 15)
-    )
+    if (
+        expected_test_categories is not None
+        and len(test_manifest.categories) != int(expected_test_categories)
+    ):
+        raise ValueError(
+            f"Expected {expected_test_categories} test categories, found "
+            f"{len(test_manifest.categories)}"
+        )
+    expected_train = dataset.get("expected_train_samples_per_category", 20)
+    expected_test = dataset.get("expected_test_samples_per_category", 15)
+    expected_train = None if expected_train is None else int(expected_train)
+    expected_test = None if expected_test is None else int(expected_test)
     train_counts = {
         category: len(train_manifest.views_for_category(category)) // 5
         for category in train_manifest.categories
@@ -195,27 +221,30 @@ def _audit_data(config: dict[str, Any]) -> dict[str, Any]:
     bad_train = {
         category: count
         for category, count in train_counts.items()
-        if count != expected_train
+        if expected_train is not None and count != expected_train
     }
     bad_test = {
         category: count
         for category, count in test_counts.items()
-        if count != expected_test
+        if expected_test is not None and count != expected_test
     }
     if bad_train or bad_test:
         raise ValueError(
             "Unexpected samples per category: "
-            f"Train={bad_train}, Test_A={bad_test}"
+            f"Train={bad_train}, test={bad_test}"
         )
     return {
         "status": "valid",
         "audited_at": utc_now(),
         "train": train_manifest.summary(),
         "test": test_manifest.summary(),
-        "same_categories": True,
+        "same_categories": same_categories,
+        "train_only_categories": only_train,
+        "unseen_test_categories": only_test,
         "train_samples_per_category": expected_train,
         "test_samples_per_category": expected_test,
         "category_names": list(train_manifest.categories),
+        "test_category_names": list(test_manifest.categories),
     }
 
 
@@ -223,7 +252,21 @@ def main() -> int:
     args = parse_args()
     if args.skip_train and args.skip_inference and not args.validate_only:
         raise ValueError("--skip-train and --skip-inference leave no work to do")
-    config = materialize_paths(load_config(args.config, args.set))
+    overrides: list[str] = []
+    if args.test_b:
+        overrides.extend(
+            [
+                "dataset.test_dir=data/competition/Test_B",
+                "dataset.test_categories=all",
+                "dataset.test_category_limit=null",
+                "dataset.require_same_categories=false",
+                "dataset.expected_test_categories=null",
+                "dataset.expected_test_samples_per_category=null",
+            ]
+        )
+    # User-provided overrides deliberately take precedence over --test-b.
+    overrides.extend(args.set)
+    config = materialize_paths(load_config(args.config, overrides))
     if config["dataset"].get("type") != "competition_folders":
         raise ValueError(
             "run_competition_pipeline.py requires dataset.type=competition_folders"
@@ -252,10 +295,12 @@ def main() -> int:
             return 0
 
         if not args.skip_train:
-            _guard_against_active_training(
-                output_dir, args.active_timeout_seconds
-            )
             if is_primary:
+                # Rank zero alone owns shared-state checks and writes. A later
+                # torchrun worker must not mistake rank zero for a duplicate job.
+                _guard_against_active_training(
+                    output_dir, args.active_timeout_seconds
+                )
                 _write_state(
                     output_dir,
                     status="training",
@@ -271,7 +316,8 @@ def main() -> int:
                 output_dir,
                 status="trained",
                 next_action=(
-                    "Run with --skip-train to infer Test_A and create the ZIP."
+                    "Run with --skip-train to infer the configured test split "
+                    "and create the ZIP."
                 ),
             )
             return 0

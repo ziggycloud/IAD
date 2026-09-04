@@ -305,8 +305,12 @@ def generate_competition_submission(
     dataset_config = config["dataset"]
     manifest = scan_competition_split(
         Path(dataset_config["test_dir"]),
-        requested=dataset_config["categories"],
-        limit=dataset_config.get("category_limit"),
+        requested=dataset_config.get(
+            "test_categories", dataset_config["categories"]
+        ),
+        limit=dataset_config.get(
+            "test_category_limit", dataset_config.get("category_limit")
+        ),
     )
     signature, signature_inputs = _submission_signature(
         config, checkpoint_path, manifest

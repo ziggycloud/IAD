@@ -1,6 +1,7 @@
 experiment:
-  name: generalized_dinomaly_competition_seen50_vitl448
-  output_dir: outputs/generalized_dinomaly_competition_seen50_vitl448
+  name: generalized_dinomaly_competition_seen50_vitl448_20260904
+  # Training semantics changed; keep new checkpoints separate from the old run.
+  output_dir: outputs/generalized_dinomaly_competition_seen50_vitl448_20260904
   seed: 20260803
 
 dataset:
@@ -9,7 +10,12 @@ dataset:
   test_dir: data/competition/Test_A
   categories: all
   category_limit: null
+  # Test selection is independent so Test_B may contain unseen categories.
+  test_categories: all
+  test_category_limit: null
+  require_same_categories: true
   expected_categories: 50
+  expected_test_categories: 50
   expected_train_samples_per_category: 20
   expected_test_samples_per_category: 15
   image_size: 448
@@ -42,46 +48,49 @@ model:
       expert_diversity: 0.05
 
 training:
-  # 6k x global batch 64 over 5,000 views is about 76.8 passes.
-  total_steps: 6000
+  # 5k x global batch 64 over 5,000 views is about 64 passes. This branch
+  # trains views independently, so retain a view batch near the current
+  # five-view model's 60 views per optimizer step.
+  total_steps: 5000
   effective_batch_size: 64
   micro_batch_size: auto
-  batch_candidates: [16, 8, 4, 2, 1]
+  batch_candidates: [8, 4, 2, 1]
   memory_headroom_mb: 3000
   amp: true
   amp_dtype: bfloat16
-  learning_rate: 0.001
+  learning_rate: 0.0001
   first_bottleneck_lr_scale: 0.2
   weight_decay: 0.0001
   adam_betas: [0.9, 0.999]
-  adam_epsilon: 1.0e-10
-  warmup_steps: 300
+  adam_epsilon: 1.0e-8
+  # Linear warmup followed by one half-cosine decay to 5e-6.
+  warmup_steps: 500
   lr_step_offset: 1
-  final_lr_ratio: 0.1
-  loose_loss_warmup_steps: 800
-  loose_loss_final_discard: 0.9
+  final_lr_ratio: 0.05
+  loose_loss_warmup_steps: 1500
+  loose_loss_final_discard: 0.7
   generalized_regularization_weight: 0.01
-  gradient_clip_norm: 0.1
+  gradient_clip_norm: 0.5
   log_every: 20
-  checkpoint_every: 250
+  checkpoint_every: 500
   auto_resume: true
 
 evaluation:
   # Used by competition inference; no labels or local metrics are required.
   amp: true
-  batch_size: 4
+  batch_size: 2
   num_workers: 4
   resize_mask: 448
   image_top_ratio: 0.01
   object_top_ratio: 0.01
   gaussian_kernel_size: 5
-  gaussian_sigma: 4.0
+  gaussian_sigma: 2.0
   metric_bins: 1000
   resume: true
 
 submission:
   mask_size: 448
-  batch_size: 4
+  batch_size: 2
   num_workers: 4
   object_top_ratio: 0.01
   # Per-category monotonic 8-bit calibration. The extreme upper quantile keeps
