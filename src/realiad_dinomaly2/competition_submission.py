@@ -463,11 +463,17 @@ def generate_competition_submission(
                 current = fuse_unseen_anomaly_map(
                     current,
                     broken_probability,
-                    semantic_weight=float(
-                        clip_config.get("semantic_weight", 0.25)
+                    reconstruction_gain=float(
+                        clip_config.get("reconstruction_gain", 0.5)
+                    ),
+                    semantic_gain=float(
+                        clip_config.get("semantic_gain", 2.0)
+                    ),
+                    semantic_scale_floor=float(
+                        clip_config.get("semantic_scale_floor", 0.05)
                     ),
                     broken_threshold=float(
-                        clip_config.get("broken_threshold", 0.5)
+                        clip_config.get("broken_threshold", 0.35)
                     ),
                     center_quantile=float(
                         clip_config.get("center_quantile", 0.5)

@@ -52,6 +52,9 @@ class FrozenClipBrokenSegmenter(nn.Module):
         self.device = device
         self.temperature = float(config.get("temperature", 0.07))
         self.intermediate_layers = int(config.get("intermediate_layers", 4))
+        self.prompt_aggregation = str(
+            config.get("prompt_aggregation", "max")
+        ).lower()
         model_name = str(config.get("model_name", "ViT-B-16"))
         pretrained = str(config.get("pretrained", "openai"))
         image_size = int(config.get("image_size", 448))
@@ -111,24 +114,37 @@ class FrozenClipBrokenSegmenter(nn.Module):
         )
         self.register_buffer(
             "normal_text",
-            self._encode_prompt_ensemble(normal_prompts),
+            self._encode_prompts(normal_prompts),
             persistent=False,
         )
         self.register_buffer(
             "broken_text",
-            self._encode_prompt_ensemble(broken_prompts),
+            self._encode_prompts(broken_prompts),
             persistent=False,
         )
 
     @torch.no_grad()
-    def _encode_prompt_ensemble(
+    def _encode_prompts(
         self,
         prompts: Sequence[str],
     ) -> torch.Tensor:
         tokens = self.tokenizer(list(prompts)).to(self.device)
         features = self.model.encode_text(tokens).float()
-        features = F.normalize(features, dim=-1, eps=1e-6)
-        return F.normalize(features.mean(dim=0), dim=0, eps=1e-6)
+        return F.normalize(features, dim=-1, eps=1e-6)
+
+    def _aggregate_prompt_similarity(
+        self,
+        patches: torch.Tensor,
+        prompts: torch.Tensor,
+    ) -> torch.Tensor:
+        similarities = torch.einsum("bhwc,pc->bhwp", patches, prompts)
+        if self.prompt_aggregation == "max":
+            return similarities.amax(dim=-1)
+        if self.prompt_aggregation == "mean":
+            return similarities.mean(dim=-1)
+        raise ValueError(
+            "evaluation.unseen_clip.prompt_aggregation must be max or mean"
+        )
 
     def _project_patches(self, feature: torch.Tensor) -> torch.Tensor:
         # OpenCLIP ViTs expose the same projection used by the pooled token.
@@ -138,7 +154,7 @@ class FrozenClipBrokenSegmenter(nn.Module):
             patches = projection(patches)
         elif isinstance(projection, torch.Tensor):
             patches = patches @ projection
-        elif patches.shape[-1] != self.normal_text.numel():
+        elif patches.shape[-1] != self.normal_text.shape[-1]:
             raise RuntimeError(
                 "CLIP patch width does not match text width and visual.proj "
                 "is unavailable"
@@ -182,8 +198,16 @@ class FrozenClipBrokenSegmenter(nn.Module):
             dim=0,
         ).mean(dim=0)
         projected = F.normalize(projected, dim=-1, eps=1e-6)
-        normal = torch.einsum("bhwc,c->bhw", projected, self.normal_text)
-        broken = torch.einsum("bhwc,c->bhw", projected, self.broken_text)
+        # Keep each prompt separate. Max aggregation acts like a union of
+        # defect concepts: a patch matching any known defect description can
+        # strongly activate the broken class instead of being diluted by an
+        # average over unrelated defect types.
+        normal = self._aggregate_prompt_similarity(
+            projected, self.normal_text
+        )
+        broken = self._aggregate_prompt_similarity(
+            projected, self.broken_text
+        )
         logits = torch.stack([normal, broken], dim=1) / self.temperature
         return logits.softmax(dim=1)[:, 1:2]
 
@@ -192,7 +216,9 @@ def fuse_unseen_anomaly_map(
     reconstruction_map: torch.Tensor,
     broken_probability: torch.Tensor,
     *,
-    semantic_weight: float,
+    reconstruction_gain: float,
+    semantic_gain: float,
+    semantic_scale_floor: float,
     broken_threshold: float,
     center_quantile: float,
     upper_quantile: float,
@@ -226,8 +252,11 @@ def fuse_unseen_anomaly_map(
         (broken_probability - broken_threshold)
         / max(1.0 - broken_threshold, eps)
     ).clamp(0.0, 1.0)
-    semantic_scale = (upper - center).clamp_min(eps)
+    # Aggressive mode: semantic evidence is additive rather than a convex
+    # blend, and its scale cannot collapse merely because an unseen-category
+    # reconstruction map is spatially flat.
+    semantic_scale = (upper - center).clamp_min(semantic_scale_floor)
     return (
-        (1.0 - semantic_weight) * adjusted
-        + semantic_weight * semantic * semantic_scale
+        reconstruction_gain * adjusted
+        + semantic_gain * semantic * semantic_scale
     ).clamp_min(0.0)

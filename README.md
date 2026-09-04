@@ -251,7 +251,8 @@ mask 按类别做无标签、严格单调的 8-bit 分位数标定，以充分�
 `0806-competition-clip` 分支会比较 Train 与测试目录中的类别名称。已见类别继续走
 原始 Dinomaly 路径；仅未见类别会懒加载冻结的 OpenCLIP ViT-B/16，通过通用的
 normal/broken 文本提示生成 patch 级破损语义图，并与去除全局类别偏移后的重建图
-保守融合。CLIP 不参与训练，也不写入 Dinomaly checkpoint，因此已有该分支基线权重
+做 CLIP 主导的加法融合。缺陷提示覆盖论文中的表面磨损、污染、结构损伤、材料工艺和
+装配逻辑异常，并按最大相似度聚合。CLIP 不参与训练，也不写入 Dinomaly checkpoint，因此已有该分支基线权重
 可以继续使用。首次推理未见类别时会把 CLIP 权重下载到
 `third_party/OpenCLIP/weights`。
 

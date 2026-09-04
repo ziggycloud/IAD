@@ -138,17 +138,32 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError(
                 "evaluation.unseen_clip.temperature must be positive"
             )
+        if unseen_clip.get("prompt_aggregation", "max") not in {
+            "max",
+            "mean",
+        }:
+            raise ValueError(
+                "evaluation.unseen_clip.prompt_aggregation must be max or mean"
+            )
         for key, default in (
-            ("semantic_weight", 0.25),
-            ("broken_threshold", 0.5),
+            ("broken_threshold", 0.35),
             ("center_quantile", 0.5),
             ("upper_quantile", 0.995),
-            ("global_retention", 0.25),
+            ("global_retention", 0.1),
         ):
             value = float(unseen_clip.get(key, default))
             if not 0.0 <= value <= 1.0:
                 raise ValueError(
                     f"evaluation.unseen_clip.{key} must be in [0, 1]"
+                )
+        for key, default in (
+            ("reconstruction_gain", 0.5),
+            ("semantic_gain", 2.0),
+            ("semantic_scale_floor", 0.05),
+        ):
+            if float(unseen_clip.get(key, default)) < 0:
+                raise ValueError(
+                    f"evaluation.unseen_clip.{key} must be non-negative"
                 )
         if float(unseen_clip.get("center_quantile", 0.5)) >= float(
             unseen_clip.get("upper_quantile", 0.995)
@@ -156,6 +171,10 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError(
                 "evaluation.unseen_clip.center_quantile must be below "
                 "upper_quantile"
+            )
+        if float(unseen_clip.get("broken_threshold", 0.35)) >= 1.0:
+            raise ValueError(
+                "evaluation.unseen_clip.broken_threshold must be below 1"
             )
         for key in ("normal_prompts", "broken_prompts"):
             prompts = unseen_clip.get(key)

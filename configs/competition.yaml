@@ -96,24 +96,66 @@ evaluation:
     weights_dir: third_party/OpenCLIP/weights
     image_size: 448
     intermediate_layers: 4
-    temperature: 0.07
-    # Keep reconstruction dominant because vanilla CLIP localization is coarse.
-    semantic_weight: 0.25
-    broken_threshold: 0.5
-    # Remove broad category novelty while retaining part of the raw response.
+    temperature: 0.04
+    # A match to any defect concept is enough; unrelated prompts cannot dilute it.
+    prompt_aggregation: max
+    # Aggressive additive fusion: CLIP can dominate when broken semantics fire.
+    reconstruction_gain: 0.5
+    semantic_gain: 2.0
+    semantic_scale_floor: 0.05
+    broken_threshold: 0.35
+    # Strongly remove broad unseen-category novelty.
     center_quantile: 0.5
     upper_quantile: 0.995
-    global_retention: 0.25
+    global_retention: 0.1
     normal_prompts:
       - a close-up photo of an intact industrial object
       - a normal undamaged component
       - a flawless object surface
       - a complete object without defects
+      - a correctly assembled industrial component
+      - an object with all parts present
+      - a clean object without contamination
+      - a component with correct wiring and connections
+      - an object with a smooth uniform coating
+      - an object with clear complete printed characters
+      - a component with open unobstructed holes
+      - an object with the correct shape and alignment
     broken_prompts:
       - a close-up photo of a broken industrial object
-      - a damaged component with a crack or scratch
-      - a defective object with a dent or hole
-      - an object with a missing or deformed part
+      - an industrial object with abrasion or a worn surface
+      - an industrial object with missing or incomplete printed characters
+      - an industrial object with discoloration or abnormal color
+      - an industrial object with an exposed inner surface
+      - an industrial object contaminated by glue or gelatinous residue
+      - an industrial object contaminated by metallic debris
+      - an industrial object with a pit or surface cavity
+      - an industrial object with a scratch or gouge
+      - an industrial object fitted with the wrong plug or wrong component
+      - an industrial object with a broken or disconnected wire
+      - a visibly damaged industrial component
+      - an industrial object with excessive material or material overflow
+      - an industrial object with fiber burrs or frayed fibers
+      - an industrial object with a blocked or obstructed hole
+      - an industrial object with a missing part or absent component
+      - an industrial object with porosity, pores, or air holes
+      - an industrial object with a twisted or tangled wire
+      - an industrial object with a wire jumping out of its correct position
+      - an industrial object with a burn mark or heat damage
+      - an industrial object with deformation, warping, or bending
+      - an industrial object with exposed copper or exposed conductor
+      - an industrial object with a fracture, crack, or split
+      - an industrial object with impact damage, denting, or crushing
+      - an industrial object with an oil stain or greasy contamination
+      - an industrial object with uneven coating or patchy paint
+      - an industrial object with corrosion, oxidation, or rust
+      - an industrial object with peeling, delamination, or flaking
+      - an industrial object with a chip, notch, or broken edge
+      - an industrial object with a puncture, tear, or unwanted hole
+      - an industrial object with a loose connection or detached part
+      - an industrial object with a bent pin or misaligned connector
+      - an industrial object with foreign material, dirt, or contamination
+      - an industrial object with an incorrect assembly or misplaced part
 
 submission:
   mask_size: 448
