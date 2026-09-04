@@ -55,6 +55,10 @@ class FrozenClipBrokenSegmenter(nn.Module):
         self.prompt_aggregation = str(
             config.get("prompt_aggregation", "max")
         ).lower()
+        self.prompt_top_k = int(config.get("prompt_top_k", 3))
+        self.patch_smoothing_kernel = int(
+            config.get("patch_smoothing_kernel", 3)
+        )
         model_name = str(config.get("model_name", "ViT-B-16"))
         pretrained = str(config.get("pretrained", "openai"))
         image_size = int(config.get("image_size", 448))
@@ -149,8 +153,12 @@ class FrozenClipBrokenSegmenter(nn.Module):
             return similarities.amax(dim=-1)
         if self.prompt_aggregation == "mean":
             return similarities.mean(dim=-1)
+        if self.prompt_aggregation == "topk_mean":
+            top_k = min(self.prompt_top_k, similarities.shape[-1])
+            return similarities.topk(top_k, dim=-1).values.mean(dim=-1)
         raise ValueError(
-            "evaluation.unseen_clip.prompt_aggregation must be max or mean"
+            "evaluation.unseen_clip.prompt_aggregation must be max, mean, "
+            "or topk_mean"
         )
 
     def _project_patches(self, feature: torch.Tensor) -> torch.Tensor:
@@ -205,10 +213,9 @@ class FrozenClipBrokenSegmenter(nn.Module):
             dim=0,
         ).mean(dim=0)
         projected = F.normalize(projected, dim=-1, eps=1e-6)
-        # Keep each prompt separate. Max aggregation acts like a union of
-        # defect concepts: a patch matching any known defect description can
-        # strongly activate the broken class instead of being diluted by an
-        # average over unrelated defect types.
+        # Keep prompts separate and aggregate only the strongest few matches.
+        # This preserves the union-of-defects behavior without allowing one
+        # accidentally matched prompt to light up an otherwise clean patch.
         normal = self._aggregate_prompt_similarity(
             projected, self.normal_text
         )
@@ -216,7 +223,19 @@ class FrozenClipBrokenSegmenter(nn.Module):
             projected, self.broken_text
         )
         logits = torch.stack([normal, broken], dim=1) / self.temperature
-        return logits.softmax(dim=1)[:, 1:2]
+        probability = logits.softmax(dim=1)[:, 1:2]
+        if self.patch_smoothing_kernel > 1:
+            padding = self.patch_smoothing_kernel // 2
+            probability = F.avg_pool2d(
+                F.pad(
+                    probability,
+                    (padding, padding, padding, padding),
+                    mode="replicate",
+                ),
+                kernel_size=self.patch_smoothing_kernel,
+                stride=1,
+            )
+        return probability
 
 
 def fuse_unseen_anomaly_map(
@@ -230,8 +249,12 @@ def fuse_unseen_anomaly_map(
     center_quantile: float,
     upper_quantile: float,
     global_retention: float,
+    foreground_low_quantile: float,
+    foreground_high_quantile: float,
+    foreground_floor: float,
+    foreground_dilation_kernel: int,
 ) -> torch.Tensor:
-    """Suppress broad category novelty and retain CLIP-supported defects."""
+    """Suppress broad category novelty and retain foreground CLIP defects."""
 
     if reconstruction_map.ndim != 4 or reconstruction_map.shape[1] != 1:
         raise ValueError("reconstruction_map must have shape [B, 1, H, W]")
@@ -245,6 +268,12 @@ def fuse_unseen_anomaly_map(
     minimum = values.amin(dim=1).view(-1, 1, 1, 1)
     center = torch.quantile(values, center_quantile, dim=1).view(-1, 1, 1, 1)
     upper = torch.quantile(values, upper_quantile, dim=1).view(-1, 1, 1, 1)
+    foreground_low = torch.quantile(
+        values, foreground_low_quantile, dim=1
+    ).view(-1, 1, 1, 1)
+    foreground_high = torch.quantile(
+        values, foreground_high_quantile, dim=1
+    ).view(-1, 1, 1, 1)
     eps = torch.finfo(torch.float32).eps
     # Keep cosine-distance units so unseen and seen object scores remain
     # comparable. Subtracting the image-wide floor/median removes category
@@ -259,6 +288,24 @@ def fuse_unseen_anomaly_map(
         (broken_probability - broken_threshold)
         / max(1.0 - broken_threshold, eps)
     ).clamp(0.0, 1.0)
+    # The baseline reconstruction map is already a reliable object locator on
+    # dark competition backgrounds. Use it only as a soft ROI: CLIP remains
+    # aggressive on/near the object, but cannot independently manufacture a
+    # full-strength anomaly in clean background patches.
+    foreground = (
+        (reconstruction_map.float() - foreground_low)
+        / (foreground_high - foreground_low).clamp_min(eps)
+    ).clamp(0.0, 1.0)
+    foreground = foreground.square() * (3.0 - 2.0 * foreground)
+    if foreground_dilation_kernel > 1:
+        foreground = F.max_pool2d(
+            foreground,
+            kernel_size=foreground_dilation_kernel,
+            stride=1,
+            padding=foreground_dilation_kernel // 2,
+        )
+    foreground_gate = foreground_floor + (1.0 - foreground_floor) * foreground
+    semantic = semantic * foreground_gate
     # Aggressive mode: semantic evidence is additive rather than a convex
     # blend, and its scale cannot collapse merely because an unseen-category
     # reconstruction map is spatially flat.

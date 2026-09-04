@@ -482,9 +482,23 @@ def generate_competition_submission(
                         clip_config.get("upper_quantile", 0.995)
                     ),
                     global_retention=float(
-                        clip_config.get("global_retention", 0.25)
+                        clip_config.get("global_retention", 0.1)
+                    ),
+                    foreground_low_quantile=float(
+                        clip_config.get("foreground_low_quantile", 0.2)
+                    ),
+                    foreground_high_quantile=float(
+                        clip_config.get("foreground_high_quantile", 0.7)
+                    ),
+                    foreground_floor=float(
+                        clip_config.get("foreground_floor", 0.05)
+                    ),
+                    foreground_dilation_kernel=int(
+                        clip_config.get("foreground_dilation_kernel", 17)
                     ),
                 )
+                if bool(clip_config.get("final_gaussian_smoothing", True)):
+                    current = gaussian(current).clamp_(min=0.0)
             maps.extend(
                 array
                 for array in current[:, 0].cpu().numpy().astype(np.float32)

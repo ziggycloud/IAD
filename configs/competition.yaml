@@ -97,8 +97,11 @@ evaluation:
     image_size: 448
     intermediate_layers: 4
     temperature: 0.04
-    # A match to any defect concept is enough; unrelated prompts cannot dilute it.
-    prompt_aggregation: max
+    # Keep the strongest defect concepts while rejecting one-prompt accidents.
+    prompt_aggregation: topk_mean
+    prompt_top_k: 3
+    # Smooth on CLIP's native patch grid before 448x448 interpolation.
+    patch_smoothing_kernel: 3
     # Aggressive additive fusion: CLIP can dominate when broken semantics fire.
     reconstruction_gain: 0.5
     semantic_gain: 2.0
@@ -108,6 +111,14 @@ evaluation:
     center_quantile: 0.5
     upper_quantile: 0.995
     global_retention: 0.1
+    # Let the clean Dinomaly map act as a soft object ROI for CLIP. A small
+    # floor and dilation preserve real defects around the object boundary.
+    foreground_low_quantile: 0.2
+    foreground_high_quantile: 0.7
+    foreground_floor: 0.05
+    foreground_dilation_kernel: 17
+    # CLIP is added after the first Gaussian pass, so smooth once more here.
+    final_gaussian_smoothing: true
     normal_prompts:
       - a close-up photo of an intact industrial object
       - a normal undamaged component

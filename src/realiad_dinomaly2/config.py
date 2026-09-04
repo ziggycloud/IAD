@@ -141,15 +141,33 @@ def _validate(config: dict[str, Any]) -> None:
         if unseen_clip.get("prompt_aggregation", "max") not in {
             "max",
             "mean",
+            "topk_mean",
         }:
             raise ValueError(
-                "evaluation.unseen_clip.prompt_aggregation must be max or mean"
+                "evaluation.unseen_clip.prompt_aggregation must be max, mean, "
+                "or topk_mean"
             )
+        if int(unseen_clip.get("prompt_top_k", 3)) <= 0:
+            raise ValueError(
+                "evaluation.unseen_clip.prompt_top_k must be positive"
+            )
+        for key, default in (
+            ("patch_smoothing_kernel", 3),
+            ("foreground_dilation_kernel", 17),
+        ):
+            value = int(unseen_clip.get(key, default))
+            if value <= 0 or value % 2 == 0:
+                raise ValueError(
+                    f"evaluation.unseen_clip.{key} must be positive and odd"
+                )
         for key, default in (
             ("broken_threshold", 0.35),
             ("center_quantile", 0.5),
             ("upper_quantile", 0.995),
             ("global_retention", 0.1),
+            ("foreground_low_quantile", 0.2),
+            ("foreground_high_quantile", 0.7),
+            ("foreground_floor", 0.05),
         ):
             value = float(unseen_clip.get(key, default))
             if not 0.0 <= value <= 1.0:
@@ -171,6 +189,13 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError(
                 "evaluation.unseen_clip.center_quantile must be below "
                 "upper_quantile"
+            )
+        if float(unseen_clip.get("foreground_low_quantile", 0.2)) >= float(
+            unseen_clip.get("foreground_high_quantile", 0.7)
+        ):
+            raise ValueError(
+                "evaluation.unseen_clip.foreground_low_quantile must be below "
+                "foreground_high_quantile"
             )
         if float(unseen_clip.get("broken_threshold", 0.35)) >= 1.0:
             raise ValueError(
