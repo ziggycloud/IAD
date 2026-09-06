@@ -24,6 +24,14 @@ from .competition_data import (
     scan_competition_split,
 )
 from .config import config_fingerprint
+from .clip_normal_prior import (
+    clip_normal_prior_path,
+    load_clip_normal_prior,
+)
+from .clip_semantic import (
+    FrozenClipBrokenSegmenter,
+    fuse_unseen_anomaly_map,
+)
 from .losses import anomaly_map
 from .modeling import build_model, load_trainable_state_dict
 from .normal_prior import (
@@ -71,6 +79,8 @@ def _submission_signature(
     config: dict[str, Any],
     checkpoint_path: Path,
     manifest: CompetitionManifest,
+    *,
+    unseen_clip_active: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     checkpoint_stat = checkpoint_path.stat()
     payload = {
@@ -80,6 +90,7 @@ def _submission_signature(
         "checkpoint_mtime_ns": checkpoint_stat.st_mtime_ns,
         "test_root": str(manifest.root),
         "test_manifest_sha256": _manifest_digest(manifest),
+        "evaluation": config["evaluation"],
         "submission": config["submission"],
     }
     if bool(config["evaluation"].get("normal_prior", {}).get("enabled", False)):
@@ -91,6 +102,18 @@ def _submission_signature(
         payload["normal_prior"] = {
             "path": str(prior_path),
             "sha256": file_sha256(prior_path),
+        }
+    clip_config = config["evaluation"].get("unseen_clip", {})
+    clip_prior_config = clip_config.get("normal_prior", {})
+    if unseen_clip_active and bool(clip_prior_config.get("enabled", False)):
+        clip_prior = clip_normal_prior_path(config)
+        if not clip_prior.is_file():
+            raise FileNotFoundError(
+                f"CLIP normal prior does not exist: {clip_prior}"
+            )
+        payload["clip_normal_prior"] = {
+            "path": str(clip_prior),
+            "sha256": file_sha256(clip_prior),
         }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
@@ -380,8 +403,22 @@ def generate_competition_submission(
             "test_category_limit", dataset_config.get("category_limit")
         ),
     )
+    train_manifest = scan_competition_split(
+        Path(dataset_config["train_dir"]),
+        requested=dataset_config["categories"],
+        limit=dataset_config.get("category_limit"),
+    )
+    seen_categories = set(train_manifest.categories)
+    unseen_categories = set(manifest.categories) - seen_categories
+    clip_config = config["evaluation"].get("unseen_clip", {})
+    unseen_clip_active = bool(clip_config.get("enabled", False)) and bool(
+        unseen_categories
+    )
     signature, signature_inputs = _submission_signature(
-        config, checkpoint_path, manifest
+        config,
+        checkpoint_path,
+        manifest,
+        unseen_clip_active=unseen_clip_active,
     )
     run_dir = output_dir / "competition_submission" / signature[:12]
     submission_root = run_dir / "package"
@@ -446,6 +483,14 @@ def generate_competition_submission(
             config,
             checkpoint_path,
         )
+    clip_prior = None
+    clip_segmenter = None
+    if unseen_clip_active and bool(
+        clip_config.get("normal_prior", {}).get("enabled", False)
+    ):
+        clip_prior = load_clip_normal_prior(
+            clip_normal_prior_path(config), config
+        )
     mask_size = int(submission.get("mask_size", 448))
     lower_quantile = float(submission.get("lower_quantile", 0.001))
     upper_quantile = float(submission.get("upper_quantile", 0.99999))
@@ -487,12 +532,16 @@ def generate_competition_submission(
             all_rows.extend(rows)
             continue
 
+        category_uses_clip = unseen_clip_active and category in unseen_categories
+        if category_uses_clip and clip_segmenter is None:
+            clip_segmenter = FrozenClipBrokenSegmenter(clip_config, device).eval()
         logger.info(
-            "[%d/%d] infer category %s (%d views)",
+            "[%d/%d] infer category %s (%d views, unseen_clip=%s)",
             index,
             len(manifest.categories),
             category,
             len(category_views),
+            category_uses_clip,
         )
         if multi_view_enabled:
             dataset = CompetitionObjectDataset(
@@ -575,6 +624,81 @@ def generate_competition_submission(
                     mask_size,
                 )
                 visibility = context_output["visibility_weights"].float().cpu()
+                del encoder_features, decoder_features, context_output
+                if category_uses_clip:
+                    assert clip_segmenter is not None
+                    flat_images = images.reshape(
+                        batch_size * view_count, *images.shape[2:]
+                    )
+                    broken_probability = clip_segmenter(flat_images)
+                    broken_probability = broken_probability.reshape(
+                        batch_size,
+                        view_count,
+                        *broken_probability.shape[1:],
+                    )
+                    if clip_prior is not None:
+                        broken_probability = clip_prior.calibrate(
+                            broken_probability,
+                            view_ids=view_ids,
+                            valid_view_mask=valid_view_mask,
+                            config=config,
+                        )
+                    current = fuse_unseen_anomaly_map(
+                        current.reshape(
+                            batch_size * view_count, 1, mask_size, mask_size
+                        ),
+                        broken_probability.reshape(
+                            batch_size * view_count,
+                            *broken_probability.shape[2:],
+                        ),
+                        reconstruction_gain=float(
+                            clip_config.get("reconstruction_gain", 1.0)
+                        ),
+                        semantic_gain=float(
+                            clip_config.get("semantic_gain", 1.0)
+                        ),
+                        semantic_scale_floor=float(
+                            clip_config.get("semantic_scale_floor", 0.02)
+                        ),
+                        broken_threshold=float(
+                            clip_config.get("broken_threshold", 0.5)
+                        ),
+                        upper_quantile=float(
+                            clip_config.get("upper_quantile", 0.995)
+                        ),
+                        foreground_low_quantile=float(
+                            clip_config.get("foreground_low_quantile", 0.2)
+                        ),
+                        foreground_high_quantile=float(
+                            clip_config.get("foreground_high_quantile", 0.7)
+                        ),
+                        foreground_floor=float(
+                            clip_config.get("foreground_floor", 0.0)
+                        ),
+                        foreground_dilation_kernel=int(
+                            clip_config.get("foreground_dilation_kernel", 9)
+                        ),
+                        confidence_power=float(
+                            clip_config.get("confidence_power", 2.0)
+                        ),
+                    ).reshape(
+                        batch_size,
+                        view_count,
+                        1,
+                        mask_size,
+                        mask_size,
+                    )
+                    if bool(
+                        clip_config.get("final_gaussian_smoothing", True)
+                    ):
+                        current = gaussian(
+                            current.reshape(
+                                batch_size * view_count,
+                                1,
+                                mask_size,
+                                mask_size,
+                            )
+                        ).clamp_(min=0.0).reshape_as(current)
                 group_folders = [str(value) for value in batch["group_folder"]]
                 for batch_index, group_folder in enumerate(group_folders):
                     visibility_by_group[group_folder] = (
@@ -623,6 +747,55 @@ def generate_competition_submission(
                     align_corners=False,
                 )
                 current = gaussian(current).clamp_(min=0.0)
+                del encoder_features, decoder_features
+                if category_uses_clip:
+                    assert clip_segmenter is not None
+                    broken_probability = clip_segmenter(images)
+                    if clip_prior is not None:
+                        broken_probability = clip_prior.calibrate(
+                            broken_probability,
+                            view_ids=view_ids,
+                            valid_view_mask=valid_view_mask,
+                            config=config,
+                        )
+                    current = fuse_unseen_anomaly_map(
+                        current,
+                        broken_probability,
+                        reconstruction_gain=float(
+                            clip_config.get("reconstruction_gain", 1.0)
+                        ),
+                        semantic_gain=float(
+                            clip_config.get("semantic_gain", 1.0)
+                        ),
+                        semantic_scale_floor=float(
+                            clip_config.get("semantic_scale_floor", 0.02)
+                        ),
+                        broken_threshold=float(
+                            clip_config.get("broken_threshold", 0.5)
+                        ),
+                        upper_quantile=float(
+                            clip_config.get("upper_quantile", 0.995)
+                        ),
+                        foreground_low_quantile=float(
+                            clip_config.get("foreground_low_quantile", 0.2)
+                        ),
+                        foreground_high_quantile=float(
+                            clip_config.get("foreground_high_quantile", 0.7)
+                        ),
+                        foreground_floor=float(
+                            clip_config.get("foreground_floor", 0.0)
+                        ),
+                        foreground_dilation_kernel=int(
+                            clip_config.get("foreground_dilation_kernel", 9)
+                        ),
+                        confidence_power=float(
+                            clip_config.get("confidence_power", 2.0)
+                        ),
+                    )
+                    if bool(
+                        clip_config.get("final_gaussian_smoothing", True)
+                    ):
+                        current = gaussian(current).clamp_(min=0.0)
                 maps.extend(
                     array
                     for array in current[:, 0].cpu().numpy().astype(np.float32)
@@ -675,6 +848,7 @@ def generate_competition_submission(
                 "category": category,
                 "completed_at": utc_now(),
                 "views": len(category_views),
+                "unseen_clip": category_uses_clip,
                 "calibration": {
                     "lower": lower,
                     "upper": upper,

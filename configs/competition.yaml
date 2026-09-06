@@ -1,7 +1,7 @@
 experiment:
-  name: multiview_generalized_dinomaly_competition_vitl448_cosine_v4
+  name: multiview_generalized_dinomaly_clip_0906
   # Keep this run separate: scheduler/optimizer semantics are checkpoint-bound.
-  output_dir: outputs/multiview_generalized_dinomaly_competition_vitl448_cosine_v4
+  output_dir: outputs/multiview_generalized_dinomaly_clip_0906
   seed: 20260830
 
 dataset:
@@ -141,6 +141,91 @@ evaluation:
     eps: 1.0e-6
     batch_size: 2
     num_workers: 4
+  # Frozen CLIP is an inference-only semantic residual for categories that are
+  # absent from Train. Seen categories retain the exact multiview DINO path.
+  unseen_clip:
+    enabled: true
+    model_name: ViT-B-16
+    pretrained: openai
+    weights_dir: third_party/OpenCLIP/weights
+    image_size: 448
+    intermediate_layers: 4
+    # Suppress shallow texture noise and favor the deeper semantic layers.
+    intermediate_layer_weights: [0.1, 0.2, 0.3, 0.4]
+    temperature: 0.07
+    prompt_aggregation: topk_mean
+    prompt_top_k: 3
+    patch_smoothing_kernel: 3
+    reconstruction_gain: 1.0
+    semantic_gain: 1.0
+    semantic_scale_floor: 0.02
+    broken_threshold: 0.5
+    upper_quantile: 0.995
+    confidence_power: 2.0
+    foreground_low_quantile: 0.2
+    foreground_high_quantile: 0.7
+    foreground_floor: 0.0
+    foreground_dilation_kernel: 9
+    final_gaussian_smoothing: true
+    # Fit only on Train normals and use a category-agnostic prior per camera.
+    normal_prior:
+      enabled: true
+      statistic: median_mad
+      threshold: 2.0
+      temperature: 0.5
+      blend: 0.8
+      eps: 1.0e-6
+      mad_floor: 0.02
+      batch_size: 2
+      num_workers: 4
+    normal_prompts:
+      - a close-up photo of an intact industrial object
+      - a normal undamaged component
+      - a flawless object surface
+      - a complete object without defects
+      - a correctly assembled industrial component
+      - an object with all parts present
+      - a clean object without contamination
+      - a component with correct wiring and connections
+      - an object with a smooth uniform coating
+      - an object with clear complete printed characters
+      - a component with open unobstructed holes
+      - an object with the correct shape and alignment
+    broken_prompts:
+      - a close-up photo of a broken industrial object
+      - an industrial object with abrasion or a worn surface
+      - an industrial object with missing or incomplete printed characters
+      - an industrial object with discoloration or abnormal color
+      - an industrial object with an exposed inner surface
+      - an industrial object contaminated by glue or gelatinous residue
+      - an industrial object contaminated by metallic debris
+      - an industrial object with a pit or surface cavity
+      - an industrial object with a scratch or gouge
+      - an industrial object fitted with the wrong plug or wrong component
+      - an industrial object with a broken or disconnected wire
+      - a visibly damaged industrial component
+      - an industrial object with excessive material or material overflow
+      - an industrial object with fiber burrs or frayed fibers
+      - an industrial object with a blocked or obstructed hole
+      - an industrial object with a missing part or absent component
+      - an industrial object with porosity, pores, or air holes
+      - an industrial object with a twisted or tangled wire
+      - an industrial object with a wire jumping out of its correct position
+      - an industrial object with a burn mark or heat damage
+      - an industrial object with deformation, warping, or bending
+      - an industrial object with exposed copper or exposed conductor
+      - an industrial object with a fracture, crack, or split
+      - an industrial object with impact damage, denting, or crushing
+      - an industrial object with an oil stain or greasy contamination
+      - an industrial object with uneven coating or patchy paint
+      - an industrial object with corrosion, oxidation, or rust
+      - an industrial object with peeling, delamination, or flaking
+      - an industrial object with a chip, notch, or broken edge
+      - an industrial object with a puncture, tear, or unwanted hole
+      - an industrial object with a loose connection or detached part
+      - an industrial object with a bent pin or misaligned connector
+      - an industrial object with foreign material, dirt, or contamination
+      - an industrial object with an incorrect assembly or misplaced part
 
 submission:
   mask_size: 448

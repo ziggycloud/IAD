@@ -229,7 +229,7 @@ python run_unseen_pipeline.py
 ViT-L/14，并把输入对齐到提交 mask 的 448 × 448：
 
 ```powershell
-# 一键：审计 → 正常 Train 训练 → 正常 Train prior → Test_A 推理 → 校验并打 ZIP
+# 一键：审计 → 多视角训练 → DINO prior → Test_A 推理 → 校验并打 ZIP
 python run_competition_pipeline.py
 
 # 只检查目录、类别和五视角完整性
@@ -256,9 +256,10 @@ python run_competition_pipeline.py --test-b --skip-train
 `visibility_aware` 同时保留 max 分量，避免单相机可见缺陷被软共识抹掉。
 
 Test_B 解压到 `data/competition/Test_B`。`--test-b` 会独立扫描其全部类别，不要求
-类别数、类别名称或每类样本数与 Train/Test_A 相同；Train 中不存在的类别使用
-view-global Normal Prior。显式 `--set` 参数优先于该预设，因此仍可覆盖 Test_B 路径
-或恢复严格的数据计数检查。Test_B 不参与训练和 prior 拟合。
+类别数、类别名称或每类样本数与 Train/Test_A 相同；Train 中不存在的类别先使用
+view-global DINO Normal Prior，再启用冻结 CLIP 语义残差。CLIP 的常见正常响应也只
+由 Train 正常图拟合为 view-global prior。显式 `--set` 参数优先于该预设，因此仍可
+覆盖 Test_B 路径或恢复严格的数据计数检查。Test_B 不参与训练和任何 prior 拟合。
 下载使用天池提供的临时 STS 凭证，凭证只通过 `ossutil` 命令传入，不要写入 YAML、
 脚本或 Git；`Test_B.zip` 和 ossutil 断点目录均已被 `.gitignore` 排除。
 
@@ -268,11 +269,12 @@ view-global Normal Prior。显式 `--set` 参数优先于该预设，因此仍�
 完成后读取：
 
 ```text
-outputs/multiview_generalized_dinomaly_competition_vitl448_cosine_v4/
+outputs/multiview_generalized_dinomaly_clip_0906/
 ├── competition_data_audit.json
 ├── competition_pipeline_state.json
 ├── checkpoints/final_model.pt
 ├── normal_prior/normal_prior.pt
+├── normal_prior/clip_normal_prior.pt
 └── competition_submission/
     ├── latest.json
     └── <签名>/
@@ -296,4 +298,6 @@ python run_competition_pipeline.py `
 ```
 
 分割边缘假阳性、五视角无监督建模、梯度爆炸诊断和 YAML 调参说明见
-[COMPETITION_TUNING.md](COMPETITION_TUNING.md)。
+[COMPETITION_TUNING.md](COMPETITION_TUNING.md)。本分支的 DINO + CLIP 融合边界、
+训练/推理阶段和恢复规则见
+[COMPETITION_CLIP_0906.md](COMPETITION_CLIP_0906.md)。

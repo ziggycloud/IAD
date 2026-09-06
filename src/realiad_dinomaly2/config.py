@@ -257,6 +257,129 @@ def _validate(config: dict[str, Any]) -> None:
                 "evaluation.anomaly_map_layer_weights must be a non-empty "
                 "list of non-negative values with a positive sum"
             )
+    unseen_clip = evaluation.get("unseen_clip", {})
+    if not isinstance(unseen_clip, dict):
+        raise ValueError("evaluation.unseen_clip must be a mapping")
+    if bool(unseen_clip.get("enabled", False)):
+        for key in ("model_name", "pretrained", "weights_dir"):
+            if not str(unseen_clip.get(key, "")).strip():
+                raise ValueError(f"evaluation.unseen_clip.{key} is required")
+        intermediate_layers = int(unseen_clip.get("intermediate_layers", 4))
+        if intermediate_layers <= 0:
+            raise ValueError(
+                "evaluation.unseen_clip.intermediate_layers must be positive"
+            )
+        clip_layer_weights = unseen_clip.get("intermediate_layer_weights")
+        if (
+            not isinstance(clip_layer_weights, list)
+            or len(clip_layer_weights) != intermediate_layers
+            or any(float(value) < 0 for value in clip_layer_weights)
+            or sum(float(value) for value in clip_layer_weights) <= 0
+        ):
+            raise ValueError(
+                "evaluation.unseen_clip.intermediate_layer_weights must have "
+                "one non-negative value per intermediate layer and a positive sum"
+            )
+        if float(unseen_clip.get("temperature", 0.07)) <= 0:
+            raise ValueError("evaluation.unseen_clip.temperature must be positive")
+        if unseen_clip.get("prompt_aggregation", "topk_mean") not in {
+            "max",
+            "mean",
+            "topk_mean",
+        }:
+            raise ValueError(
+                "evaluation.unseen_clip.prompt_aggregation must be max, mean, "
+                "or topk_mean"
+            )
+        if int(unseen_clip.get("prompt_top_k", 3)) <= 0:
+            raise ValueError("evaluation.unseen_clip.prompt_top_k must be positive")
+        for key, default in (
+            ("patch_smoothing_kernel", 3),
+            ("foreground_dilation_kernel", 9),
+        ):
+            value = int(unseen_clip.get(key, default))
+            if value <= 0 or value % 2 == 0:
+                raise ValueError(
+                    f"evaluation.unseen_clip.{key} must be positive and odd"
+                )
+        for key, default in (
+            ("broken_threshold", 0.5),
+            ("upper_quantile", 0.995),
+            ("foreground_low_quantile", 0.2),
+            ("foreground_high_quantile", 0.7),
+            ("foreground_floor", 0.0),
+        ):
+            value = float(unseen_clip.get(key, default))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(
+                    f"evaluation.unseen_clip.{key} must be in [0, 1]"
+                )
+        if float(unseen_clip.get("broken_threshold", 0.5)) >= 1.0:
+            raise ValueError(
+                "evaluation.unseen_clip.broken_threshold must be below 1"
+            )
+        if float(unseen_clip.get("foreground_low_quantile", 0.2)) >= float(
+            unseen_clip.get("foreground_high_quantile", 0.7)
+        ):
+            raise ValueError(
+                "evaluation.unseen_clip.foreground_low_quantile must be below "
+                "foreground_high_quantile"
+            )
+        for key, default in (
+            ("reconstruction_gain", 1.0),
+            ("semantic_gain", 1.0),
+            ("semantic_scale_floor", 0.02),
+        ):
+            if float(unseen_clip.get(key, default)) < 0:
+                raise ValueError(
+                    f"evaluation.unseen_clip.{key} must be non-negative"
+                )
+        if float(unseen_clip.get("confidence_power", 2.0)) <= 0:
+            raise ValueError(
+                "evaluation.unseen_clip.confidence_power must be positive"
+            )
+        for key in ("normal_prompts", "broken_prompts"):
+            prompts = unseen_clip.get(key)
+            if (
+                not isinstance(prompts, list)
+                or not prompts
+                or any(not str(prompt).strip() for prompt in prompts)
+            ):
+                raise ValueError(
+                    f"evaluation.unseen_clip.{key} must be a non-empty list"
+                )
+        clip_prior = unseen_clip.get("normal_prior", {})
+        if not isinstance(clip_prior, dict):
+            raise ValueError(
+                "evaluation.unseen_clip.normal_prior must be a mapping"
+            )
+        if bool(clip_prior.get("enabled", False)):
+            if clip_prior.get("statistic", "median_mad") != "median_mad":
+                raise ValueError(
+                    "evaluation.unseen_clip.normal_prior.statistic currently "
+                    "supports median_mad"
+                )
+            if float(clip_prior.get("temperature", 0.5)) <= 0:
+                raise ValueError(
+                    "evaluation.unseen_clip.normal_prior.temperature must be positive"
+                )
+            if float(clip_prior.get("eps", 1e-6)) <= 0:
+                raise ValueError(
+                    "evaluation.unseen_clip.normal_prior.eps must be positive"
+                )
+            if float(clip_prior.get("mad_floor", 0.02)) <= 0:
+                raise ValueError(
+                    "evaluation.unseen_clip.normal_prior.mad_floor must be positive"
+                )
+            clip_blend = float(clip_prior.get("blend", 0.8))
+            if not 0.0 <= clip_blend <= 1.0:
+                raise ValueError(
+                    "evaluation.unseen_clip.normal_prior.blend must be in [0, 1]"
+                )
+            if int(clip_prior.get("batch_size", 2)) <= 0:
+                raise ValueError(
+                    "evaluation.unseen_clip.normal_prior.batch_size must be positive"
+                )
     submission = config.get("submission")
     if dataset_type == "competition_folders":
         if not isinstance(submission, dict):

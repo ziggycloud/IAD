@@ -37,6 +37,9 @@ from realiad_dinomaly2.runtime import (  # noqa: E402
     utc_now,
 )
 from realiad_dinomaly2.normal_prior import fit_normal_prior  # noqa: E402
+from realiad_dinomaly2.clip_normal_prior import (  # noqa: E402
+    fit_clip_normal_prior,
+)
 from realiad_dinomaly2.train_engine import train  # noqa: E402
 
 
@@ -328,6 +331,26 @@ def main() -> int:
             fit_normal_prior(
                 config,
                 checkpoint_path,
+                categories=audit["category_names"],
+            )
+        clip_config = config["evaluation"].get("unseen_clip", {})
+        clip_prior_config = clip_config.get("normal_prior", {})
+        if (
+            audit["unseen_test_categories"]
+            and bool(clip_config.get("enabled", False))
+            and bool(clip_prior_config.get("enabled", False))
+        ):
+            _write_state(
+                output_dir,
+                status="fitting_clip_normal_prior",
+                next_action=(
+                    "Fit or strictly validate the Train-normal view-global "
+                    "CLIP prior."
+                ),
+                checkpoint=str(checkpoint_path),
+            )
+            fit_clip_normal_prior(
+                config,
                 categories=audit["category_names"],
             )
         if args.skip_inference:
