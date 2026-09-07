@@ -54,6 +54,9 @@ from .zero_shot_model import (
 )
 
 
+ZERO_SHOT_SCORING_VERSION = "mask_topk_v1"
+
+
 def resolve_competition_checkpoint(
     output_dir: Path,
     checkpoint: str,
@@ -133,6 +136,7 @@ def _submission_signature(
             "config": config["zero_shot"],
             "checkpoint": str(zero_path),
             "sha256": file_sha256(zero_path),
+            "scoring_version": ZERO_SHOT_SCORING_VERSION,
         }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
@@ -257,6 +261,27 @@ def _aggregate_object_score(
     raise ValueError(
         "object_score_aggregation must be legacy_concat_topk, max, softmax, "
         "or visibility_aware"
+    )
+
+
+def _zero_shot_object_score(
+    arrays: list[np.ndarray],
+    ratio: float,
+    *,
+    max_blend: float = 0.5,
+) -> float:
+    """Score unseen objects from the exact float maps written as masks."""
+    if not arrays:
+        raise ValueError("zero-shot object scoring requires at least one map")
+    if not 0.0 <= max_blend <= 1.0:
+        raise ValueError("max_blend must be in [0, 1]")
+    per_view = np.asarray(
+        [_top_ratio_score([array], ratio) for array in arrays],
+        dtype=np.float64,
+    )
+    return float(
+        max_blend * per_view.max()
+        + (1.0 - max_blend) * per_view.mean()
     )
 
 
@@ -595,7 +620,6 @@ def generate_competition_submission(
                 crop_size=int(dataset_config["crop_size"]),
             )
         maps: list[np.ndarray] = []
-        zero_view_scores: list[float] = []
         visibility_by_group: dict[str, np.ndarray] = {}
         for batch in _loader(dataset, config):
             # Use the dataset payload as the final source of truth. This keeps
@@ -641,13 +665,6 @@ def generate_competition_submission(
                             .cpu()
                             .numpy()
                             .astype(np.float32)
-                        )
-                    if "image_probability" in zero_output:
-                        zero_view_scores.extend(
-                            float(value)
-                            for value in zero_output["image_probability"]
-                            .cpu()
-                            .tolist()
                         )
                     continue
                 category_names = [str(value) for value in batch["category"]]
@@ -808,13 +825,6 @@ def generate_competition_submission(
                         .numpy()
                         .astype(np.float32)
                     )
-                    if "image_probability" in zero_output:
-                        zero_view_scores.extend(
-                            float(value)
-                            for value in zero_output["image_probability"]
-                            .cpu()
-                            .tolist()
-                        )
                     continue
                 category_names = [str(value) for value in batch["category"]]
                 view_ids = batch["view_id"].to(device, dtype=torch.long)
@@ -916,7 +926,6 @@ def generate_competition_submission(
                 maps, lower_quantile, upper_quantile
             )
         grouped_maps: dict[str, list[np.ndarray]] = defaultdict(list)
-        grouped_zero_scores: dict[str, list[float]] = defaultdict(list)
         for view, current in zip(category_views, maps, strict=True):
             grouped_maps[view.group_folder].append(current)
             _write_mask(
@@ -927,27 +936,18 @@ def generate_competition_submission(
                 lower,
                 upper,
             )
-        if zero_view_scores:
-            if len(zero_view_scores) != len(category_views):
-                raise RuntimeError("zero-shot image-score count mismatch")
-            for view, score in zip(
-                category_views, zero_view_scores, strict=True
-            ):
-                grouped_zero_scores[view.group_folder].append(score)
         rows = []
         for group_folder in dict.fromkeys(
             view.group_folder for view in category_views
         ):
-            if grouped_zero_scores:
-                # The per-view score already fuses visual/textual global
-                # logits with the local top-patch mean. Only five cameras
-                # remain to be combined here.
-                view_scores = np.asarray(
-                    grouped_zero_scores[group_folder], dtype=np.float64
-                )
-                raw_score = float(
-                    visibility_max_blend * view_scores.max()
-                    + (1.0 - visibility_max_blend) * view_scores.mean()
+            if category_uses_zero_shot:
+                # A global CLIP head can be confident while every local mask
+                # is empty. Score the same float maps used to write PNGs so a
+                # black localization result can never produce a high score.
+                raw_score = _zero_shot_object_score(
+                    grouped_maps[group_folder],
+                    object_top_ratio,
+                    max_blend=visibility_max_blend,
                 )
             else:
                 raw_score = _aggregate_object_score(

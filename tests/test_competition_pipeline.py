@@ -24,6 +24,7 @@ from realiad_dinomaly2.competition_data import (  # noqa: E402
 from realiad_dinomaly2.competition_submission import (  # noqa: E402
     _aggregate_object_score,
     _top_ratio_score,
+    _zero_shot_object_score,
     build_submission_zip,
     resolve_competition_checkpoint,
     validate_submission_layout,
@@ -125,6 +126,16 @@ class CompetitionDataTests(unittest.TestCase):
         self.assertGreaterEqual(
             score,
             0.5 * _aggregate_object_score(maps, 0.1, mode="max"),
+        )
+
+    def test_zero_shot_score_is_coupled_to_written_maps(self) -> None:
+        maps = [np.zeros((4, 4), dtype=np.float32) for _ in range(5)]
+        self.assertEqual(_zero_shot_object_score(maps, 0.1), 0.0)
+
+        maps[2][0, 0] = 1.0
+        self.assertAlmostEqual(
+            _zero_shot_object_score(maps, 0.1, max_blend=0.5),
+            0.6,
         )
 
 
