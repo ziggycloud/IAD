@@ -280,6 +280,22 @@ def _validate(config: dict[str, Any]) -> None:
                 zero_training["total_steps"]
             ):
                 raise ValueError("zero_shot warmup_steps must be below total_steps")
+            if backend == "adaptclip_inspired":
+                for key in (
+                    "visual_fusion_weight",
+                    "image_local_weight",
+                    "image_top_ratio",
+                ):
+                    value = float(zero_model.get(key, 0.0))
+                    if not 0.0 < value < 1.0:
+                        raise ValueError(
+                            f"zero_shot.model.{key} must be in (0, 1)"
+                        )
+            focal_alpha = float(zero_training.get("focal_alpha", 0.75))
+            if not 0.0 < focal_alpha < 1.0:
+                raise ValueError(
+                    "zero_shot.training.focal_alpha must be in (0, 1)"
+                )
             for key in (
                 "anomaly_probability",
                 "hard_normal_probability",

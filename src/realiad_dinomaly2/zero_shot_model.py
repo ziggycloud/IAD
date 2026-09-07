@@ -21,7 +21,7 @@ from .config import resolve_path
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-ZERO_SHOT_FORMAT_VERSION = 2
+ZERO_SHOT_FORMAT_VERSION = 3
 
 
 def zero_shot_checkpoint_path(config: dict[str, Any]) -> Path:
@@ -34,12 +34,7 @@ def zero_shot_checkpoint_path(config: dict[str, Any]) -> Path:
 
 
 def zero_shot_last_checkpoint_path(config: dict[str, Any]) -> Path:
-    return (
-        Path(config["experiment"]["output_dir"])
-        / "zero_shot"
-        / "checkpoints"
-        / "last.pt"
-    )
+    return zero_shot_checkpoint_path(config).parent / "last.pt"
 
 
 def zero_shot_config_fingerprint(config: dict[str, Any]) -> str:
@@ -107,6 +102,15 @@ class LearnedZeroShotSegmenter(nn.Module):
         )
         self.semantic_temperature = float(
             model_config.get("semantic_temperature", 0.07)
+        )
+        self.visual_fusion_weight = float(
+            model_config.get("visual_fusion_weight", 0.65)
+        )
+        self.image_local_weight = float(
+            model_config.get("image_local_weight", 0.35)
+        )
+        self.image_top_ratio = float(
+            model_config.get("image_top_ratio", 0.01)
         )
         model_name = str(model_config.get("model_name", "ViT-B-16"))
         pretrained = str(model_config.get("pretrained", "openai"))
@@ -250,11 +254,6 @@ class LearnedZeroShotSegmenter(nn.Module):
             eps=1e-6,
         )
 
-    @staticmethod
-    def _harmonic(values: list[torch.Tensor]) -> torch.Tensor:
-        stacked = torch.stack(values)
-        return len(values) / stacked.clamp_min(1e-6).reciprocal().sum(0)
-
     def _project_patches(self, feature: torch.Tensor) -> torch.Tensor:
         patches = feature.float().permute(0, 2, 3, 1)
         projection = getattr(self.clip.visual, "proj", None)
@@ -352,38 +351,52 @@ class LearnedZeroShotSegmenter(nn.Module):
             "bc,kc->bk", global_feature, learned_prompts
         ) / self.semantic_temperature
 
-        visual_probability = visual_logits.softmax(dim=1)[:, 1:2]
-        textual_probability = textual_logits.softmax(dim=1)[:, 1:2]
-        visual_image_probability = visual_global_logits.softmax(dim=1)[:, 1]
-        textual_image_probability = textual_global_logits.softmax(dim=1)[:, 1]
+        visual_margin = visual_logits[:, 1:2] - visual_logits[:, 0:1]
+        textual_margin = textual_logits[:, 1:2] - textual_logits[:, 0:1]
+        visual_image_margin = (
+            visual_global_logits[:, 1] - visual_global_logits[:, 0]
+        )
+        textual_image_margin = (
+            textual_global_logits[:, 1] - textual_global_logits[:, 0]
+        )
         # AdaptCLIP's central result: visual and textual representations are
         # optimized alternately, not jointly in one backward pass.
         if train_branch == "visual":
-            textual_probability = textual_probability.detach()
-            textual_image_probability = textual_image_probability.detach()
+            textual_margin = textual_margin.detach()
+            textual_image_margin = textual_image_margin.detach()
         elif train_branch == "textual":
-            visual_probability = visual_probability.detach()
-            visual_image_probability = visual_image_probability.detach()
+            visual_margin = visual_margin.detach()
+            visual_image_margin = visual_image_margin.detach()
         elif train_branch not in {None, "visual", "textual"}:
             raise ValueError(f"unsupported train_branch={train_branch!r}")
 
-        probability = self._harmonic(
-            [visual_probability, textual_probability]
-        ).clamp(1e-6, 1.0 - 1e-6)
-        logits = torch.logit(probability)
-        local_max = probability.flatten(1).amax(dim=1)
-        image_probability = self._harmonic(
-            [
-                visual_image_probability,
-                textual_image_probability,
-                local_max,
-            ]
-        ).clamp(1e-6, 1.0 - 1e-6)
+        logits = (
+            self.visual_fusion_weight * visual_margin
+            + (1.0 - self.visual_fusion_weight) * textual_margin
+        )
+        probability = logits.sigmoid().clamp(1e-6, 1.0 - 1e-6)
+        flat = probability.flatten(1)
+        top_count = max(1, int(round(flat.shape[1] * self.image_top_ratio)))
+        local_probability = flat.topk(top_count, dim=1).values.mean(dim=1)
+        local_logit = torch.logit(local_probability.clamp(1e-6, 1.0 - 1e-6))
+        global_margin = (
+            self.visual_fusion_weight * visual_image_margin
+            + (1.0 - self.visual_fusion_weight) * textual_image_margin
+        )
+        image_logits = (
+            (1.0 - self.image_local_weight) * global_margin
+            + self.image_local_weight * local_logit
+        )
+        image_probability = image_logits.sigmoid().clamp(1e-6, 1.0 - 1e-6)
         return {
             "logits": logits.float(),
             "probability": probability.float(),
-            "image_logits": torch.logit(image_probability).float(),
+            "image_logits": image_logits.float(),
             "image_probability": image_probability.float(),
+            "visual_margin": visual_margin.float(),
+            "textual_margin": textual_margin.float(),
+            "visual_image_margin": visual_image_margin.float(),
+            "textual_image_margin": textual_image_margin.float(),
             "visual_logits": visual_logits.float(),
             "textual_logits": textual_logits.float(),
             "semantic_logit": logits.float(),

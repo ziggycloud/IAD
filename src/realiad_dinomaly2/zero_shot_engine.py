@@ -24,11 +24,17 @@ from .zero_shot_model import (
 )
 
 
-def _focal_loss(logits: torch.Tensor, targets: torch.Tensor, gamma: float) -> torch.Tensor:
+def _focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma: float,
+    alpha: float,
+) -> torch.Tensor:
     bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     probability = logits.sigmoid()
     pt = probability * targets + (1.0 - probability) * (1.0 - targets)
-    return ((1.0 - pt).pow(gamma) * bce).mean()
+    alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+    return (alpha_t * (1.0 - pt).pow(gamma) * bce).mean()
 
 
 def _dice_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -73,7 +79,7 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
     setup_seed(int(config["experiment"]["seed"]) + 907, False)
     logger = setup_logger(
         "zero_shot_training",
-        Path(config["experiment"]["output_dir"]) / "zero_shot" / "train.log",
+        zero_shot_checkpoint_path(config).parent.parent / "train.log",
     )
     manifest = scan_competition_split(
         Path(config["dataset"]["train_dir"]),
@@ -154,26 +160,39 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
             synthesis_config.get("feature_anomaly_probability", 0.5)
         )
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            train_branch = "visual" if step % 2 else "textual"
             output = model(
                 images,
                 feature_anomaly_mask=masks if use_feature_anomaly else None,
                 feature_noise_std=float(synthesis_config.get("feature_noise_std", 0.08)),
-                train_branch="visual" if step % 2 else "textual",
+                train_branch=train_branch,
             )
             target = F.interpolate(
                 masks, size=output["logits"].shape[-2:], mode="area"
             ).clamp(0.0, 1.0)
             focal_gamma = float(train_config.get("focal_gamma", 2.0))
-            focal = _focal_loss(output["logits"], target, focal_gamma)
-            dice = _dice_loss(output["logits"], target)
+            branch_logits = output[f"{train_branch}_margin"]
+            branch_image_logits = output[f"{train_branch}_image_margin"]
+            focal = _focal_loss(
+                branch_logits,
+                target,
+                focal_gamma,
+                float(train_config.get("focal_alpha", 0.75)),
+            )
+            positive = target.flatten(1).sum(dim=1) > 1e-6
+            dice = (
+                _dice_loss(branch_logits[positive], target[positive])
+                if positive.any()
+                else branch_logits.new_zeros(())
+            )
             image_loss = F.binary_cross_entropy_with_logits(
-                output["image_logits"], labels
+                branch_image_logits, labels
             )
             clean = labels == 0
             clean_loss = (
-                output["probability"][clean].mean()
+                branch_logits[clean].sigmoid().mean()
                 if clean.any()
-                else output["logits"].new_zeros(())
+                else branch_logits.new_zeros(())
             )
             # Keep AdaptCLIP-style alternating optimization strict: the text
             # prompt is regularized only on textual-adapter updates.
@@ -201,12 +220,14 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
         if step == 1 or step % int(train_config.get("log_every", 20)) == 0:
             logger.info(
                 "zero-shot step %d/%d | loss %.5f | focal %.5f | "
-                "dice %.5f | lr %.3e | grad %.3f",
+                "dice %.5f | positive %.3f | branch %s | lr %.3e | grad %.3e",
                 step,
                 total_steps,
                 loss.item(),
                 focal.item(),
                 dice.item(),
+                float(positive.float().mean()),
+                train_branch,
                 lr,
                 float(grad_norm),
             )

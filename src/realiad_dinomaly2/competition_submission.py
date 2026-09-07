@@ -934,8 +934,8 @@ def generate_competition_submission(
             view.group_folder for view in category_views
         ):
             if grouped_zero_scores:
-                # The per-view score already harmonically fuses visual,
-                # textual and maximum-local branches. Only five cameras
+                # The per-view score already fuses visual/textual global
+                # logits with the local top-patch mean. Only five cameras
                 # remain to be combined here.
                 view_scores = np.asarray(
                     grouped_zero_scores[group_folder], dtype=np.float64
