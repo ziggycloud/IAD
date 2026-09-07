@@ -80,11 +80,14 @@ def _update_root_run_state(
 
 def _resolve_checkpoint(output_dir: Path, checkpoint: str) -> Path:
     if checkpoint == "auto":
-        candidate = output_dir / "checkpoints" / "final_model.pt"
-        if candidate.is_file():
-            return candidate
+        best = output_dir / "checkpoints" / "best_model.pt"
+        final = output_dir / "checkpoints" / "final_model.pt"
+        if best.is_file():
+            return best
+        if final.is_file():
+            return final
         raise FileNotFoundError(
-            "未找到 final_model.pt；正式评估默认只接受完整训练模型。"
+            "未找到 best_model.pt 或 final_model.pt；正式评估默认只接受完整训练模型。"
             "请先完成训练。若仅做诊断，可显式指定 last.pt 并添加 "
             "--allow-partial。"
         )
@@ -621,11 +624,14 @@ def evaluate(
     if checkpoint_payload.get("config_fingerprint") != expected:
         raise ValueError("checkpoint 与当前模型/训练语义配置不一致")
     completed_steps = int(checkpoint_payload.get("completed_steps", -1))
+    training_completed_steps = int(
+        checkpoint_payload.get("training_completed_steps", completed_steps)
+    )
     total_steps = int(config["training"]["total_steps"])
-    is_partial = completed_steps != total_steps
+    is_partial = training_completed_steps != total_steps
     if is_partial and not allow_partial:
         raise ValueError(
-            f"checkpoint 仅完成 {completed_steps}/{total_steps} steps。"
+            f"checkpoint 仅完成 {training_completed_steps}/{total_steps} steps。"
             "正式论文指标拒绝评估中间断点；如仅做诊断，请显式添加 "
             "--allow-partial。"
         )

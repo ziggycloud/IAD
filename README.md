@@ -163,7 +163,8 @@ outputs\dinomaly2_realiad_variety_b_280\
 │   └── progress.jsonl
 ├── checkpoints\
 │   ├── last.pt
-│   └── final_model.pt
+│   ├── final_model.pt
+│   └── best_model.pt
 └── evaluation\<签名>\
     ├── eval_state.json
     ├── metrics.json
@@ -176,8 +177,9 @@ outputs\dinomaly2_realiad_variety_b_280\
 `run_state.json` 即可知道下一步。训练会从 `last.pt` 继续；评估会根据
 checkpoint 与配置生成签名，并跳过同签名下已完成的类别。
 
-默认评估只接受完成 100,000 步的 `final_model.pt`，避免把中间模型静默写成
-正式报告。仅做诊断时可以显式运行：
+默认评估和推理优先使用完成全程训练后标记的 `best_model.pt`，旧实验没有该
+文件时回退到 `final_model.pt`；二者都不会把中间模型静默写成正式报告。
+仅做诊断时可以显式运行：
 
 ```powershell
 python run_pipeline.py `
@@ -235,7 +237,7 @@ python run_competition_pipeline.py
 # 只检查目录、类别和五视角完整性
 python run_competition_pipeline.py --validate-only
 
-# 已有 final_model.pt 时跳过训练，重新/继续按类别推理和打包
+# 已有 best_model.pt（旧运行可用 final_model.pt）时跳过训练并推理打包
 python run_competition_pipeline.py --skip-train
 
 # 只训练，暂不推理
@@ -273,7 +275,10 @@ normal-only CLIP Patch-MoE 分支：按文件夹类名生成提示词，并在�
 outputs/multiview_generalized_dinomaly_clip_0906/
 ├── competition_data_audit.json
 ├── competition_pipeline_state.json
-├── checkpoints/final_model.pt
+├── checkpoints/
+│   ├── best_model.pt        # 推理默认；训练损失 EMA 最优
+│   ├── final_model.pt       # 最后一步权重
+│   └── last.pt              # 断点续训
 ├── normal_prior/normal_prior.pt
 ├── normal_prior/clip_normal_prior.pt
 └── competition_submission/

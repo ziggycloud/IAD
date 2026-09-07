@@ -234,7 +234,7 @@ zero_shot:
   enabled: true
   backend: normal_only_moe
   route: unseen_only
-  checkpoint: zero_shot_normalonly_stable/checkpoints/final_model.pt
+  checkpoint: zero_shot_normalonly_stable/checkpoints/best_model.pt
   model:
     model_name: ViT-L-14-336
     pretrained: openai

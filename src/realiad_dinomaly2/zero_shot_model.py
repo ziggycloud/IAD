@@ -30,13 +30,17 @@ def zero_shot_checkpoint_path(config: dict[str, Any]) -> Path:
     configured = config.get("zero_shot", {}).get("checkpoint")
     output_dir = Path(config["experiment"]["output_dir"])
     if configured is None:
-        return output_dir / "zero_shot" / "checkpoints" / "final_model.pt"
+        return output_dir / "zero_shot" / "checkpoints" / "best_model.pt"
     path = Path(str(configured)).expanduser()
     return path if path.is_absolute() else output_dir / path
 
 
 def zero_shot_last_checkpoint_path(config: dict[str, Any]) -> Path:
     return zero_shot_checkpoint_path(config).parent / "last.pt"
+
+
+def zero_shot_final_checkpoint_path(config: dict[str, Any]) -> Path:
+    return zero_shot_checkpoint_path(config).parent / "final_model.pt"
 
 
 def zero_shot_config_fingerprint(config: dict[str, Any]) -> str:
@@ -620,6 +624,12 @@ def load_zero_shot_segmenter(
         raise ValueError(
             "Zero-shot checkpoint format is incompatible; "
             "retrain the normal-only branch"
+        )
+    completed = int(payload.get("training_completed_steps", -1))
+    expected_steps = int(config["zero_shot"]["training"]["total_steps"])
+    if completed != expected_steps:
+        raise ValueError(
+            f"Zero-shot best checkpoint is partial ({completed}/{expected_steps})"
         )
     if payload.get("config_fingerprint") != zero_shot_config_fingerprint(config):
         raise ValueError("Zero-shot checkpoint/config fingerprint mismatch")

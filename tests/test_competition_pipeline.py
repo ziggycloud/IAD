@@ -25,6 +25,7 @@ from realiad_dinomaly2.competition_submission import (  # noqa: E402
     _aggregate_object_score,
     _top_ratio_score,
     build_submission_zip,
+    resolve_competition_checkpoint,
     validate_submission_layout,
 )
 from realiad_dinomaly2.config import load_config, materialize_paths  # noqa: E402
@@ -51,6 +52,18 @@ def _temporary_directory():
 
 
 class CompetitionDataTests(unittest.TestCase):
+    def test_auto_checkpoint_prefers_best_and_supports_legacy_final(self) -> None:
+        with _temporary_directory() as root:
+            checkpoint_dir = root / "checkpoints"
+            checkpoint_dir.mkdir()
+            final_path = checkpoint_dir / "final_model.pt"
+            final_path.write_bytes(b"final")
+            self.assertEqual(resolve_competition_checkpoint(root, "auto"), final_path)
+
+            best_path = checkpoint_dir / "best_model.pt"
+            best_path.write_bytes(b"best")
+            self.assertEqual(resolve_competition_checkpoint(root, "auto"), best_path)
+
     def test_scan_and_dataset_preserve_five_view_topology(self) -> None:
         with _temporary_directory() as root:
             _write_sample(root, "part_b", "S0002")

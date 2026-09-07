@@ -53,8 +53,10 @@ export HF_ENDPOINT=https://hf-mirror.com
 ```
 
 This is only a download endpoint override. No gated repository or task-specific
-checkpoint is required. The pipeline then trains its own lightweight adapter
-checkpoint at `outputs/.../zero_shot/checkpoints/final_model.pt`.
+checkpoint is required. The pipeline writes `last.pt` for resume,
+`final_model.pt` for the last step, and an EMA-loss-selected `best_model.pt`
+under `outputs/.../zero_shot_normalonly_stable/checkpoints/`. Inference uses the
+best model by default.
 
 ## Run
 
