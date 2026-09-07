@@ -152,13 +152,21 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 torch.zeros_like(foreground, dtype=torch.long),
             )
             patch_loss = F.cross_entropy(
-                output["class_logits"], patch_target
+                output["class_logits"],
+                patch_target,
+                label_smoothing=float(
+                    train_config.get("label_smoothing", 0.05)
+                ),
             )
             global_target = torch.ones(
                 images.shape[0], device=device, dtype=torch.long
             )
             image_loss = F.cross_entropy(
-                output["global_logits"], global_target
+                output["global_logits"],
+                global_target,
+                label_smoothing=float(
+                    train_config.get("label_smoothing", 0.05)
+                ),
             )
             margin = F.relu(
                 float(train_config.get("normal_margin", 1.0))
@@ -196,13 +204,17 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
         if step == 1 or step % int(train_config.get("log_every", 20)) == 0:
             logger.info(
                 "normal-only step %d/%d | loss %.5f | patch %.5f | "
-                "image %.5f | margin %.5f | lr %.3e | grad %.3f",
+                "image %.5f | margin %.5f | anomaly %.3e | "
+                "balance %.3e | diversity %.3e | lr %.3e | grad %.3e",
                 step,
                 total_steps,
                 loss.item(),
                 patch_loss.item(),
                 image_loss.item(),
                 margin.item(),
+                clean_loss.item(),
+                output["moe_balance_loss"].item(),
+                output["moe_diversity_loss"].item(),
                 lr,
                 float(grad_norm),
             )

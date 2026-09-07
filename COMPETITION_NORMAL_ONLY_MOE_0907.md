@@ -21,6 +21,9 @@ image -> frozen OpenCLIP multi-layer patches -> weighted layer fusion
 router、低秩升维、PAA 前的残差尺度、层权重和文本 adapter。训练损失为正常 patch
 三分类、正常图分类、normal-vs-broken margin、五视角状态一致性、router balance、
 expert diversity 和 prompt anchor。异常文本只作为语义负锚点。
+Patch 与图像分类使用 `0.05` label smoothing，避免只有正常正类时
+Softmax 过早饱和并造成不可见的小梯度；日志以科学计数法打印梯度、异常均值、
+router balance 和 expert diversity。
 
 ## Test_B 类别级评分
 

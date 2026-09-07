@@ -300,6 +300,7 @@ zero_shot:
     warmup_steps: 200
     min_lr_ratio: 0.1
     gradient_clip_norm: 1.0
+    label_smoothing: 0.05
     foreground_threshold: 0.45
     patch_normal_weight: 1.0
     image_normal_weight: 1.0
@@ -309,7 +310,7 @@ zero_shot:
     clean_weight: 0.1
     moe_balance_weight: 0.01
     moe_diversity_weight: 0.01
-    prompt_anchor_weight: 0.01
+    prompt_anchor_weight: 0.001
     log_every: 20
     checkpoint_every: 500
     auto_resume: true

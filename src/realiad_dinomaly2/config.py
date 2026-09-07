@@ -291,6 +291,13 @@ def _validate(config: dict[str, Any]) -> None:
                 zero_training["total_steps"]
             ):
                 raise ValueError("zero_shot warmup_steps must be below total_steps")
+            label_smoothing = float(
+                zero_training.get("label_smoothing", 0.0)
+            )
+            if not 0.0 <= label_smoothing < 1.0:
+                raise ValueError(
+                    "zero_shot.training.label_smoothing must be in [0, 1)"
+                )
             for key in (
                 "prototype_retain_ratio",
                 "normal_distance_quantile",
