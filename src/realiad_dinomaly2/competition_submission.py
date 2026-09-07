@@ -58,11 +58,12 @@ def resolve_competition_checkpoint(
     output_dir: Path,
     checkpoint: str,
 ) -> Path:
-    path = (
-        output_dir / "checkpoints" / "final_model.pt"
-        if checkpoint == "auto"
-        else Path(checkpoint).expanduser().resolve()
-    )
+    if checkpoint == "auto":
+        best = output_dir / "checkpoints" / "best_model.pt"
+        final = output_dir / "checkpoints" / "final_model.pt"
+        path = best if best.is_file() else final
+    else:
+        path = Path(checkpoint).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Competition checkpoint does not exist: {path}")
     return path.resolve()
@@ -482,10 +483,14 @@ def generate_competition_submission(
             "Checkpoint does not match the competition model/training config"
         )
     completed_steps = int(checkpoint_payload.get("completed_steps", -1))
+    training_completed_steps = int(
+        checkpoint_payload.get("training_completed_steps", completed_steps)
+    )
     total_steps = int(config["training"]["total_steps"])
-    if completed_steps != total_steps and not allow_partial:
+    if training_completed_steps != total_steps and not allow_partial:
         raise ValueError(
-            f"Checkpoint is partial ({completed_steps}/{total_steps}); "
+            "Checkpoint is partial "
+            f"({training_completed_steps}/{total_steps}); "
             "pass --allow-partial only for a diagnostic package"
         )
 

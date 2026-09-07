@@ -20,6 +20,7 @@ from .zero_shot_model import (
     trainable_zero_shot_state_dict,
     zero_shot_checkpoint_path,
     zero_shot_config_fingerprint,
+    zero_shot_final_checkpoint_path,
     zero_shot_last_checkpoint_path,
 )
 
@@ -60,11 +61,19 @@ def _payload(
     optimizer: torch.optim.Optimizer,
     config: dict[str, Any],
     completed_steps: int,
+    *,
+    best_metric: float,
+    best_step: int,
+    ema_loss: float | None,
 ) -> dict[str, Any]:
     return {
         "format_version": ZERO_SHOT_FORMAT_VERSION,
         "config_fingerprint": zero_shot_config_fingerprint(config),
         "completed_steps": completed_steps,
+        "best_metric": best_metric,
+        "best_step": best_step,
+        "ema_loss": ema_loss,
+        "selection": "minimum training-loss EMA after warmup",
         "model": trainable_zero_shot_state_dict(model),
         "optimizer": optimizer.state_dict(),
     }
@@ -122,7 +131,11 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
         betas=tuple(float(value) for value in train_config.get("adam_betas", [0.9, 0.999])),
     )
     last_path = zero_shot_last_checkpoint_path(config)
+    best_path = zero_shot_checkpoint_path(config)
     completed_steps = 0
+    best_metric = float("inf")
+    best_step = 0
+    ema_loss: float | None = None
     if resume != "never" and last_path.is_file():
         saved = torch.load(last_path, map_location="cpu", weights_only=False)
         if saved.get("config_fingerprint") != zero_shot_config_fingerprint(config):
@@ -130,6 +143,10 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
         load_trainable_zero_shot_state_dict(model, saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
         completed_steps = int(saved["completed_steps"])
+        best_metric = float(saved.get("best_metric", float("inf")))
+        best_step = int(saved.get("best_step", 0))
+        saved_ema = saved.get("ema_loss")
+        ema_loss = None if saved_ema is None else float(saved_ema)
         logger.info("恢复 zero-shot 训练：step=%d", completed_steps)
 
     total_steps = int(train_config["total_steps"])
@@ -217,6 +234,42 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
         if not torch.isfinite(grad_norm):
             raise FloatingPointError(f"non-finite zero-shot gradient at step={step}")
         optimizer.step()
+        loss_value = float(loss.detach())
+        ema_loss = (
+            loss_value
+            if ema_loss is None
+            else 0.98 * ema_loss + 0.02 * loss_value
+        )
+        best_start = max(
+            int(train_config.get("warmup_steps", 0)),
+            max(1, total_steps // 10),
+        )
+        best_check_every = int(train_config.get("log_every", 20))
+        if (
+            step >= best_start
+            and step % best_check_every == 0
+            and ema_loss < best_metric - 1e-4
+        ):
+            best_metric = ema_loss
+            best_step = step
+            atomic_torch_save(
+                best_path,
+                _payload(
+                    model,
+                    optimizer,
+                    config,
+                    step,
+                    best_metric=best_metric,
+                    best_step=best_step,
+                    ema_loss=ema_loss,
+                ),
+            )
+            logger.info(
+                "更新 zero-shot best：step=%d | ema_loss=%.6f | %s",
+                best_step,
+                best_metric,
+                best_path,
+            )
         if step == 1 or step % int(train_config.get("log_every", 20)) == 0:
             logger.info(
                 "zero-shot step %d/%d | loss %.5f | focal %.5f | "
@@ -232,10 +285,46 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 float(grad_norm),
             )
         if step % int(train_config.get("checkpoint_every", 500)) == 0:
-            atomic_torch_save(last_path, _payload(model, optimizer, config, step))
+            atomic_torch_save(
+                last_path,
+                _payload(
+                    model,
+                    optimizer,
+                    config,
+                    step,
+                    best_metric=best_metric,
+                    best_step=best_step,
+                    ema_loss=ema_loss,
+                ),
+            )
 
-    final_path = zero_shot_checkpoint_path(config)
-    atomic_torch_save(final_path, _payload(model, optimizer, config, total_steps))
-    atomic_torch_save(last_path, _payload(model, optimizer, config, total_steps))
-    logger.info("zero-shot 训练完成：%s", final_path)
-    return final_path
+    final_path = zero_shot_final_checkpoint_path(config)
+    final_payload = _payload(
+        model,
+        optimizer,
+        config,
+        total_steps,
+        best_metric=best_metric,
+        best_step=best_step,
+        ema_loss=ema_loss,
+    )
+    atomic_torch_save(final_path, final_payload)
+    atomic_torch_save(last_path, final_payload)
+    if not best_path.is_file():
+        best_metric = float(ema_loss) if ema_loss is not None else float("nan")
+        best_step = total_steps
+        final_payload["best_metric"] = best_metric
+        final_payload["best_step"] = best_step
+        final_payload["selection"] = "final fallback; no eligible EMA checkpoint"
+        atomic_torch_save(best_path, final_payload)
+    selected = torch.load(best_path, map_location="cpu", weights_only=False)
+    selected["training_completed_steps"] = total_steps
+    atomic_torch_save(best_path, selected)
+    logger.info(
+        "zero-shot 训练完成：final=%s | best=%s (step=%d, ema_loss=%.6f)",
+        final_path,
+        best_path,
+        best_step,
+        best_metric,
+    )
+    return best_path

@@ -695,6 +695,9 @@ def save_checkpoint(
     completed_steps: int,
     batch_choice: BatchChoice,
     rng_states: list[dict[str, Any]] | None = None,
+    best_metric: float = float("inf"),
+    best_step: int = 0,
+    ema_loss: float | None = None,
 ) -> None:
     multi_view_enabled, num_views, _ = _multi_view_settings(config)
     atomic_torch_save(
@@ -706,6 +709,10 @@ def save_checkpoint(
             "created_at": utc_now(),
             "config_fingerprint": config_fingerprint(config),
             "completed_steps": completed_steps,
+            "best_metric": best_metric,
+            "best_step": best_step,
+            "ema_loss": ema_loss,
+            "selection": "minimum logged training-loss EMA after warmup",
             "micro_batch_size": batch_choice.micro_batch_size,
             "accumulation_steps": batch_choice.accumulation_steps,
             "effective_batch_size": batch_choice.effective_batch_size,
@@ -753,6 +760,9 @@ def _save_checkpoint_for_all_ranks(
     completed_steps: int,
     batch_choice: BatchChoice,
     context: DistributedContext,
+    best_metric: float = float("inf"),
+    best_step: int = 0,
+    ema_loss: float | None = None,
 ) -> None:
     rng_states = _gather_rng_states(context)
     if context.is_primary:
@@ -765,6 +775,9 @@ def _save_checkpoint_for_all_ranks(
             completed_steps=completed_steps,
             batch_choice=batch_choice,
             rng_states=rng_states,
+            best_metric=best_metric,
+            best_step=best_step,
+            ema_loss=ema_loss,
         )
     _barrier(context)
 
@@ -784,6 +797,7 @@ def _resolve_resume(
             for path in (
                 checkpoint_dir / "last.pt",
                 checkpoint_dir / "final_model.pt",
+                checkpoint_dir / "best_model.pt",
             )
             if path.is_file()
         ]
@@ -1166,6 +1180,16 @@ def _train_impl(
             _restore_rng_state(checkpoint["rng_state"])
 
     total_steps = int(config["training"]["total_steps"])
+    best_metric = float(
+        checkpoint.get("best_metric", float("inf"))
+        if checkpoint is not None
+        else float("inf")
+    )
+    best_step = int(
+        checkpoint.get("best_step", 0) if checkpoint is not None else 0
+    )
+    saved_ema = checkpoint.get("ema_loss") if checkpoint is not None else None
+    ema_loss = None if saved_ema is None else float(saved_ema)
     if completed_steps > total_steps:
         raise ValueError(
             f"checkpoint 已完成 {completed_steps} 步，超过配置 {total_steps}"
@@ -1400,6 +1424,7 @@ def _train_impl(
                     scaler.update()
                     consecutive_skipped_steps = 0
                 completed_steps = step_index + 1
+                new_best = False
 
                 should_log = scheduled_log or skip_optimizer_step
                 if should_log:
@@ -1427,6 +1452,30 @@ def _train_impl(
                             accumulated_auxiliary.items()
                         )
                     }
+                    ema_loss = (
+                        mean_loss
+                        if ema_loss is None
+                        else 0.9 * ema_loss + 0.1 * mean_loss
+                    )
+                    best_start = max(
+                        int(
+                            config["training"]
+                            .get("scheduler", {})
+                            .get(
+                                "warmup_steps",
+                                config["training"].get("warmup_steps", 0),
+                            )
+                        ),
+                        max(1, total_steps // 10),
+                    )
+                    if (
+                        not skip_optimizer_step
+                        and completed_steps >= best_start
+                        and ema_loss < best_metric - 1e-4
+                    ):
+                        best_metric = ema_loss
+                        best_step = completed_steps
+                        new_best = True
                     now = time.perf_counter()
                     elapsed = now - started
                     mean_step_seconds = elapsed / max(
@@ -1536,6 +1585,26 @@ def _train_impl(
                         f"last pre-clip norm={grad_norm_value:.6g}"
                     )
 
+                if new_best:
+                    logger.info(
+                        "更新 best_model step=%d | ema_loss=%.6f",
+                        best_step,
+                        best_metric,
+                    )
+                    _save_checkpoint_for_all_ranks(
+                        checkpoint_dir / "best_model.pt",
+                        bundle=bundle,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        config=config,
+                        completed_steps=completed_steps,
+                        batch_choice=batch_choice,
+                        context=context,
+                        best_metric=best_metric,
+                        best_step=best_step,
+                        ema_loss=ema_loss,
+                    )
+
                 if (
                     completed_steps % checkpoint_every == 0
                     or completed_steps == total_steps
@@ -1550,6 +1619,9 @@ def _train_impl(
                         completed_steps=completed_steps,
                         batch_choice=batch_choice,
                         context=context,
+                        best_metric=best_metric,
+                        best_step=best_step,
+                        ema_loss=ema_loss,
                     )
         except KeyboardInterrupt:
             logger.warning("收到中断，正在保存可续跑断点")
@@ -1562,6 +1634,9 @@ def _train_impl(
                     config=config,
                     completed_steps=completed_steps,
                     batch_choice=batch_choice,
+                    best_metric=best_metric,
+                    best_step=best_step,
+                    ema_loss=ema_loss,
                 )
             state.update(
                 {
@@ -1599,6 +1674,10 @@ def _train_impl(
                 "created_at": utc_now(),
                 "config_fingerprint": config_fingerprint(config),
                 "completed_steps": total_steps,
+                "best_metric": best_metric,
+                "best_step": best_step,
+                "ema_loss": ema_loss,
+                "selection": "minimum logged training-loss EMA after warmup",
                 "scheduler": {
                     "completed_steps": total_steps,
                     "config": dict(config["training"].get("scheduler", {})),
@@ -1617,13 +1696,33 @@ def _train_impl(
                 ),
             },
         )
+        best_path = checkpoint_dir / "best_model.pt"
+        if not best_path.is_file():
+            fallback = torch.load(
+                final_path, map_location="cpu", weights_only=False
+            )
+            fallback["best_metric"] = (
+                float(ema_loss) if ema_loss is not None else float("nan")
+            )
+            fallback["best_step"] = total_steps
+            fallback["selection"] = (
+                "final fallback; no eligible EMA checkpoint"
+            )
+            atomic_torch_save(best_path, fallback)
+        selected = torch.load(
+            best_path, map_location="cpu", weights_only=False
+        )
+        selected["training_completed_steps"] = total_steps
+        atomic_torch_save(best_path, selected)
     _barrier(context)
     state.update(
         {
             "status": "trained",
             "updated_at": utc_now(),
             "completed_steps": total_steps,
-            "checkpoint": str(final_path),
+            "checkpoint": str(checkpoint_dir / "best_model.pt"),
+            "final_checkpoint": str(final_path),
+            "best_step": best_step,
             "next_action": "运行 evaluate.ps1 计算论文七项指标",
         }
     )
@@ -1635,10 +1734,16 @@ def _train_impl(
                 "timestamp": utc_now(),
                 "event": "training_complete",
                 "step": total_steps,
-                "checkpoint": str(final_path),
+                "checkpoint": str(checkpoint_dir / "best_model.pt"),
+                "final_checkpoint": str(final_path),
+                "best_step": best_step,
             },
         )
-    logger.info("训练完成：%s", final_path)
+    logger.info(
+        "训练完成：final=%s | inference_default=%s",
+        final_path,
+        checkpoint_dir / "best_model.pt",
+    )
     return state
 
 

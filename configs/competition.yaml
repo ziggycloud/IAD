@@ -233,7 +233,7 @@ zero_shot:
   enabled: true
   backend: adaptclip_inspired
   route: unseen_only
-  checkpoint: zero_shot_stable/checkpoints/final_model.pt
+  checkpoint: zero_shot_stable/checkpoints/best_model.pt
   model:
     model_name: ViT-L-14-336
     pretrained: openai

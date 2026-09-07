@@ -55,10 +55,11 @@ export HF_ENDPOINT=https://hf-mirror.com
 ```
 
 This is only a download endpoint override. No gated repository or task-specific
-checkpoint is required. The revised training run writes an isolated adapter
-checkpoint at `outputs/.../zero_shot_stable/checkpoints/final_model.pt`; the
-previous 8000-step checkpoint is not resumed because its loss/fusion semantics
-are incompatible.
+checkpoint is required. The revised training run writes `last.pt` for resume,
+`final_model.pt` for the last step, and an EMA-loss-selected `best_model.pt`
+under `outputs/.../zero_shot_stable/checkpoints/`. Inference uses the best model
+by default. The previous 8000-step checkpoint is not resumed because its
+loss/fusion semantics are incompatible.
 
 ## Run
 
