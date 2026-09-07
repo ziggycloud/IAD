@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -18,6 +19,9 @@ from realiad_dinomaly2.clip_semantic import (  # noqa: E402
     fuse_unseen_anomaly_map,
 )
 from realiad_dinomaly2.config import load_config  # noqa: E402
+from realiad_dinomaly2.zero_shot_model import (  # noqa: E402
+    PatchNormalityMoE,
+)
 from realiad_dinomaly2.zero_shot_model import (  # noqa: E402
     score_normal_only_category,
 )
@@ -160,6 +164,37 @@ class ClipCompetitionConfigTests(unittest.TestCase):
         after = clip_prior_config_fingerprint(config)
 
         self.assertNotEqual(before, after)
+
+
+class PatchNormalityMoETests(unittest.TestCase):
+    def test_mixed_precision_expert_updates_use_compatible_accumulator(self) -> None:
+        moe = PatchNormalityMoE(
+            width=16,
+            experts=2,
+            rank=4,
+            top_k=1,
+            residual_scale=0.1,
+        )
+        patches = torch.randn(2, 3, 3, 16, dtype=torch.bfloat16)
+        original_linear = torch.nn.functional.linear
+
+        def promoted_linear(input, weight, bias=None):
+            return original_linear(
+                input.float(),
+                weight.float(),
+                None if bias is None else bias.float(),
+            )
+
+        with mock.patch(
+            "realiad_dinomaly2.zero_shot_model.F.linear",
+            side_effect=promoted_linear,
+        ):
+            output, balance = moe(patches)
+
+        self.assertEqual(output.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(output).all())
+        (output.float().mean() + balance.float()).backward()
+        self.assertIsNotNone(moe.expert_up.grad)
 
 
 class NormalOnlyCategoryScoreTests(unittest.TestCase):

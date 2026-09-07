@@ -126,7 +126,11 @@ class PatchNormalityMoE(nn.Module):
         values, indices = routing.topk(self.top_k, dim=-1)
         values = values / values.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         gates = torch.zeros_like(routing).scatter(1, indices, values)
-        residual = torch.zeros_like(flat)
+        # CUDA autocast may keep CLIP patches in bfloat16 while promoting a
+        # sliced expert projection to float32. index_add_ requires an exact
+        # dtype match, so accumulate sparse expert updates in float32 and cast
+        # the completed residual back to the patch dtype once.
+        residual = torch.zeros_like(flat, dtype=torch.float32)
         for expert in range(self.experts):
             selected = torch.nonzero(
                 gates[:, expert] > 0, as_tuple=False
@@ -137,14 +141,16 @@ class PatchNormalityMoE(nn.Module):
                 F.linear(flat[selected], self.expert_down[expert])
             )
             update = F.linear(hidden, self.expert_up[expert])
-            residual.index_add_(
-                0, selected, update * gates[selected, expert, None]
-            )
+            source = (
+                update * gates[selected, expert, None]
+            ).to(dtype=residual.dtype)
+            residual.index_add_(0, selected, source)
         importance = routing.mean(dim=0)
         balance = importance.var(unbiased=False) / importance.mean().square().clamp_min(1e-6)
-        return (
-            flat + self.residual_scale * residual
-        ).reshape(shape), balance
+        mixed = (
+            flat.float() + self.residual_scale.float() * residual
+        ).to(dtype=patches.dtype)
+        return mixed.reshape(shape), balance
 
     def diversity_loss(self) -> torch.Tensor:
         vectors = F.normalize(
