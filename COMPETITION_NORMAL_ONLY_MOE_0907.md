@@ -49,5 +49,5 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   --test-b
 ```
 
-权重写入独立的 `zero_shot_normalonly/checkpoints`，不会误读 0907 的旧异常监督
-checkpoint；格式版本也已经升级为 3。
+权重写入独立的 `zero_shot_normalonly_stable/checkpoints`，不会误读 0907 的旧异常
+监督 checkpoint 或 label-smoothing 前的 normal-only checkpoint；格式版本为 3。
