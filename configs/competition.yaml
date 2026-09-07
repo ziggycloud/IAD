@@ -1,7 +1,7 @@
 experiment:
-  name: multiview_generalized_dinomaly_clip_0906
+  name: multiview_generalized_dinomaly_zeroshot_0907
   # Keep this run separate: scheduler/optimizer semantics are checkpoint-bound.
-  output_dir: outputs/multiview_generalized_dinomaly_clip_0906
+  output_dir: outputs/multiview_generalized_dinomaly_zeroshot_0907
   seed: 20260830
 
 dataset:
@@ -141,10 +141,10 @@ evaluation:
     eps: 1.0e-6
     batch_size: 2
     num_workers: 4
-  # Frozen CLIP is an inference-only semantic residual for categories that are
-  # absent from Train. Seen categories retain the exact multiview DINO path.
+  # Legacy inference-only fusion is disabled. The trained independent branch
+  # below owns every category absent from Train.
   unseen_clip:
-    enabled: true
+    enabled: false
     model_name: ViT-B-16
     pretrained: openai
     weights_dir: third_party/OpenCLIP/weights
@@ -226,6 +226,82 @@ evaluation:
       - an industrial object with a bent pin or misaligned connector
       - an industrial object with foreign material, dirt, or contamination
       - an industrial object with an incorrect assembly or misplaced part
+
+# Stage 2 runs after the Dinomaly stage and only on rank 0. The CLIP backbone
+# stays frozen; synthetic masks train category-agnostic prompts, a residual
+# visual adapter and a dense decoder. Inference hard-routes unseen classes here.
+zero_shot:
+  enabled: true
+  route: unseen_only
+  checkpoint: zero_shot/checkpoints/final_model.pt
+  model:
+    model_name: ViT-B-16
+    pretrained: openai
+    weights_dir: third_party/OpenCLIP/weights
+    force_quick_gelu: true
+    image_size: 448
+    intermediate_layers: 4
+    intermediate_layer_weights: [0.1, 0.2, 0.3, 0.4]
+    semantic_temperature: 0.07
+    semantic_weight: 1.0
+    dense_weight: 1.0
+    adapter_hidden_dim: 256
+    decoder_hidden_dim: 128
+    dropout: 0.1
+    normal_prompts:
+      - an intact industrial object
+      - a flawless undamaged component
+      - a correctly assembled object with all parts present
+      - a clean uniform surface without defects
+      - a normal object with correct shape and alignment
+    broken_prompts:
+      - a broken industrial object
+      - a cracked fractured or split component
+      - a scratched abraded chipped or dented surface
+      - a component with missing displaced or incorrectly assembled parts
+      - an object with deformation bending or crushing
+      - an object with contamination stain glue debris or foreign material
+      - an object with corrosion burn discoloration or peeling coating
+      - a component with a blocked hole broken wire or bent connector
+      - an object with excess material porosity pits or unwanted holes
+      - a defective industrial component with a local anomaly
+  training:
+    # 8k updates x 10 views/update gives 80k varied supervised examples from
+    # only 5k normal views; a longer schedule tends to overfit synthetic cues.
+    total_steps: 8000
+    object_batch_size: 2
+    num_workers: 4
+    amp: true
+    amp_dtype: bfloat16
+    optimizer: adamw
+    learning_rate: 0.0002
+    weight_decay: 0.0001
+    adam_betas: [0.9, 0.999]
+    scheduler: cosine
+    warmup_steps: 400
+    min_lr_ratio: 0.05
+    gradient_clip_norm: 1.0
+    focal_gamma: 2.0
+    focal_weight: 1.0
+    dice_weight: 1.0
+    semantic_weight: 0.25
+    image_weight: 0.25
+    clean_weight: 0.2
+    prompt_anchor_weight: 0.01
+    image_top_ratio: 0.01
+    log_every: 20
+    checkpoint_every: 500
+    auto_resume: true
+  synthesis:
+    anomaly_probability: 0.75
+    hard_normal_probability: 0.5
+    scratch_probability: 0.35
+    min_area_ratio: 0.002
+    max_area_ratio: 0.18
+    alpha_min: 0.45
+    alpha_max: 0.95
+    feature_anomaly_probability: 0.5
+    feature_noise_std: 0.08
 
 submission:
   mask_size: 448

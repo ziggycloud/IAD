@@ -301,3 +301,7 @@ python run_competition_pipeline.py `
 [COMPETITION_TUNING.md](COMPETITION_TUNING.md)。本分支的 DINO + CLIP 融合边界、
 训练/推理阶段和恢复规则见
 [COMPETITION_CLIP_0906.md](COMPETITION_CLIP_0906.md)。
+
+0907 分支进一步将 unseen 类改为独立、经过合成缺陷像素监督训练的 zero-shot
+路径；架构、损失和启动命令见
+[COMPETITION_ZERO_SHOT_0907.md](COMPETITION_ZERO_SHOT_0907.md)。

@@ -41,6 +41,7 @@ from realiad_dinomaly2.clip_normal_prior import (  # noqa: E402
     fit_clip_normal_prior,
 )
 from realiad_dinomaly2.train_engine import train  # noqa: E402
+from realiad_dinomaly2.zero_shot_engine import train_zero_shot  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -313,6 +314,18 @@ def main() -> int:
         # torchrun workers stop here; rank 0 alone writes the shared package.
         if not is_primary:
             return 0
+        if not args.skip_train and bool(
+            config.get("zero_shot", {}).get("enabled", False)
+        ):
+            _write_state(
+                output_dir,
+                status="training_zero_shot",
+                next_action=(
+                    "Train the independent unseen-category segmenter from "
+                    "synthetic pixel masks."
+                ),
+            )
+            train_zero_shot(config, resume=args.resume)
         checkpoint_path = resolve_competition_checkpoint(
             output_dir,
             args.checkpoint,

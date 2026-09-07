@@ -48,6 +48,10 @@ from .runtime import (
     setup_seed,
     utc_now,
 )
+from .zero_shot_model import (
+    load_zero_shot_segmenter,
+    zero_shot_checkpoint_path,
+)
 
 
 def resolve_competition_checkpoint(
@@ -81,6 +85,7 @@ def _submission_signature(
     manifest: CompetitionManifest,
     *,
     unseen_clip_active: bool = False,
+    zero_shot_active: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     checkpoint_stat = checkpoint_path.stat()
     payload = {
@@ -114,6 +119,17 @@ def _submission_signature(
         payload["clip_normal_prior"] = {
             "path": str(clip_prior),
             "sha256": file_sha256(clip_prior),
+        }
+    if zero_shot_active:
+        zero_path = zero_shot_checkpoint_path(config)
+        if not zero_path.is_file():
+            raise FileNotFoundError(
+                f"Zero-shot checkpoint does not exist: {zero_path}"
+            )
+        payload["zero_shot"] = {
+            "config": config["zero_shot"],
+            "checkpoint": str(zero_path),
+            "sha256": file_sha256(zero_path),
         }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
@@ -410,15 +426,21 @@ def generate_competition_submission(
     )
     seen_categories = set(train_manifest.categories)
     unseen_categories = set(manifest.categories) - seen_categories
+    zero_shot_active = bool(
+        config.get("zero_shot", {}).get("enabled", False)
+    ) and bool(unseen_categories)
     clip_config = config["evaluation"].get("unseen_clip", {})
-    unseen_clip_active = bool(clip_config.get("enabled", False)) and bool(
-        unseen_categories
+    unseen_clip_active = (
+        not zero_shot_active
+        and bool(clip_config.get("enabled", False))
+        and bool(unseen_categories)
     )
     signature, signature_inputs = _submission_signature(
         config,
         checkpoint_path,
         manifest,
         unseen_clip_active=unseen_clip_active,
+        zero_shot_active=zero_shot_active,
     )
     run_dir = output_dir / "competition_submission" / signature[:12]
     submission_root = run_dir / "package"
@@ -485,6 +507,7 @@ def generate_competition_submission(
         )
     clip_prior = None
     clip_segmenter = None
+    zero_shot_segmenter = None
     if unseen_clip_active and bool(
         clip_config.get("normal_prior", {}).get("enabled", False)
     ):
@@ -533,15 +556,20 @@ def generate_competition_submission(
             continue
 
         category_uses_clip = unseen_clip_active and category in unseen_categories
+        category_uses_zero_shot = (
+            zero_shot_active and category in unseen_categories
+        )
+        if category_uses_zero_shot and zero_shot_segmenter is None:
+            zero_shot_segmenter = load_zero_shot_segmenter(config, device)
         if category_uses_clip and clip_segmenter is None:
             clip_segmenter = FrozenClipBrokenSegmenter(clip_config, device).eval()
         logger.info(
-            "[%d/%d] infer category %s (%d views, unseen_clip=%s)",
+            "[%d/%d] infer category %s (%d views, route=%s)",
             index,
             len(manifest.categories),
             category,
             len(category_views),
-            category_uses_clip,
+            "zero_shot" if category_uses_zero_shot else "dinomaly",
         )
         if multi_view_enabled:
             dataset = CompetitionObjectDataset(
@@ -575,6 +603,37 @@ def generate_competition_submission(
                 valid_view_mask = batch["valid_view_mask"].to(
                     device, non_blocking=True
                 )
+                if category_uses_zero_shot:
+                    assert zero_shot_segmenter is not None
+                    batch_size, view_count = images.shape[:2]
+                    flat_images = images.reshape(
+                        batch_size * view_count, *images.shape[2:]
+                    )
+                    current = zero_shot_segmenter(flat_images)["probability"]
+                    current = F.interpolate(
+                        current,
+                        size=(mask_size, mask_size),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).clamp(0.0, 1.0).reshape(
+                        batch_size, view_count, 1, mask_size, mask_size
+                    )
+                    group_folders = [
+                        str(value) for value in batch["group_folder"]
+                    ]
+                    uniform = np.full(
+                        view_count, 1.0 / view_count, dtype=np.float64
+                    )
+                    for batch_index, group_folder in enumerate(group_folders):
+                        visibility_by_group[group_folder] = uniform.copy()
+                        maps.extend(
+                            array
+                            for array in current[batch_index, :, 0]
+                            .cpu()
+                            .numpy()
+                            .astype(np.float32)
+                        )
+                    continue
                 category_names = [str(value) for value in batch["category"]]
                 with autocast_context(dtype, device):
                     (
@@ -716,6 +775,23 @@ def generate_competition_submission(
                     device,
                     non_blocking=bool(config["runtime"]["pin_memory"]),
                 )
+                if category_uses_zero_shot:
+                    assert zero_shot_segmenter is not None
+                    current = zero_shot_segmenter(images)["probability"]
+                    current = F.interpolate(
+                        current,
+                        size=(mask_size, mask_size),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).clamp(0.0, 1.0)
+                    maps.extend(
+                        array
+                        for array in current[:, 0]
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32)
+                    )
+                    continue
                 category_names = [str(value) for value in batch["category"]]
                 view_ids = batch["view_id"].to(device, dtype=torch.long)
                 valid_view_mask = torch.ones_like(view_ids, dtype=torch.bool)
@@ -806,9 +882,15 @@ def generate_competition_submission(
                 f"{len(maps)} != {len(category_views)}"
             )
 
-        lower, upper = _calibration_bounds(
-            maps, lower_quantile, upper_quantile
-        )
+        if category_uses_zero_shot:
+            # Learned probabilities share one absolute scale across unseen
+            # categories. Per-category stretching would turn harmless noise
+            # into bright false positives.
+            lower, upper = 0.0, 1.0
+        else:
+            lower, upper = _calibration_bounds(
+                maps, lower_quantile, upper_quantile
+            )
         grouped_maps: dict[str, list[np.ndarray]] = defaultdict(list)
         for view, current in zip(category_views, maps, strict=True):
             grouped_maps[view.group_folder].append(current)
@@ -838,7 +920,11 @@ def generate_competition_submission(
             rows.append(
                 {
                     "group_folder": group_folder,
-                    "anomaly_score": _probability_like_score(raw_score),
+                    "anomaly_score": (
+                        float(np.clip(raw_score, 0.0, 1.0))
+                        if category_uses_zero_shot
+                        else _probability_like_score(raw_score)
+                    ),
                     "raw_score": raw_score,
                 }
             )
@@ -849,6 +935,7 @@ def generate_competition_submission(
                 "completed_at": utc_now(),
                 "views": len(category_views),
                 "unseen_clip": category_uses_clip,
+                "route": "zero_shot" if category_uses_zero_shot else "dinomaly",
                 "calibration": {
                     "lower": lower,
                     "upper": upper,

@@ -121,14 +121,16 @@ class ClipNormalPriorTests(unittest.TestCase):
 
 
 class ClipCompetitionConfigTests(unittest.TestCase):
-    def test_new_competition_config_enables_both_priors(self) -> None:
+    def test_new_competition_config_uses_trained_zero_shot_route(self) -> None:
         config = load_config(ROOT / "configs" / "competition.yaml")
 
         self.assertTrue(config["model"]["multi_view"]["enabled"])
         self.assertTrue(config["evaluation"]["normal_prior"]["enabled"])
-        self.assertTrue(config["evaluation"]["unseen_clip"]["enabled"])
-        self.assertTrue(
-            config["evaluation"]["unseen_clip"]["normal_prior"]["enabled"]
+        self.assertFalse(config["evaluation"]["unseen_clip"]["enabled"])
+        self.assertTrue(config["zero_shot"]["enabled"])
+        self.assertEqual(config["zero_shot"]["route"], "unseen_only")
+        self.assertEqual(
+            config["zero_shot"]["training"]["scheduler"], "cosine"
         )
         self.assertEqual(
             config["evaluation"]["unseen_clip"][
