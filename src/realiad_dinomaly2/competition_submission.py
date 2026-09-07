@@ -121,12 +121,14 @@ def _submission_signature(
             "sha256": file_sha256(clip_prior),
         }
     if zero_shot_active:
+        backend = config["zero_shot"].get("backend", "synthetic")
         zero_path = zero_shot_checkpoint_path(config)
         if not zero_path.is_file():
             raise FileNotFoundError(
                 f"Zero-shot checkpoint does not exist: {zero_path}"
             )
         payload["zero_shot"] = {
+            "backend": backend,
             "config": config["zero_shot"],
             "checkpoint": str(zero_path),
             "sha256": file_sha256(zero_path),
@@ -588,6 +590,7 @@ def generate_competition_submission(
                 crop_size=int(dataset_config["crop_size"]),
             )
         maps: list[np.ndarray] = []
+        zero_view_scores: list[float] = []
         visibility_by_group: dict[str, np.ndarray] = {}
         for batch in _loader(dataset, config):
             # Use the dataset payload as the final source of truth. This keeps
@@ -609,7 +612,8 @@ def generate_competition_submission(
                     flat_images = images.reshape(
                         batch_size * view_count, *images.shape[2:]
                     )
-                    current = zero_shot_segmenter(flat_images)["probability"]
+                    zero_output = zero_shot_segmenter(flat_images)
+                    current = zero_output["probability"]
                     current = F.interpolate(
                         current,
                         size=(mask_size, mask_size),
@@ -632,6 +636,13 @@ def generate_competition_submission(
                             .cpu()
                             .numpy()
                             .astype(np.float32)
+                        )
+                    if "image_probability" in zero_output:
+                        zero_view_scores.extend(
+                            float(value)
+                            for value in zero_output["image_probability"]
+                            .cpu()
+                            .tolist()
                         )
                     continue
                 category_names = [str(value) for value in batch["category"]]
@@ -777,7 +788,8 @@ def generate_competition_submission(
                 )
                 if category_uses_zero_shot:
                     assert zero_shot_segmenter is not None
-                    current = zero_shot_segmenter(images)["probability"]
+                    zero_output = zero_shot_segmenter(images)
+                    current = zero_output["probability"]
                     current = F.interpolate(
                         current,
                         size=(mask_size, mask_size),
@@ -791,6 +803,13 @@ def generate_competition_submission(
                         .numpy()
                         .astype(np.float32)
                     )
+                    if "image_probability" in zero_output:
+                        zero_view_scores.extend(
+                            float(value)
+                            for value in zero_output["image_probability"]
+                            .cpu()
+                            .tolist()
+                        )
                     continue
                 category_names = [str(value) for value in batch["category"]]
                 view_ids = batch["view_id"].to(device, dtype=torch.long)
@@ -892,6 +911,7 @@ def generate_competition_submission(
                 maps, lower_quantile, upper_quantile
             )
         grouped_maps: dict[str, list[np.ndarray]] = defaultdict(list)
+        grouped_zero_scores: dict[str, list[float]] = defaultdict(list)
         for view, current in zip(category_views, maps, strict=True):
             grouped_maps[view.group_folder].append(current)
             _write_mask(
@@ -902,21 +922,40 @@ def generate_competition_submission(
                 lower,
                 upper,
             )
+        if zero_view_scores:
+            if len(zero_view_scores) != len(category_views):
+                raise RuntimeError("zero-shot image-score count mismatch")
+            for view, score in zip(
+                category_views, zero_view_scores, strict=True
+            ):
+                grouped_zero_scores[view.group_folder].append(score)
         rows = []
         for group_folder in dict.fromkeys(
             view.group_folder for view in category_views
         ):
-            raw_score = _aggregate_object_score(
-                grouped_maps[group_folder],
-                object_top_ratio,
-                mode=aggregation_mode,
-                visibility=visibility_by_group.get(
-                    group_folder,
-                    np.full(5, 0.2, dtype=np.float64),
-                ),
-                softmax_temperature=aggregation_temperature,
-                visibility_max_blend=visibility_max_blend,
-            )
+            if grouped_zero_scores:
+                # The per-view score already harmonically fuses visual,
+                # textual and maximum-local branches. Only five cameras
+                # remain to be combined here.
+                view_scores = np.asarray(
+                    grouped_zero_scores[group_folder], dtype=np.float64
+                )
+                raw_score = float(
+                    visibility_max_blend * view_scores.max()
+                    + (1.0 - visibility_max_blend) * view_scores.mean()
+                )
+            else:
+                raw_score = _aggregate_object_score(
+                    grouped_maps[group_folder],
+                    object_top_ratio,
+                    mode=aggregation_mode,
+                    visibility=visibility_by_group.get(
+                        group_folder,
+                        np.full(5, 0.2, dtype=np.float64),
+                    ),
+                    softmax_temperature=aggregation_temperature,
+                    visibility_max_blend=visibility_max_blend,
+                )
             rows.append(
                 {
                     "group_folder": group_folder,

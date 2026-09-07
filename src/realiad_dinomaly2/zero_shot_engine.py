@@ -158,6 +158,7 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 images,
                 feature_anomaly_mask=masks if use_feature_anomaly else None,
                 feature_noise_std=float(synthesis_config.get("feature_noise_std", 0.08)),
+                train_branch="visual" if step % 2 else "textual",
             )
             target = F.interpolate(
                 masks, size=output["logits"].shape[-2:], mode="area"
@@ -165,28 +166,8 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
             focal_gamma = float(train_config.get("focal_gamma", 2.0))
             focal = _focal_loss(output["logits"], target, focal_gamma)
             dice = _dice_loss(output["logits"], target)
-            semantic = _focal_loss(
-                output["semantic_logit"], target, focal_gamma
-            )
-            patch_count = (
-                output["probability"].shape[-1]
-                * output["probability"].shape[-2]
-            )
-            top_count = max(
-                1,
-                int(
-                    patch_count
-                    * float(train_config.get("image_top_ratio", 0.01))
-                ),
-            )
-            image_logits = (
-                output["logits"]
-                .flatten(1)
-                .topk(top_count, dim=1)
-                .values.mean(dim=1)
-            )
             image_loss = F.binary_cross_entropy_with_logits(
-                image_logits, labels
+                output["image_logits"], labels
             )
             clean = labels == 0
             clean_loss = (
@@ -194,11 +175,16 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 if clean.any()
                 else output["logits"].new_zeros(())
             )
-            anchor_loss = model.prompt_delta.square().mean()
+            # Keep AdaptCLIP-style alternating optimization strict: the text
+            # prompt is regularized only on textual-adapter updates.
+            anchor_loss = (
+                model.prompt_delta.square().mean()
+                if step % 2 == 0
+                else output["logits"].new_zeros(())
+            )
             loss = (
                 float(train_config.get("focal_weight", 1.0)) * focal
                 + float(train_config.get("dice_weight", 1.0)) * dice
-                + float(train_config.get("semantic_weight", 0.25)) * semantic
                 + float(train_config.get("image_weight", 0.25)) * image_loss
                 + float(train_config.get("clean_weight", 0.2)) * clean_loss
                 + float(train_config.get("prompt_anchor_weight", 0.01))

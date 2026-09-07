@@ -227,26 +227,23 @@ evaluation:
       - an industrial object with foreign material, dirt, or contamination
       - an industrial object with an incorrect assembly or misplaced part
 
-# Stage 2 runs after the Dinomaly stage and only on rank 0. The CLIP backbone
-# stays frozen; synthetic masks train category-agnostic prompts, a residual
-# visual adapter and a dense decoder. Inference hard-routes unseen classes here.
+# AdaptCLIP-inspired branch trained locally from public OpenAI CLIP base
+# weights. It never loads another anomaly model's task-specific checkpoint.
 zero_shot:
   enabled: true
+  backend: adaptclip_inspired
   route: unseen_only
   checkpoint: zero_shot/checkpoints/final_model.pt
   model:
-    model_name: ViT-B-16
+    model_name: ViT-L-14-336
     pretrained: openai
     weights_dir: third_party/OpenCLIP/weights
     force_quick_gelu: true
-    image_size: 448
+    image_size: 518
     intermediate_layers: 4
     intermediate_layer_weights: [0.1, 0.2, 0.3, 0.4]
     semantic_temperature: 0.07
-    semantic_weight: 1.0
-    dense_weight: 1.0
-    adapter_hidden_dim: 256
-    decoder_hidden_dim: 128
+    adapter_hidden_dim: 192
     dropout: 0.1
     normal_prompts:
       - an intact industrial object
@@ -266,8 +263,6 @@ zero_shot:
       - an object with excess material porosity pits or unwanted holes
       - a defective industrial component with a local anomaly
   training:
-    # 8k updates x 10 views/update gives 80k varied supervised examples from
-    # only 5k normal views; a longer schedule tends to overfit synthetic cues.
     total_steps: 8000
     object_batch_size: 2
     num_workers: 4
@@ -284,11 +279,9 @@ zero_shot:
     focal_gamma: 2.0
     focal_weight: 1.0
     dice_weight: 1.0
-    semantic_weight: 0.25
     image_weight: 0.25
     clean_weight: 0.2
     prompt_anchor_weight: 0.01
-    image_top_ratio: 0.01
     log_every: 20
     checkpoint_every: 500
     auto_resume: true

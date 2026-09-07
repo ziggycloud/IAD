@@ -130,6 +130,12 @@ class ClipCompetitionConfigTests(unittest.TestCase):
         self.assertTrue(config["zero_shot"]["enabled"])
         self.assertEqual(config["zero_shot"]["route"], "unseen_only")
         self.assertEqual(
+            config["zero_shot"]["backend"], "adaptclip_inspired"
+        )
+        self.assertEqual(
+            config["zero_shot"]["model"]["pretrained"], "openai"
+        )
+        self.assertEqual(
             config["zero_shot"]["training"]["scheduler"], "cosine"
         )
         self.assertEqual(

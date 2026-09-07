@@ -314,8 +314,11 @@ def main() -> int:
         # torchrun workers stop here; rank 0 alone writes the shared package.
         if not is_primary:
             return 0
-        if not args.skip_train and bool(
-            config.get("zero_shot", {}).get("enabled", False)
+        if (
+            not args.skip_train
+            and bool(config.get("zero_shot", {}).get("enabled", False))
+            and config["zero_shot"].get("backend", "synthetic")
+            in {"synthetic", "adaptclip_inspired"}
         ):
             _write_state(
                 output_dir,

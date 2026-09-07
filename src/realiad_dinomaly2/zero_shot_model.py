@@ -1,9 +1,7 @@
-"""Trainable, category-agnostic CLIP anomaly segmenter.
+"""Trainable category-agnostic anomaly path with a frozen public CLIP base.
 
-The CLIP backbone remains frozen.  Training updates only lightweight visual
-adapters, two object-agnostic normal/broken embeddings, and a dense decoder.
-This keeps CLIP's transferability while explicitly aligning local features to
-pixel masks instead of using raw CLIP similarity as post-processing.
+The local implementation borrows the dual-adapter and alternating-update idea
+from AdaptCLIP, without loading its code or anomaly-specific checkpoint.
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ from .config import resolve_path
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-ZERO_SHOT_FORMAT_VERSION = 1
+ZERO_SHOT_FORMAT_VERSION = 2
 
 
 def zero_shot_checkpoint_path(config: dict[str, Any]) -> Path:
@@ -110,8 +108,6 @@ class LearnedZeroShotSegmenter(nn.Module):
         self.semantic_temperature = float(
             model_config.get("semantic_temperature", 0.07)
         )
-        self.semantic_weight = float(model_config.get("semantic_weight", 1.0))
-        self.dense_weight = float(model_config.get("dense_weight", 1.0))
         model_name = str(model_config.get("model_name", "ViT-B-16"))
         pretrained = str(model_config.get("pretrained", "openai"))
         cache_dir = resolve_path(
@@ -196,31 +192,37 @@ class LearnedZeroShotSegmenter(nn.Module):
         self.layer_logits = nn.Parameter(weights.clamp_min(1e-6).log())
 
         adapter_hidden = int(model_config.get("adapter_hidden_dim", 256))
-        decoder_hidden = int(model_config.get("decoder_hidden_dim", 128))
         dropout = float(model_config.get("dropout", 0.1))
-        self.visual_adapter = nn.Sequential(
+        self.local_visual_adapter = nn.Sequential(
             nn.LayerNorm(text_dim, eps=1e-6),
             nn.Linear(text_dim, adapter_hidden),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(adapter_hidden, text_dim),
         )
-        self.dense_decoder = nn.Sequential(
-            nn.Conv2d(text_dim, decoder_hidden, kernel_size=3, padding=1),
-            nn.GroupNorm(8, decoder_hidden),
+        self.global_visual_adapter = nn.Sequential(
+            nn.LayerNorm(text_dim, eps=1e-6),
+            nn.Linear(text_dim, adapter_hidden),
             nn.GELU(),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(decoder_hidden, decoder_hidden // 2, kernel_size=3, padding=1),
-            nn.GroupNorm(8, decoder_hidden // 2),
-            nn.GELU(),
-            nn.Conv2d(decoder_hidden // 2, 1, kernel_size=1),
+            nn.Dropout(dropout),
+            nn.Linear(adapter_hidden, text_dim),
         )
-        # Start from CLIP semantics. The learned residual and dense decoder are
-        # initially neutral, avoiding a random full-frame anomaly map.
-        nn.init.zeros_(self.visual_adapter[-1].weight)
-        nn.init.zeros_(self.visual_adapter[-1].bias)
-        nn.init.zeros_(self.dense_decoder[-1].weight)
-        nn.init.zeros_(self.dense_decoder[-1].bias)
+        self.textual_adapter = nn.Sequential(
+            nn.LayerNorm(text_dim, eps=1e-6),
+            nn.Linear(text_dim, adapter_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(adapter_hidden, text_dim),
+        )
+        # All adapters start as identity residuals, preserving public CLIP's
+        # original embedding geometry before auxiliary anomaly training.
+        for adapter in (
+            self.local_visual_adapter,
+            self.global_visual_adapter,
+            self.textual_adapter,
+        ):
+            nn.init.zeros_(adapter[-1].weight)
+            nn.init.zeros_(adapter[-1].bias)
         self.to(device)
         self.clip.eval()
 
@@ -241,8 +243,17 @@ class LearnedZeroShotSegmenter(nn.Module):
 
     def learned_prompts(self) -> torch.Tensor:
         return F.normalize(
-            self.prompt_anchors + self.prompt_delta, dim=-1, eps=1e-6
+            self.prompt_anchors
+            + self.prompt_delta
+            + self.textual_adapter(self.prompt_anchors),
+            dim=-1,
+            eps=1e-6,
         )
+
+    @staticmethod
+    def _harmonic(values: list[torch.Tensor]) -> torch.Tensor:
+        stacked = torch.stack(values)
+        return len(values) / stacked.clamp_min(1e-6).reciprocal().sum(0)
 
     def _project_patches(self, feature: torch.Tensor) -> torch.Tensor:
         patches = feature.float().permute(0, 2, 3, 1)
@@ -295,6 +306,7 @@ class LearnedZeroShotSegmenter(nn.Module):
         *,
         feature_anomaly_mask: torch.Tensor | None = None,
         feature_noise_std: float = 0.0,
+        train_branch: str | None = None,
     ) -> dict[str, torch.Tensor]:
         projected_layers = torch.stack(
             [self._project_patches(feature) for feature in self._clip_features(images)],
@@ -315,23 +327,66 @@ class LearnedZeroShotSegmenter(nn.Module):
                 * feature_mask
                 * float(feature_noise_std)
             )
-        patches = F.normalize(
-            patches + self.visual_adapter(patches), dim=-1, eps=1e-6
+        global_feature = F.normalize(patches.mean(dim=(1, 2)), dim=-1, eps=1e-6)
+        visual_patches = F.normalize(
+            patches + self.local_visual_adapter(patches), dim=-1, eps=1e-6
         )
-        prompts = self.learned_prompts().to(patches.dtype)
-        prompt_logits = torch.einsum("bhwc,kc->bkhw", patches, prompts)
-        prompt_logits = prompt_logits / self.semantic_temperature
-        semantic_logit = prompt_logits[:, 1:2] - prompt_logits[:, 0:1]
-        dense_logit = self.dense_decoder(patches.permute(0, 3, 1, 2))
-        logits = (
-            self.semantic_weight * semantic_logit
-            + self.dense_weight * dense_logit
+        visual_global = F.normalize(
+            global_feature + self.global_visual_adapter(global_feature),
+            dim=-1,
+            eps=1e-6,
         )
+        static_prompts = self.prompt_anchors.to(patches.dtype)
+        learned_prompts = self.learned_prompts().to(patches.dtype)
+
+        visual_logits = torch.einsum(
+            "bhwc,kc->bkhw", visual_patches, static_prompts
+        ) / self.semantic_temperature
+        textual_logits = torch.einsum(
+            "bhwc,kc->bkhw", patches, learned_prompts
+        ) / self.semantic_temperature
+        visual_global_logits = torch.einsum(
+            "bc,kc->bk", visual_global, static_prompts
+        ) / self.semantic_temperature
+        textual_global_logits = torch.einsum(
+            "bc,kc->bk", global_feature, learned_prompts
+        ) / self.semantic_temperature
+
+        visual_probability = visual_logits.softmax(dim=1)[:, 1:2]
+        textual_probability = textual_logits.softmax(dim=1)[:, 1:2]
+        visual_image_probability = visual_global_logits.softmax(dim=1)[:, 1]
+        textual_image_probability = textual_global_logits.softmax(dim=1)[:, 1]
+        # AdaptCLIP's central result: visual and textual representations are
+        # optimized alternately, not jointly in one backward pass.
+        if train_branch == "visual":
+            textual_probability = textual_probability.detach()
+            textual_image_probability = textual_image_probability.detach()
+        elif train_branch == "textual":
+            visual_probability = visual_probability.detach()
+            visual_image_probability = visual_image_probability.detach()
+        elif train_branch not in {None, "visual", "textual"}:
+            raise ValueError(f"unsupported train_branch={train_branch!r}")
+
+        probability = self._harmonic(
+            [visual_probability, textual_probability]
+        ).clamp(1e-6, 1.0 - 1e-6)
+        logits = torch.logit(probability)
+        local_max = probability.flatten(1).amax(dim=1)
+        image_probability = self._harmonic(
+            [
+                visual_image_probability,
+                textual_image_probability,
+                local_max,
+            ]
+        ).clamp(1e-6, 1.0 - 1e-6)
         return {
             "logits": logits.float(),
-            "probability": logits.float().sigmoid(),
-            "prompt_logits": prompt_logits.float(),
-            "semantic_logit": semantic_logit.float(),
+            "probability": probability.float(),
+            "image_logits": torch.logit(image_probability).float(),
+            "image_probability": image_probability.float(),
+            "visual_logits": visual_logits.float(),
+            "textual_logits": textual_logits.float(),
+            "semantic_logit": logits.float(),
             "layer_weights": layer_weights.float(),
         }
 

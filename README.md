@@ -302,6 +302,6 @@ python run_competition_pipeline.py `
 训练/推理阶段和恢复规则见
 [COMPETITION_CLIP_0906.md](COMPETITION_CLIP_0906.md)。
 
-0907 分支进一步将 unseen 类改为独立、经过合成缺陷像素监督训练的 zero-shot
-路径；架构、损失和启动命令见
+0907 改进分支将 unseen 类硬路由到一个 AdaptCLIP 思路启发的独立分支；
+它只使用公开 OpenAI CLIP 基础权重，架构和启动命令见
 [COMPETITION_ZERO_SHOT_0907.md](COMPETITION_ZERO_SHOT_0907.md)。

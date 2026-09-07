@@ -239,6 +239,11 @@ def _validate(config: dict[str, Any]) -> None:
     if not isinstance(zero_shot, dict):
         raise ValueError("zero_shot must be a mapping")
     if bool(zero_shot.get("enabled", False)):
+        backend = str(zero_shot.get("backend", "synthetic"))
+        if backend not in {"synthetic", "adaptclip_inspired"}:
+            raise ValueError(
+                "zero_shot.backend must be synthetic or adaptclip_inspired"
+            )
         if zero_shot.get("route", "unseen_only") != "unseen_only":
             raise ValueError("zero_shot.route currently supports unseen_only")
         zero_model = zero_shot.get("model", {})
@@ -251,49 +256,48 @@ def _validate(config: dict[str, Any]) -> None:
         ):
             if not isinstance(section, dict):
                 raise ValueError(f"zero_shot.{section_name} must be a mapping")
-        for key in ("model_name", "pretrained", "weights_dir"):
-            if not str(zero_model.get(key, "")).strip():
-                raise ValueError(f"zero_shot.model.{key} is required")
-        for key in ("normal_prompts", "broken_prompts"):
-            prompts = zero_model.get(key)
-            if not isinstance(prompts, list) or not prompts:
-                raise ValueError(f"zero_shot.model.{key} must be non-empty")
-        layers = int(zero_model.get("intermediate_layers", 4))
-        weights = zero_model.get("intermediate_layer_weights", [])
-        if layers <= 0 or not isinstance(weights, list) or len(weights) != layers:
-            raise ValueError(
-                "zero_shot.model.intermediate_layer_weights must match "
-                "intermediate_layers"
-            )
-        decoder_hidden = int(zero_model.get("decoder_hidden_dim", 128))
-        if decoder_hidden <= 0 or decoder_hidden % 16:
-            raise ValueError(
-                "zero_shot.model.decoder_hidden_dim must be positive and divisible by 16"
-            )
-        for key in ("total_steps", "object_batch_size", "checkpoint_every"):
-            if int(zero_training.get(key, 0)) <= 0:
-                raise ValueError(f"zero_shot.training.{key} must be positive")
-        if float(zero_training.get("learning_rate", 0.0)) <= 0:
-            raise ValueError("zero_shot.training.learning_rate must be positive")
-        if int(zero_training.get("warmup_steps", 0)) >= int(
-            zero_training["total_steps"]
-        ):
-            raise ValueError("zero_shot warmup_steps must be below total_steps")
-        for key in (
-            "anomaly_probability",
-            "hard_normal_probability",
-            "scratch_probability",
-            "feature_anomaly_probability",
-        ):
-            value = float(synthesis.get(key, 0.0))
-            if not 0.0 <= value <= 1.0:
-                raise ValueError(f"zero_shot.synthesis.{key} must be in [0, 1]")
-        min_area = float(synthesis.get("min_area_ratio", 0.0))
-        max_area = float(synthesis.get("max_area_ratio", 0.0))
-        if not 0.0 < min_area < max_area < 1.0:
-            raise ValueError(
-                "zero_shot synthesis area ratios must satisfy 0 < min < max < 1"
-            )
+        if backend in {"synthetic", "adaptclip_inspired"}:
+            for key in ("model_name", "pretrained", "weights_dir"):
+                if not str(zero_model.get(key, "")).strip():
+                    raise ValueError(f"zero_shot.model.{key} is required")
+            for key in ("normal_prompts", "broken_prompts"):
+                prompts = zero_model.get(key)
+                if not isinstance(prompts, list) or not prompts:
+                    raise ValueError(f"zero_shot.model.{key} must be non-empty")
+            layers = int(zero_model.get("intermediate_layers", 4))
+            weights = zero_model.get("intermediate_layer_weights", [])
+            if layers <= 0 or not isinstance(weights, list) or len(weights) != layers:
+                raise ValueError(
+                    "zero_shot.model.intermediate_layer_weights must match "
+                    "intermediate_layers"
+                )
+            for key in ("total_steps", "object_batch_size", "checkpoint_every"):
+                if int(zero_training.get(key, 0)) <= 0:
+                    raise ValueError(f"zero_shot.training.{key} must be positive")
+            if float(zero_training.get("learning_rate", 0.0)) <= 0:
+                raise ValueError("zero_shot.training.learning_rate must be positive")
+            if int(zero_training.get("warmup_steps", 0)) >= int(
+                zero_training["total_steps"]
+            ):
+                raise ValueError("zero_shot warmup_steps must be below total_steps")
+            for key in (
+                "anomaly_probability",
+                "hard_normal_probability",
+                "scratch_probability",
+                "feature_anomaly_probability",
+            ):
+                value = float(synthesis.get(key, 0.0))
+                if not 0.0 <= value <= 1.0:
+                    raise ValueError(
+                        f"zero_shot.synthesis.{key} must be in [0, 1]"
+                    )
+            min_area = float(synthesis.get("min_area_ratio", 0.0))
+            max_area = float(synthesis.get("max_area_ratio", 0.0))
+            if not 0.0 < min_area < max_area < 1.0:
+                raise ValueError(
+                    "zero_shot synthesis area ratios must satisfy "
+                    "0 < min < max < 1"
+                )
 
     evaluation = config["evaluation"]
     if not 0 < float(evaluation["image_top_ratio"]) <= 1:
