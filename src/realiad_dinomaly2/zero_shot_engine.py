@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader
 
 from .competition_data import CompetitionObjectDataset, scan_competition_split
 from .runtime import atomic_torch_save, resolve_device, setup_logger, setup_seed
-from .synthetic_anomaly import synthesize_defects
 from .zero_shot_model import (
     ZERO_SHOT_FORMAT_VERSION,
     LearnedZeroShotSegmenter,
@@ -22,20 +21,6 @@ from .zero_shot_model import (
     zero_shot_config_fingerprint,
     zero_shot_last_checkpoint_path,
 )
-
-
-def _focal_loss(logits: torch.Tensor, targets: torch.Tensor, gamma: float) -> torch.Tensor:
-    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-    probability = logits.sigmoid()
-    pt = probability * targets + (1.0 - probability) * (1.0 - targets)
-    return ((1.0 - pt).pow(gamma) * bce).mean()
-
-
-def _dice_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    probability = logits.sigmoid()
-    numerator = 2.0 * (probability * targets).flatten(1).sum(dim=1) + 1.0
-    denominator = (probability + targets).flatten(1).sum(dim=1) + 1.0
-    return (1.0 - numerator / denominator).mean()
 
 
 def _learning_rate(step: int, config: dict[str, Any]) -> float:
@@ -68,12 +53,11 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
     if not bool(config.get("zero_shot", {}).get("enabled", False)):
         return None
     train_config = config["zero_shot"]["training"]
-    synthesis_config = config["zero_shot"]["synthesis"]
     device = resolve_device(str(config["runtime"]["device"]))
     setup_seed(int(config["experiment"]["seed"]) + 907, False)
     logger = setup_logger(
         "zero_shot_training",
-        Path(config["experiment"]["output_dir"]) / "zero_shot" / "train.log",
+        zero_shot_checkpoint_path(config).parent.parent / "train.log",
     )
     manifest = scan_competition_split(
         Path(config["dataset"]["train_dir"]),
@@ -135,8 +119,14 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
         except StopIteration:
             iterator = iter(loader)
             batch = next(iterator)
-        images = batch["images"].flatten(0, 1).to(device, non_blocking=True)
-        images, masks, labels = synthesize_defects(images, synthesis_config)
+        object_images = batch["images"]
+        object_batch, view_count = object_images.shape[:2]
+        images = object_images.flatten(0, 1).to(device, non_blocking=True)
+        categories = [
+            str(category)
+            for category in batch["category"]
+            for _ in range(view_count)
+        ]
         lr = _learning_rate(step, train_config)
         for group in optimizer.param_groups:
             group["lr"] = lr
@@ -150,43 +140,48 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
             if requested_dtype in {"bf16", "bfloat16"}
             else torch.float16
         )
-        use_feature_anomaly = torch.rand(()).item() < float(
-            synthesis_config.get("feature_anomaly_probability", 0.5)
-        )
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            output = model(
-                images,
-                feature_anomaly_mask=masks if use_feature_anomaly else None,
-                feature_noise_std=float(synthesis_config.get("feature_noise_std", 0.08)),
-                train_branch="visual" if step % 2 else "textual",
+            output = model(images, categories=categories)
+            # The foreground target is an image-derived, detached background
+            # estimate. Every foreground patch and every image is normal;
+            # anomaly text acts only as a semantic negative anchor.
+            foreground = output["color_foreground_probability"].detach()[:, 0]
+            patch_target = torch.where(
+                foreground >= float(train_config.get("foreground_threshold", 0.45)),
+                torch.ones_like(foreground, dtype=torch.long),
+                torch.zeros_like(foreground, dtype=torch.long),
             )
-            target = F.interpolate(
-                masks, size=output["logits"].shape[-2:], mode="area"
-            ).clamp(0.0, 1.0)
-            focal_gamma = float(train_config.get("focal_gamma", 2.0))
-            focal = _focal_loss(output["logits"], target, focal_gamma)
-            dice = _dice_loss(output["logits"], target)
-            image_loss = F.binary_cross_entropy_with_logits(
-                output["image_logits"], labels
+            patch_loss = F.cross_entropy(
+                output["class_logits"], patch_target
             )
-            clean = labels == 0
-            clean_loss = (
-                output["probability"][clean].mean()
-                if clean.any()
-                else output["logits"].new_zeros(())
+            global_target = torch.ones(
+                images.shape[0], device=device, dtype=torch.long
             )
-            # Keep AdaptCLIP-style alternating optimization strict: the text
-            # prompt is regularized only on textual-adapter updates.
-            anchor_loss = (
-                model.prompt_delta.square().mean()
-                if step % 2 == 0
-                else output["logits"].new_zeros(())
+            image_loss = F.cross_entropy(
+                output["global_logits"], global_target
             )
+            margin = F.relu(
+                float(train_config.get("normal_margin", 1.0))
+                - output["global_logits"][:, 1]
+                + output["global_logits"][:, 2]
+            ).mean()
+            normal_probability = output["global_logits"].softmax(-1)[:, 1]
+            view_consistency = normal_probability.reshape(
+                object_batch, view_count
+            ).var(dim=1, unbiased=False).mean()
+            clean_loss = output["semantic_probability"].mean()
+            anchor_loss = model.prompt_delta.square().mean()
             loss = (
-                float(train_config.get("focal_weight", 1.0)) * focal
-                + float(train_config.get("dice_weight", 1.0)) * dice
-                + float(train_config.get("image_weight", 0.25)) * image_loss
-                + float(train_config.get("clean_weight", 0.2)) * clean_loss
+                float(train_config.get("patch_normal_weight", 1.0)) * patch_loss
+                + float(train_config.get("image_normal_weight", 1.0)) * image_loss
+                + float(train_config.get("normal_margin_weight", 0.25)) * margin
+                + float(train_config.get("view_consistency_weight", 0.1))
+                * view_consistency
+                + float(train_config.get("clean_weight", 0.1)) * clean_loss
+                + float(train_config.get("moe_balance_weight", 0.01))
+                * output["moe_balance_loss"]
+                + float(train_config.get("moe_diversity_weight", 0.01))
+                * output["moe_diversity_loss"]
                 + float(train_config.get("prompt_anchor_weight", 0.01))
                 * anchor_loss
             )
@@ -200,13 +195,14 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
         optimizer.step()
         if step == 1 or step % int(train_config.get("log_every", 20)) == 0:
             logger.info(
-                "zero-shot step %d/%d | loss %.5f | focal %.5f | "
-                "dice %.5f | lr %.3e | grad %.3f",
+                "normal-only step %d/%d | loss %.5f | patch %.5f | "
+                "image %.5f | margin %.5f | lr %.3e | grad %.3f",
                 step,
                 total_steps,
                 loss.item(),
-                focal.item(),
-                dice.item(),
+                patch_loss.item(),
+                image_loss.item(),
+                margin.item(),
                 lr,
                 float(grad_norm),
             )

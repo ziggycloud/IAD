@@ -317,15 +317,14 @@ def main() -> int:
         if (
             not args.skip_train
             and bool(config.get("zero_shot", {}).get("enabled", False))
-            and config["zero_shot"].get("backend", "synthetic")
-            in {"synthetic", "adaptclip_inspired"}
+            and config["zero_shot"].get("backend") == "normal_only_moe"
         ):
             _write_state(
                 output_dir,
                 status="training_zero_shot",
                 next_action=(
-                    "Train the independent unseen-category segmenter from "
-                    "synthetic pixel masks."
+                    "Train the independent unseen-category branch using "
+                    "normal images and semantic negative anchors."
                 ),
             )
             train_zero_shot(config, resume=args.resume)

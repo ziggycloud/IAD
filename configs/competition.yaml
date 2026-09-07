@@ -227,13 +227,14 @@ evaluation:
       - an industrial object with foreign material, dirt, or contamination
       - an industrial object with an incorrect assembly or misplaced part
 
-# AdaptCLIP-inspired branch trained locally from public OpenAI CLIP base
-# weights. It never loads another anomaly model's task-specific checkpoint.
+# Normal-only unseen branch. It uses no real/synthetic anomaly image, no
+# CutPaste, and no task-specific anomaly checkpoint. OpenCLIP downloads only
+# the public OpenAI base weights on first use (HF_ENDPOINT may point at a mirror).
 zero_shot:
   enabled: true
-  backend: adaptclip_inspired
+  backend: normal_only_moe
   route: unseen_only
-  checkpoint: zero_shot/checkpoints/final_model.pt
+  checkpoint: zero_shot_normalonly/checkpoints/final_model.pt
   model:
     model_name: ViT-L-14-336
     pretrained: openai
@@ -242,9 +243,19 @@ zero_shot:
     image_size: 518
     intermediate_layers: 4
     intermediate_layer_weights: [0.1, 0.2, 0.3, 0.4]
+    paa_scales: [1, 3, 5]
     semantic_temperature: 0.07
     adapter_hidden_dim: 192
     dropout: 0.1
+    moe_num_experts: 4
+    moe_top_k: 2
+    moe_rank: 32
+    moe_residual_scale: 0.1
+    prototype_dim: 64
+    background_prompts:
+      - the background outside an inspected object
+      - an empty surrounding area without the product
+      - an irrelevant background region
     normal_prompts:
       - an intact industrial object
       - a flawless undamaged component
@@ -262,39 +273,59 @@ zero_shot:
       - a component with a blocked hole broken wire or bent connector
       - an object with excess material porosity pits or unwanted holes
       - a defective industrial component with a local anomaly
+    class_background_prompts:
+      - background outside the {class_name}
+      - surrounding area not belonging to the {class_name}
+    class_normal_prompts:
+      - a normal {class_name}
+      - an intact undamaged {class_name}
+      - a correctly assembled {class_name}
+      - a flawless {class_name} with all parts present
+    class_broken_prompts:
+      - a broken {class_name}
+      - a damaged defective {class_name}
+      - a {class_name} with a crack scratch dent or contamination
+      - a {class_name} with a missing displaced or malformed part
   training:
-    total_steps: 8000
+    total_steps: 3000
     object_batch_size: 2
     num_workers: 4
     amp: true
     amp_dtype: bfloat16
     optimizer: adamw
-    learning_rate: 0.0002
+    learning_rate: 0.0001
     weight_decay: 0.0001
     adam_betas: [0.9, 0.999]
     scheduler: cosine
-    warmup_steps: 400
-    min_lr_ratio: 0.05
+    warmup_steps: 200
+    min_lr_ratio: 0.1
     gradient_clip_norm: 1.0
-    focal_gamma: 2.0
-    focal_weight: 1.0
-    dice_weight: 1.0
-    image_weight: 0.25
-    clean_weight: 0.2
+    foreground_threshold: 0.45
+    patch_normal_weight: 1.0
+    image_normal_weight: 1.0
+    normal_margin: 1.0
+    normal_margin_weight: 0.25
+    view_consistency_weight: 0.1
+    clean_weight: 0.1
+    moe_balance_weight: 0.01
+    moe_diversity_weight: 0.01
     prompt_anchor_weight: 0.01
     log_every: 20
     checkpoint_every: 500
     auto_resume: true
-  synthesis:
-    anomaly_probability: 0.75
-    hard_normal_probability: 0.5
-    scratch_probability: 0.35
-    min_area_ratio: 0.002
-    max_area_ratio: 0.18
-    alpha_min: 0.45
-    alpha_max: 0.95
-    feature_anomaly_probability: 0.5
-    feature_noise_std: 0.08
+  inference:
+    # For each unseen category and camera, retain the samples nearest to the
+    # robust category center as an unlabeled normal reference bank.
+    prototype_retain_ratio: 0.6
+    prototype_min_samples: 3
+    foreground_threshold: 0.35
+    normal_distance_quantile: 0.99
+    normal_semantic_quantile: 0.95
+    prototype_gain: 4.0
+    semantic_gain: 0.5
+    decision_bias: 3.0
+    foreground_power: 1.5
+    image_top_ratio: 0.01
 
 submission:
   mask_size: 448

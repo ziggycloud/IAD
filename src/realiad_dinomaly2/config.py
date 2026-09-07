@@ -240,27 +240,38 @@ def _validate(config: dict[str, Any]) -> None:
         raise ValueError("zero_shot must be a mapping")
     if bool(zero_shot.get("enabled", False)):
         backend = str(zero_shot.get("backend", "synthetic"))
-        if backend not in {"synthetic", "adaptclip_inspired"}:
+        if backend != "normal_only_moe":
             raise ValueError(
-                "zero_shot.backend must be synthetic or adaptclip_inspired"
+                "this branch requires zero_shot.backend=normal_only_moe"
             )
         if zero_shot.get("route", "unseen_only") != "unseen_only":
             raise ValueError("zero_shot.route currently supports unseen_only")
         zero_model = zero_shot.get("model", {})
         zero_training = zero_shot.get("training", {})
-        synthesis = zero_shot.get("synthesis", {})
-        for section_name, section in (
+        zero_inference = zero_shot.get("inference", {})
+        sections = [
             ("model", zero_model),
             ("training", zero_training),
-            ("synthesis", synthesis),
-        ):
+            ("inference", zero_inference),
+        ]
+        for section_name, section in sections:
             if not isinstance(section, dict):
                 raise ValueError(f"zero_shot.{section_name} must be a mapping")
-        if backend in {"synthetic", "adaptclip_inspired"}:
+        if backend == "normal_only_moe":
             for key in ("model_name", "pretrained", "weights_dir"):
                 if not str(zero_model.get(key, "")).strip():
                     raise ValueError(f"zero_shot.model.{key} is required")
-            for key in ("normal_prompts", "broken_prompts"):
+            prompt_keys = ["normal_prompts", "broken_prompts"]
+            if backend == "normal_only_moe":
+                prompt_keys.extend(
+                    [
+                        "background_prompts",
+                        "class_background_prompts",
+                        "class_normal_prompts",
+                        "class_broken_prompts",
+                    ]
+                )
+            for key in prompt_keys:
                 prompts = zero_model.get(key)
                 if not isinstance(prompts, list) or not prompts:
                     raise ValueError(f"zero_shot.model.{key} must be non-empty")
@@ -281,23 +292,16 @@ def _validate(config: dict[str, Any]) -> None:
             ):
                 raise ValueError("zero_shot warmup_steps must be below total_steps")
             for key in (
-                "anomaly_probability",
-                "hard_normal_probability",
-                "scratch_probability",
-                "feature_anomaly_probability",
+                "prototype_retain_ratio",
+                "normal_distance_quantile",
+                "normal_semantic_quantile",
+                "image_top_ratio",
             ):
-                value = float(synthesis.get(key, 0.0))
-                if not 0.0 <= value <= 1.0:
+                value = float(zero_inference.get(key, 0.0))
+                if not 0.0 < value <= 1.0:
                     raise ValueError(
-                        f"zero_shot.synthesis.{key} must be in [0, 1]"
+                        f"zero_shot.inference.{key} must be in (0, 1]"
                     )
-            min_area = float(synthesis.get("min_area_ratio", 0.0))
-            max_area = float(synthesis.get("max_area_ratio", 0.0))
-            if not 0.0 < min_area < max_area < 1.0:
-                raise ValueError(
-                    "zero_shot synthesis area ratios must satisfy "
-                    "0 < min < max < 1"
-                )
 
     evaluation = config["evaluation"]
     if not 0 < float(evaluation["image_top_ratio"]) <= 1:

@@ -256,10 +256,11 @@ python run_competition_pipeline.py --test-b --skip-train
 `visibility_aware` 同时保留 max 分量，避免单相机可见缺陷被软共识抹掉。
 
 Test_B 解压到 `data/competition/Test_B`。`--test-b` 会独立扫描其全部类别，不要求
-类别数、类别名称或每类样本数与 Train/Test_A 相同；Train 中不存在的类别先使用
-view-global DINO Normal Prior，再启用冻结 CLIP 语义残差。CLIP 的常见正常响应也只
-由 Train 正常图拟合为 view-global prior。显式 `--set` 参数优先于该预设，因此仍可
-覆盖 Test_B 路径或恢复严格的数据计数检查。Test_B 不参与训练和任何 prior 拟合。
+类别数、类别名称或每类样本数与 Train/Test_A 相同。Train 中不存在的类别硬路由到
+normal-only CLIP Patch-MoE 分支：按文件夹类名生成提示词，并在推理时按类别/相机从
+无标签 Test_B 特征稳健估计正常原型。Test_B 不参与梯度训练、不读取标签，但同类图像
+会用于 transductive inference；若比赛规则禁止测试集内部统计，应关闭该路由。
+显式 `--set` 参数优先于该预设，因此仍可覆盖 Test_B 路径或恢复严格的数据计数检查。
 下载使用天池提供的临时 STS 凭证，凭证只通过 `ossutil` 命令传入，不要写入 YAML、
 脚本或 Git；`Test_B.zip` 和 ossutil 断点目录均已被 `.gitignore` 排除。
 
@@ -302,6 +303,6 @@ python run_competition_pipeline.py `
 训练/推理阶段和恢复规则见
 [COMPETITION_CLIP_0906.md](COMPETITION_CLIP_0906.md)。
 
-0907 改进分支将 unseen 类硬路由到一个 AdaptCLIP 思路启发的独立分支；
-它只使用公开 OpenAI CLIP 基础权重，架构和启动命令见
-[COMPETITION_ZERO_SHOT_0907.md](COMPETITION_ZERO_SHOT_0907.md)。
+本分支将 unseen 类硬路由到 normal-only Patch-MoE；它不使用真实或合成异常图、
+CutPaste 和异常任务 checkpoint，只加载公开 OpenAI CLIP 基础权重。结构和评分见
+[COMPETITION_NORMAL_ONLY_MOE_0907.md](COMPETITION_NORMAL_ONLY_MOE_0907.md)。

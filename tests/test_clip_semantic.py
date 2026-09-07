@@ -18,6 +18,9 @@ from realiad_dinomaly2.clip_semantic import (  # noqa: E402
     fuse_unseen_anomaly_map,
 )
 from realiad_dinomaly2.config import load_config  # noqa: E402
+from realiad_dinomaly2.zero_shot_model import (  # noqa: E402
+    score_normal_only_category,
+)
 
 
 def _fuse(
@@ -130,7 +133,7 @@ class ClipCompetitionConfigTests(unittest.TestCase):
         self.assertTrue(config["zero_shot"]["enabled"])
         self.assertEqual(config["zero_shot"]["route"], "unseen_only")
         self.assertEqual(
-            config["zero_shot"]["backend"], "adaptclip_inspired"
+            config["zero_shot"]["backend"], "normal_only_moe"
         )
         self.assertEqual(
             config["zero_shot"]["model"]["pretrained"], "openai"
@@ -138,6 +141,8 @@ class ClipCompetitionConfigTests(unittest.TestCase):
         self.assertEqual(
             config["zero_shot"]["training"]["scheduler"], "cosine"
         )
+        self.assertNotIn("synthesis", config["zero_shot"])
+        self.assertEqual(config["zero_shot"]["model"]["moe_top_k"], 2)
         self.assertEqual(
             config["evaluation"]["unseen_clip"][
                 "intermediate_layer_weights"
@@ -155,6 +160,48 @@ class ClipCompetitionConfigTests(unittest.TestCase):
         after = clip_prior_config_fingerprint(config)
 
         self.assertNotEqual(before, after)
+
+
+class NormalOnlyCategoryScoreTests(unittest.TestCase):
+    def test_robust_prototype_separates_outliers_and_suppresses_background(
+        self,
+    ) -> None:
+        features = torch.zeros(10, 2, 2, 2)
+        features[:8, ..., 0] = 1.0
+        features[8:, ..., 1] = 1.0
+        semantic = torch.full((10, 1, 2, 2), 0.05)
+        semantic[8:] = 0.9
+        foreground = torch.ones(10, 1, 2, 2)
+        foreground[:, :, 0, 0] = 0.0
+        config = {
+            "zero_shot": {
+                "inference": {
+                    "prototype_retain_ratio": 0.6,
+                    "prototype_min_samples": 3,
+                    "foreground_threshold": 0.35,
+                    "normal_distance_quantile": 0.99,
+                    "normal_semantic_quantile": 0.95,
+                    "prototype_gain": 4.0,
+                    "semantic_gain": 0.5,
+                    "decision_bias": 3.0,
+                    "foreground_power": 1.5,
+                    "image_top_ratio": 0.25,
+                }
+            }
+        }
+
+        maps, scores = score_normal_only_category(
+            features,
+            semantic,
+            foreground,
+            torch.zeros(10, dtype=torch.long),
+            config,
+        )
+
+        self.assertLess(float(maps[:8].mean()), 0.06)
+        self.assertGreater(float(maps[8:, :, 1:, :].mean()), 0.9)
+        self.assertEqual(float(maps[:, :, 0, 0].max()), 0.0)
+        self.assertGreater(float(scores[8:].mean()), float(scores[:8].mean()))
 
 
 if __name__ == "__main__":

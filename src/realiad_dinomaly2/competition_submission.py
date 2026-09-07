@@ -50,6 +50,7 @@ from .runtime import (
 )
 from .zero_shot_model import (
     load_zero_shot_segmenter,
+    score_normal_only_category,
     zero_shot_checkpoint_path,
 )
 
@@ -591,6 +592,10 @@ def generate_competition_submission(
             )
         maps: list[np.ndarray] = []
         zero_view_scores: list[float] = []
+        zero_normal_features: list[torch.Tensor] = []
+        zero_semantic: list[torch.Tensor] = []
+        zero_foreground: list[torch.Tensor] = []
+        zero_view_ids: list[torch.Tensor] = []
         visibility_by_group: dict[str, np.ndarray] = {}
         for batch in _loader(dataset, config):
             # Use the dataset payload as the final source of truth. This keeps
@@ -612,16 +617,24 @@ def generate_competition_submission(
                     flat_images = images.reshape(
                         batch_size * view_count, *images.shape[2:]
                     )
-                    zero_output = zero_shot_segmenter(flat_images)
-                    current = zero_output["probability"]
-                    current = F.interpolate(
-                        current,
-                        size=(mask_size, mask_size),
-                        mode="bilinear",
-                        align_corners=False,
-                    ).clamp(0.0, 1.0).reshape(
-                        batch_size, view_count, 1, mask_size, mask_size
+                    flat_categories = [
+                        str(value)
+                        for value in batch["category"]
+                        for _ in range(view_count)
+                    ]
+                    zero_output = zero_shot_segmenter(
+                        flat_images, categories=flat_categories
                     )
+                    zero_normal_features.append(
+                        zero_output["normal_features"].half().cpu()
+                    )
+                    zero_semantic.append(
+                        zero_output["semantic_probability"].half().cpu()
+                    )
+                    zero_foreground.append(
+                        zero_output["foreground_probability"].half().cpu()
+                    )
+                    zero_view_ids.append(view_ids.reshape(-1).cpu())
                     group_folders = [
                         str(value) for value in batch["group_folder"]
                     ]
@@ -630,20 +643,6 @@ def generate_competition_submission(
                     )
                     for batch_index, group_folder in enumerate(group_folders):
                         visibility_by_group[group_folder] = uniform.copy()
-                        maps.extend(
-                            array
-                            for array in current[batch_index, :, 0]
-                            .cpu()
-                            .numpy()
-                            .astype(np.float32)
-                        )
-                    if "image_probability" in zero_output:
-                        zero_view_scores.extend(
-                            float(value)
-                            for value in zero_output["image_probability"]
-                            .cpu()
-                            .tolist()
-                        )
                     continue
                 category_names = [str(value) for value in batch["category"]]
                 with autocast_context(dtype, device):
@@ -788,28 +787,20 @@ def generate_competition_submission(
                 )
                 if category_uses_zero_shot:
                     assert zero_shot_segmenter is not None
-                    zero_output = zero_shot_segmenter(images)
-                    current = zero_output["probability"]
-                    current = F.interpolate(
-                        current,
-                        size=(mask_size, mask_size),
-                        mode="bilinear",
-                        align_corners=False,
-                    ).clamp(0.0, 1.0)
-                    maps.extend(
-                        array
-                        for array in current[:, 0]
-                        .cpu()
-                        .numpy()
-                        .astype(np.float32)
+                    categories = [str(value) for value in batch["category"]]
+                    zero_output = zero_shot_segmenter(
+                        images, categories=categories
                     )
-                    if "image_probability" in zero_output:
-                        zero_view_scores.extend(
-                            float(value)
-                            for value in zero_output["image_probability"]
-                            .cpu()
-                            .tolist()
-                        )
+                    zero_normal_features.append(
+                        zero_output["normal_features"].half().cpu()
+                    )
+                    zero_semantic.append(
+                        zero_output["semantic_probability"].half().cpu()
+                    )
+                    zero_foreground.append(
+                        zero_output["foreground_probability"].half().cpu()
+                    )
+                    zero_view_ids.append(batch["view_id"].cpu())
                     continue
                 category_names = [str(value) for value in batch["category"]]
                 view_ids = batch["view_id"].to(device, dtype=torch.long)
@@ -895,6 +886,26 @@ def generate_competition_submission(
                     array
                     for array in current[:, 0].cpu().numpy().astype(np.float32)
                 )
+        if category_uses_zero_shot:
+            low_resolution_maps, image_scores = score_normal_only_category(
+                torch.cat(zero_normal_features),
+                torch.cat(zero_semantic),
+                torch.cat(zero_foreground),
+                torch.cat(zero_view_ids),
+                config,
+            )
+            current = F.interpolate(
+                low_resolution_maps.float(),
+                size=(mask_size, mask_size),
+                mode="bilinear",
+                align_corners=False,
+            ).clamp(0, 1)
+            maps = [
+                value for value in current[:, 0].numpy().astype(np.float32)
+            ]
+            zero_view_scores = [
+                float(value) for value in image_scores.tolist()
+            ]
         if len(maps) != len(category_views):
             raise RuntimeError(
                 f"Inference count mismatch for {category}: "
