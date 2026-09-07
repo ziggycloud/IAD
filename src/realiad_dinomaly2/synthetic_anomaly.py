@@ -56,8 +56,14 @@ def _blob_mask(
         noise, size=(height, width), mode="bicubic", align_corners=False
     )
     area = torch.empty(batch, device=device).uniform_(min_area, max_area)
-    threshold = noise.flatten(1).quantile(1.0 - area, dim=1)
-    return noise > threshold[:, None, None, None]
+    flattened = noise.flatten(1)
+    # torch.quantile does not pair a vector q with individual rows: for
+    # input [B, HW] and q [B] it returns [B, B]. Select each sample's own
+    # order statistic explicitly so the threshold remains [B, 1, 1, 1].
+    ordered = flattened.sort(dim=1).values
+    rank = ((1.0 - area) * (flattened.shape[1] - 1)).long()
+    threshold = ordered.gather(1, rank[:, None]).view(batch, 1, 1, 1)
+    return noise > threshold
 
 
 def _scratch_mask(
