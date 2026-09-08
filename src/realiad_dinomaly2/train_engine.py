@@ -979,6 +979,7 @@ def _train_impl(
         "dinomaly2_train", log_dir / "train.log", context.is_primary
     )
     progress_path = log_dir / "progress.jsonl"
+    testc_progress_path = log_dir / "training_progress.jsonl"
     state_path = output_dir / "run_state.json"
     if context.is_primary:
         dump_resolved_config(config, output_dir / "resolved_config.yaml")
@@ -1529,6 +1530,19 @@ def _train_impl(
                         "world_size": context.world_size,
                         "accumulation_steps": batch_choice.accumulation_steps,
                         "eta_seconds": eta_seconds,
+                        "mean_step_seconds": mean_step_seconds,
+                        "objects_per_second": (
+                            batch_choice.effective_batch_size / mean_step_seconds
+                            if mean_step_seconds > 0
+                            else 0.0
+                        ),
+                        "views_per_second": (
+                            batch_choice.effective_batch_size
+                            * (num_views if multi_view_enabled else 1)
+                            / mean_step_seconds
+                            if mean_step_seconds > 0
+                            else 0.0
+                        ),
                     }
                     if device.type == "cuda":
                         payload["gpu_allocated_bytes"] = (
@@ -1539,6 +1553,7 @@ def _train_impl(
                         )
                     if context.is_primary:
                         append_jsonl(progress_path, payload)
+                        append_jsonl(testc_progress_path, payload)
                     logger.info(
                         "step %d/%d | loss %.6f | lr %.3e | grad_preclip %.4f "
                         "| clipped_to %.4f | skipped %s | ETA %.1fh",

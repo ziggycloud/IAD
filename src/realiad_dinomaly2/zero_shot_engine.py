@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .competition_data import CompetitionObjectDataset, scan_competition_split
-from .runtime import atomic_torch_save, resolve_device, setup_logger, setup_seed
+from .runtime import (
+    append_jsonl,
+    atomic_torch_save,
+    resolve_device,
+    setup_logger,
+    setup_seed,
+    utc_now,
+)
 from .synthetic_anomaly import synthesize_defects
 from .zero_shot_model import (
     ZERO_SHOT_FORMAT_VERSION,
@@ -90,6 +98,7 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
         "zero_shot_training",
         zero_shot_checkpoint_path(config).parent.parent / "train.log",
     )
+    progress_path = Path(config["experiment"]["output_dir"]) / "logs" / "training_progress.jsonl"
     manifest = scan_competition_split(
         Path(config["dataset"]["train_dir"]),
         requested=config["dataset"]["categories"],
@@ -152,12 +161,16 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
     total_steps = int(train_config["total_steps"])
     iterator = iter(loader)
     model.train()
+    started = time.perf_counter()
+    objects_processed = 0
     for step in range(completed_steps + 1, total_steps + 1):
         try:
             batch = next(iterator)
         except StopIteration:
             iterator = iter(loader)
             batch = next(iterator)
+        object_batch = int(batch["images"].shape[0])
+        objects_processed += object_batch
         images = batch["images"].flatten(0, 1).to(device, non_blocking=True)
         images, masks, labels = synthesize_defects(images, synthesis_config)
         lr = _learning_rate(step, train_config)
@@ -271,6 +284,35 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 best_path,
             )
         if step == 1 or step % int(train_config.get("log_every", 20)) == 0:
+            elapsed = max(time.perf_counter() - started, 1e-9)
+            completed_this_run = step - completed_steps
+            mean_step_seconds = elapsed / max(1, completed_this_run)
+            progress = {
+                "timestamp": utc_now(),
+                "phase": "adaptclip_zero_shot",
+                "adapter_stage": train_branch,
+                "step": step,
+                "total_steps": total_steps,
+                "loss": loss_value,
+                "ema_loss": ema_loss,
+                "focal_loss": float(focal.detach()),
+                "dice_loss": float(dice.detach()),
+                "image_loss": float(image_loss.detach()),
+                "clean_loss": float(clean_loss.detach()),
+                "prompt_anchor_loss": float(anchor_loss.detach()),
+                "positive_fraction": float(positive.float().mean()),
+                "learning_rate": lr,
+                "grad_norm": float(grad_norm),
+                "gradient_clip_norm": float(train_config.get("gradient_clip_norm", 1.0)),
+                "mean_step_seconds": mean_step_seconds,
+                "objects_per_second": objects_processed / elapsed,
+                "views_per_second": objects_processed * 5 / elapsed,
+                "eta_seconds": max(0, total_steps - step) * mean_step_seconds,
+            }
+            if device.type == "cuda":
+                progress["gpu_allocated_bytes"] = torch.cuda.memory_allocated(device)
+                progress["gpu_reserved_bytes"] = torch.cuda.memory_reserved(device)
+            append_jsonl(progress_path, progress)
             logger.info(
                 "zero-shot step %d/%d | loss %.5f | focal %.5f | "
                 "dice %.5f | positive %.3f | branch %s | lr %.3e | grad %.3e",
