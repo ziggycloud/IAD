@@ -100,7 +100,11 @@ def _hard_normal_augment(rgb: torch.Tensor, probability: float) -> torch.Tensor:
     contrast = torch.empty(rgb.shape[0], 1, 1, 1, device=rgb.device).uniform_(0.75, 1.25)
     brightness = torch.empty(rgb.shape[0], 1, 1, 1, device=rgb.device).uniform_(-0.08, 0.08)
     changed = (output - 0.5) * contrast + 0.5 + brightness
-    changed = changed + torch.randn_like(changed) * 0.015
+    noise = torch.randn(
+        rgb.shape[0], 1, *rgb.shape[-2:],
+        device=rgb.device, dtype=rgb.dtype,
+    ).expand_as(rgb)
+    changed = changed + noise * 0.015
     return (output * (1.0 - selected) + changed * selected).clamp(0.0, 1.0)
 
 
@@ -112,6 +116,14 @@ def synthesize_defects(
     mean = normalized_images.new_tensor(_MEAN).view(1, 3, 1, 1)
     std = normalized_images.new_tensor(_STD).view(1, 3, 1, 1)
     rgb = (normalized_images.float() * std + mean).clamp(0.0, 1.0)
+    luminance = (
+        rgb[:, 0:1] * 0.299
+        + rgb[:, 1:2] * 0.587
+        + rgb[:, 2:3] * 0.114
+    )
+    # The whole unseen path is achromatic: synthesis cannot solve the task by
+    # detecting an artificial RGB hue that never appears in real defects.
+    rgb = luminance.expand(-1, 3, -1, -1).clone()
     batch, _, height, width = rgb.shape
     rgb = _hard_normal_augment(
         rgb, float(config.get("hard_normal_probability", 0.5))
@@ -135,20 +147,26 @@ def synthesize_defects(
     )
     mask &= anomalous
 
-    # Mix four defect families: foreign texture, discoloration, missing
-    # material and displaced material. They deliberately avoid class names.
+    # Good-only pseudo defects: cross-image texture paste, local luminance
+    # inversion, missing material, displaced structure and local blur.
+    # Every source comes from the current good batch or a conventional filter.
     texture = torch.roll(rgb, shifts=1, dims=0)
-    colour = torch.rand(batch, 3, 1, 1, device=rgb.device)
-    border_colour = torch.cat(
+    local_mean = F.avg_pool2d(rgb, 31, stride=1, padding=15)
+    inversion = (2.0 * local_mean - rgb).clamp(0.0, 1.0)
+    border_luminance = torch.cat(
         [rgb[:, :, 0, :], rgb[:, :, -1, :]], dim=-1
     ).median(dim=-1).values[:, :, None, None]
     shift_y = random.choice((-32, -16, 16, 32))
     shift_x = random.choice((-32, -16, 16, 32))
     displaced = torch.roll(rgb, shifts=(shift_y, shift_x), dims=(-2, -1))
-    modes = torch.randint(0, 4, (batch, 1, 1, 1), device=rgb.device)
-    source = torch.where(modes == 0, texture, colour.expand_as(rgb))
-    source = torch.where(modes == 2, border_colour.expand_as(rgb), source)
+    blurred = F.avg_pool2d(rgb, 15, stride=1, padding=7)
+    modes = torch.randint(0, 5, (batch, 1, 1, 1), device=rgb.device)
+    source = torch.where(modes == 0, texture, inversion)
+    source = torch.where(
+        modes == 2, border_luminance.expand_as(rgb), source
+    )
     source = torch.where(modes == 3, displaced, source)
+    source = torch.where(modes == 4, blurred, source)
     alpha = torch.empty(batch, 1, 1, 1, device=rgb.device).uniform_(
         float(config.get("alpha_min", 0.45)),
         float(config.get("alpha_max", 0.95)),

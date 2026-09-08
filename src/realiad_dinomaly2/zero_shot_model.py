@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Sequence
@@ -21,7 +23,7 @@ from .config import resolve_path
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-ZERO_SHOT_FORMAT_VERSION = 3
+ZERO_SHOT_FORMAT_VERSION = 4
 
 
 def zero_shot_checkpoint_path(config: dict[str, Any]) -> Path:
@@ -85,11 +87,64 @@ def _prompt_list(value: Any, name: str) -> tuple[str, ...]:
     return prompts
 
 
+def readable_category(value: str) -> str:
+    name = re.sub(r"[_\-]+", " ", str(value)).strip()
+    return re.sub(r"\s+", " ", name) or "industrial object"
+
+
+class PatchMoE(nn.Module):
+    """Small top-k patch experts; CLIP remains frozen."""
+
+    def __init__(self, width: int, experts: int, rank: int, top_k: int) -> None:
+        super().__init__()
+        if not 0 < top_k <= experts:
+            raise ValueError("moe_top_k must be in [1, moe_num_experts]")
+        self.experts = experts
+        self.top_k = top_k
+        self.router = nn.Linear(width, experts, bias=False)
+        self.down = nn.Parameter(torch.empty(experts, rank, width))
+        self.up = nn.Parameter(torch.zeros(experts, width, rank))
+        self.scale = nn.Parameter(torch.tensor(0.1))
+        nn.init.normal_(self.router.weight, std=1e-3)
+        nn.init.kaiming_uniform_(self.down, a=5 ** 0.5)
+
+    def forward(self, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = value.shape
+        flat = value.reshape(-1, shape[-1])
+        routing = self.router(flat.float()).softmax(-1)
+        weights, indices = routing.topk(self.top_k, dim=-1)
+        weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-6)
+        residual = torch.zeros_like(flat, dtype=torch.float32)
+        for expert in range(self.experts):
+            gate = (indices == expert).to(weights.dtype) * weights
+            gate = gate.sum(-1)
+            selected = torch.nonzero(gate > 0, as_tuple=False).flatten()
+            if selected.numel() == 0:
+                continue
+            hidden = F.gelu(F.linear(flat[selected].float(), self.down[expert]))
+            update = F.linear(hidden, self.up[expert])
+            residual.index_add_(0, selected, update * gate[selected, None])
+        importance = routing.mean(0)
+        balance = importance.var(unbiased=False) / importance.mean().square().clamp_min(1e-6)
+        mixed = flat.float() + self.scale.tanh() * residual
+        return F.normalize(mixed, dim=-1, eps=1e-6).to(value.dtype).reshape(shape), balance
+
+    def diversity_loss(self) -> torch.Tensor:
+        vectors = F.normalize(self.up.flatten(1), dim=-1, eps=1e-6)
+        gram = vectors @ vectors.T
+        eye = torch.eye(self.experts, device=gram.device, dtype=gram.dtype)
+        return ((gram - eye) * (1.0 - eye)).square().mean()
+
+
 class LearnedZeroShotSegmenter(nn.Module):
     """Dense normal-vs-broken segmenter built around a frozen OpenCLIP ViT."""
 
     def __init__(self, config: dict[str, Any], device: torch.device) -> None:
         super().__init__()
+        model_config = config["zero_shot"]["model"]
+        hf_endpoint = str(model_config.get("hf_endpoint", "")).strip()
+        if hf_endpoint:
+            os.environ.setdefault("HF_ENDPOINT", hf_endpoint)
         try:
             import open_clip
         except ImportError as exc:
@@ -98,7 +153,6 @@ class LearnedZeroShotSegmenter(nn.Module):
                 "Run: pip install -r requirements.txt"
             ) from exc
 
-        model_config = config["zero_shot"]["model"]
         self.device_spec = device
         self.image_size = int(model_config.get("image_size", 448))
         self.intermediate_layers = int(
@@ -186,6 +240,23 @@ class LearnedZeroShotSegmenter(nn.Module):
         self.register_buffer("prompt_anchors", prompt_anchors, persistent=True)
         text_dim = int(prompt_anchors.shape[-1])
         self.prompt_delta = nn.Parameter(torch.zeros(2, text_dim))
+        self.class_prompt_templates = (
+            _prompt_list(
+                model_config.get(
+                    "class_normal_prompts",
+                    ["a normal {class_name}", "an intact {class_name}"],
+                ),
+                "class_normal_prompts",
+            ),
+            _prompt_list(
+                model_config.get(
+                    "class_broken_prompts",
+                    ["a broken {class_name}", "a defective {class_name}"],
+                ),
+                "class_broken_prompts",
+            ),
+        )
+        self._category_prompt_cache: dict[str, torch.Tensor] = {}
 
         configured_weights = model_config.get(
             "intermediate_layer_weights", [0.1, 0.2, 0.3, 0.4]
@@ -231,6 +302,27 @@ class LearnedZeroShotSegmenter(nn.Module):
         ):
             nn.init.zeros_(adapter[-1].weight)
             nn.init.zeros_(adapter[-1].bias)
+        self.patch_moe = PatchMoE(
+            text_dim,
+            experts=int(model_config.get("moe_num_experts", 4)),
+            rank=int(model_config.get("moe_rank", 16)),
+            top_k=int(model_config.get("moe_top_k", 2)),
+        )
+        self.register_buffer(
+            "calibration_fitted", torch.tensor(False), persistent=True
+        )
+        self.register_buffer(
+            "pixel_normal_threshold", torch.tensor(0.0), persistent=True
+        )
+        self.register_buffer(
+            "pixel_normal_scale", torch.tensor(1.0), persistent=True
+        )
+        self.register_buffer(
+            "image_normal_threshold", torch.tensor(0.0), persistent=True
+        )
+        self.register_buffer(
+            "image_normal_scale", torch.tensor(1.0), persistent=True
+        )
         self.to(device)
         self.clip.eval()
 
@@ -249,7 +341,61 @@ class LearnedZeroShotSegmenter(nn.Module):
     def trainable_parameters(self) -> list[nn.Parameter]:
         return [parameter for parameter in self.parameters() if parameter.requires_grad]
 
-    def learned_prompts(self) -> torch.Tensor:
+    @torch.no_grad()
+    def fit_normal_calibration(
+        self,
+        pixel_logits: torch.Tensor,
+        image_logits: torch.Tensor,
+        pixel_quantile: float = 0.995,
+        image_quantile: float = 0.95,
+    ) -> None:
+        pixels = pixel_logits.float().flatten()
+        images = image_logits.float().flatten()
+        self.pixel_normal_threshold.copy_(torch.quantile(pixels, pixel_quantile))
+        pixel_floor = torch.quantile(pixels, 0.90)
+        self.pixel_normal_scale.copy_(
+            (self.pixel_normal_threshold - pixel_floor).clamp_min(0.1)
+        )
+        self.image_normal_threshold.copy_(torch.quantile(images, image_quantile))
+        image_floor = torch.quantile(images, 0.50)
+        self.image_normal_scale.copy_(
+            (self.image_normal_threshold - image_floor).clamp_min(0.1)
+        )
+        self.calibration_fitted.fill_(True)
+
+    @torch.no_grad()
+    def _category_anchors(self, category: str) -> torch.Tensor:
+        key = readable_category(category)
+        cached = self._category_prompt_cache.get(key)
+        if cached is not None:
+            return cached
+        anchors = []
+        for generic, templates in zip(
+            self.prompt_anchors, self.class_prompt_templates, strict=True
+        ):
+            prompts = [
+                template.format(class_name=key) for template in templates
+            ]
+            class_anchor = self._encode_prompts(prompts).mean(0)
+            anchors.append(F.normalize(generic + class_anchor, dim=-1, eps=1e-6))
+        result = torch.stack(anchors)
+        self._category_prompt_cache[key] = result
+        return result
+
+    def learned_prompts(self, categories: Sequence[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        static = torch.stack(
+            [self._category_anchors(category) for category in categories]
+        )
+        learned = F.normalize(
+            static
+            + self.prompt_delta
+            + self.textual_adapter(static),
+            dim=-1,
+            eps=1e-6,
+        )
+        return static, learned
+
+    def generic_learned_prompts(self) -> torch.Tensor:
         return F.normalize(
             self.prompt_anchors
             + self.prompt_delta
@@ -276,6 +422,14 @@ class LearnedZeroShotSegmenter(nn.Module):
         rgb = (
             images.float() * self.imagenet_std + self.imagenet_mean
         ).clamp(0.0, 1.0)
+        # Remove absolute hue. The unseen branch learns luminance, contrast,
+        # edges and local structural inconsistency instead of class colours.
+        gray = (
+            rgb[:, 0:1] * 0.299
+            + rgb[:, 1:2] * 0.587
+            + rgb[:, 2:3] * 0.114
+        )
+        rgb = gray.expand(-1, 3, -1, -1)
         if rgb.shape[-2:] != (self.image_size, self.image_size):
             rgb = F.interpolate(
                 rgb,
@@ -310,7 +464,12 @@ class LearnedZeroShotSegmenter(nn.Module):
         feature_anomaly_mask: torch.Tensor | None = None,
         feature_noise_std: float = 0.0,
         train_branch: str | None = None,
+        categories: Sequence[str] | None = None,
     ) -> dict[str, torch.Tensor]:
+        if categories is None:
+            categories = ["industrial object"] * images.shape[0]
+        if len(categories) != images.shape[0]:
+            raise ValueError("categories length must match image batch")
         projected_layers = torch.stack(
             [self._project_patches(feature) for feature in self._clip_features(images)],
             dim=0,
@@ -330,6 +489,7 @@ class LearnedZeroShotSegmenter(nn.Module):
                 * feature_mask
                 * float(feature_noise_std)
             )
+        patches, moe_balance = self.patch_moe(patches)
         global_feature = F.normalize(patches.mean(dim=(1, 2)), dim=-1, eps=1e-6)
         visual_patches = F.normalize(
             patches + self.local_visual_adapter(patches), dim=-1, eps=1e-6
@@ -339,20 +499,21 @@ class LearnedZeroShotSegmenter(nn.Module):
             dim=-1,
             eps=1e-6,
         )
-        static_prompts = self.prompt_anchors.to(patches.dtype)
-        learned_prompts = self.learned_prompts().to(patches.dtype)
+        static_prompts, learned_prompts = self.learned_prompts(categories)
+        static_prompts = static_prompts.to(patches.dtype)
+        learned_prompts = learned_prompts.to(patches.dtype)
 
         visual_logits = torch.einsum(
-            "bhwc,kc->bkhw", visual_patches, static_prompts
+            "bhwc,bkc->bkhw", visual_patches, static_prompts
         ) / self.semantic_temperature
         textual_logits = torch.einsum(
-            "bhwc,kc->bkhw", patches, learned_prompts
+            "bhwc,bkc->bkhw", patches, learned_prompts
         ) / self.semantic_temperature
         visual_global_logits = torch.einsum(
-            "bc,kc->bk", visual_global, static_prompts
+            "bc,bkc->bk", visual_global, static_prompts
         ) / self.semantic_temperature
         textual_global_logits = torch.einsum(
-            "bc,kc->bk", global_feature, learned_prompts
+            "bc,bkc->bk", global_feature, learned_prompts
         ) / self.semantic_temperature
 
         visual_margin = visual_logits[:, 1:2] - visual_logits[:, 0:1]
@@ -378,8 +539,14 @@ class LearnedZeroShotSegmenter(nn.Module):
             self.visual_fusion_weight * visual_margin
             + (1.0 - self.visual_fusion_weight) * textual_margin
         )
+        raw_logits = logits
+        raw_probability = raw_logits.sigmoid().clamp(1e-6, 1.0 - 1e-6)
+        if not self.training and bool(self.calibration_fitted):
+            logits = (
+                logits - self.pixel_normal_threshold
+            ) / self.pixel_normal_scale
         probability = logits.sigmoid().clamp(1e-6, 1.0 - 1e-6)
-        flat = probability.flatten(1)
+        flat = raw_probability.flatten(1)
         top_count = max(1, int(round(flat.shape[1] * self.image_top_ratio)))
         local_probability = flat.topk(top_count, dim=1).values.mean(dim=1)
         local_logit = torch.logit(local_probability.clamp(1e-6, 1.0 - 1e-6))
@@ -387,16 +554,23 @@ class LearnedZeroShotSegmenter(nn.Module):
             self.visual_fusion_weight * visual_image_margin
             + (1.0 - self.visual_fusion_weight) * textual_image_margin
         )
-        image_logits = (
+        raw_image_logits = (
             (1.0 - self.image_local_weight) * global_margin
             + self.image_local_weight * local_logit
         )
+        image_logits = raw_image_logits
+        if not self.training and bool(self.calibration_fitted):
+            image_logits = (
+                image_logits - self.image_normal_threshold
+            ) / self.image_normal_scale
         image_probability = image_logits.sigmoid().clamp(1e-6, 1.0 - 1e-6)
         return {
             "logits": logits.float(),
             "probability": probability.float(),
             "image_logits": image_logits.float(),
             "image_probability": image_probability.float(),
+            "raw_logits": raw_logits.float(),
+            "raw_image_logits": raw_image_logits.float(),
             "visual_margin": visual_margin.float(),
             "textual_margin": textual_margin.float(),
             "visual_image_margin": visual_image_margin.float(),
@@ -405,6 +579,8 @@ class LearnedZeroShotSegmenter(nn.Module):
             "textual_logits": textual_logits.float(),
             "semantic_logit": logits.float(),
             "layer_weights": layer_weights.float(),
+            "moe_balance_loss": moe_balance.float(),
+            "moe_diversity_loss": self.patch_moe.diversity_loss().float(),
         }
 
 

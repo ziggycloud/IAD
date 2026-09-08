@@ -138,6 +138,13 @@ class ClipCompetitionConfigTests(unittest.TestCase):
         self.assertEqual(
             config["zero_shot"]["training"]["scheduler"], "cosine"
         )
+        self.assertEqual(config["zero_shot"]["model"]["moe_num_experts"], 4)
+        self.assertEqual(config["zero_shot"]["model"]["moe_top_k"], 2)
+        self.assertIn(
+            "{class_name}",
+            config["zero_shot"]["model"]["class_broken_prompts"][0],
+        )
+        self.assertNotIn("colour", config["zero_shot"]["synthesis"])
         self.assertEqual(
             config["evaluation"]["unseen_clip"][
                 "intermediate_layer_weights"

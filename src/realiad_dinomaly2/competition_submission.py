@@ -641,7 +641,14 @@ def generate_competition_submission(
                     flat_images = images.reshape(
                         batch_size * view_count, *images.shape[2:]
                     )
-                    zero_output = zero_shot_segmenter(flat_images)
+                    flat_categories = [
+                        str(value)
+                        for value in batch["category"]
+                        for _ in range(view_count)
+                    ]
+                    zero_output = zero_shot_segmenter(
+                        flat_images, categories=flat_categories
+                    )
                     current = zero_output["probability"]
                     current = F.interpolate(
                         current,
@@ -810,7 +817,12 @@ def generate_competition_submission(
                 )
                 if category_uses_zero_shot:
                     assert zero_shot_segmenter is not None
-                    zero_output = zero_shot_segmenter(images)
+                    zero_output = zero_shot_segmenter(
+                        images,
+                        categories=[
+                            str(value) for value in batch["category"]
+                        ],
+                    )
                     current = zero_output["probability"]
                     current = F.interpolate(
                         current,

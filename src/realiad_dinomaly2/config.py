@@ -260,7 +260,12 @@ def _validate(config: dict[str, Any]) -> None:
             for key in ("model_name", "pretrained", "weights_dir"):
                 if not str(zero_model.get(key, "")).strip():
                     raise ValueError(f"zero_shot.model.{key} is required")
-            for key in ("normal_prompts", "broken_prompts"):
+            prompt_keys = ["normal_prompts", "broken_prompts"]
+            if backend == "adaptclip_inspired":
+                prompt_keys.extend(
+                    ["class_normal_prompts", "class_broken_prompts"]
+                )
+            for key in prompt_keys:
                 prompts = zero_model.get(key)
                 if not isinstance(prompts, list) or not prompts:
                     raise ValueError(f"zero_shot.model.{key} must be non-empty")
@@ -281,6 +286,13 @@ def _validate(config: dict[str, Any]) -> None:
             ):
                 raise ValueError("zero_shot warmup_steps must be below total_steps")
             if backend == "adaptclip_inspired":
+                experts = int(zero_model.get("moe_num_experts", 0))
+                top_k = int(zero_model.get("moe_top_k", 0))
+                rank = int(zero_model.get("moe_rank", 0))
+                if experts <= 0 or rank <= 0 or not 0 < top_k <= experts:
+                    raise ValueError(
+                        "invalid zero_shot.model Patch-MoE configuration"
+                    )
                 for key in (
                     "visual_fusion_weight",
                     "image_local_weight",
@@ -296,6 +308,12 @@ def _validate(config: dict[str, Any]) -> None:
                 raise ValueError(
                     "zero_shot.training.focal_alpha must be in (0, 1)"
                 )
+            for key in ("pixel_normal_quantile", "image_normal_quantile"):
+                value = float(zero_training.get(key, 0.0))
+                if not 0.0 < value < 1.0:
+                    raise ValueError(
+                        f"zero_shot.training.{key} must be in (0, 1)"
+                    )
             for key in (
                 "anomaly_probability",
                 "hard_normal_probability",

@@ -2,7 +2,7 @@
 
 This branch keeps the trained Dinomaly path unchanged for categories present
 in `Train`. Categories absent from `Train` are hard-routed to an independent
-category-agnostic CLIP path.
+good-only CLIP path conditioned by the Test_B folder name.
 
 The implementation is inspired by AdaptCLIP's visual/textual adapters and
 alternating optimization, but it is a clean local implementation. It does not
@@ -16,13 +16,15 @@ The only external pretrained parameters are the public OpenAI CLIP
 category appeared in Train?
 ├─ yes -> existing five-view Dinomaly reconstruction path
 └─ no  -> locally trained unseen path
+         ├─ RGB -> luminance -> three repeated gray channels
          ├─ frozen public OpenAI CLIP ViT-L/14@336
          ├─ weighted fusion of the last four patch-feature layers
+         ├─ trainable four-expert top-2 patch MoE
          ├─ visual branch
          │  ├─ residual local visual adapter
          │  └─ residual global visual adapter
          ├─ textual branch
-         │  ├─ normal/broken prompt ensemble
+         │  ├─ generic + folder-class normal/broken prompt ensemble
          │  ├─ learned prompt residual
          │  └─ residual textual adapter
          ├─ weighted visual/textual pixel logits -> anomaly mask
@@ -38,6 +40,16 @@ frozen CLIP backbone remains unchanged throughout. Training supervision comes
 from defects synthesized from the competition's normal training views and
 includes pixel focal loss, Dice loss, image-level BCE, clean-image suppression
 and a prompt-anchor regularizer.
+
+No real anomalous image or external mask is required. Pseudo anomalies are
+made only from Train-good images using cross-image texture paste, local
+luminance inversion, background-valued missing material, spatial displacement,
+local blur and scratches/blobs. Random RGB colour blocks are not used. The
+same image pipeline supplies exact synthetic masks.
+
+After training, clean Train-good logits are used only to fit robust normal
+pixel/image quantiles. This gives unseen categories an absolute normal
+reference without reading Test_B labels or estimating a Test_B prototype.
 
 At inference, no Dinomaly/CLIP heatmap blending is performed for unseen
 categories. Five per-view image scores are aggregated as
@@ -57,7 +69,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 This is only a download endpoint override. No gated repository or task-specific
 checkpoint is required. The revised training run writes `last.pt` for resume,
 `final_model.pt` for the last step, and an EMA-loss-selected `best_model.pt`
-under `outputs/.../zero_shot_stable/checkpoints/`. Inference uses the best model
+under `outputs/.../zero_shot_gray_moe_goodonly/checkpoints/`. Inference uses the best model
 by default. The previous 8000-step checkpoint is not resumed because its
 loss/fusion semantics are incompatible.
 

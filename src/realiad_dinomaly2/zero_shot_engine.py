@@ -79,6 +79,41 @@ def _payload(
     }
 
 
+@torch.no_grad()
+def _fit_clean_calibration(
+    model: LearnedZeroShotSegmenter,
+    loader: DataLoader,
+    device: torch.device,
+    config: dict[str, Any],
+) -> None:
+    train_config = config["zero_shot"]["training"]
+    pixel_logits: list[torch.Tensor] = []
+    image_logits: list[torch.Tensor] = []
+    model.eval()
+    model.calibration_fitted.fill_(False)
+    for batch_index, batch in enumerate(loader):
+        if batch_index >= int(train_config.get("calibration_batches", 50)):
+            break
+        images = batch["images"].flatten(0, 1).to(device, non_blocking=True)
+        view_count = int(batch["images"].shape[1])
+        categories = [
+            str(category)
+            for category in batch["category"]
+            for _ in range(view_count)
+        ]
+        output = model(images, categories=categories)
+        pixel_logits.append(output["raw_logits"].float().cpu())
+        image_logits.append(output["raw_image_logits"].float().cpu())
+    if not pixel_logits:
+        raise RuntimeError("cannot fit zero-shot calibration from an empty loader")
+    model.fit_normal_calibration(
+        torch.cat(pixel_logits),
+        torch.cat(image_logits),
+        pixel_quantile=float(train_config.get("pixel_normal_quantile", 0.995)),
+        image_quantile=float(train_config.get("image_normal_quantile", 0.95)),
+    )
+
+
 def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None:
     if not bool(config.get("zero_shot", {}).get("enabled", False)):
         return None
@@ -159,6 +194,12 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
             iterator = iter(loader)
             batch = next(iterator)
         images = batch["images"].flatten(0, 1).to(device, non_blocking=True)
+        view_count = int(batch["images"].shape[1])
+        categories = [
+            str(category)
+            for category in batch["category"]
+            for _ in range(view_count)
+        ]
         images, masks, labels = synthesize_defects(images, synthesis_config)
         lr = _learning_rate(step, train_config)
         for group in optimizer.param_groups:
@@ -183,6 +224,7 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 feature_anomaly_mask=masks if use_feature_anomaly else None,
                 feature_noise_std=float(synthesis_config.get("feature_noise_std", 0.08)),
                 train_branch=train_branch,
+                categories=categories,
             )
             target = F.interpolate(
                 masks, size=output["logits"].shape[-2:], mode="area"
@@ -225,6 +267,10 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 + float(train_config.get("clean_weight", 0.2)) * clean_loss
                 + float(train_config.get("prompt_anchor_weight", 0.01))
                 * anchor_loss
+                + float(train_config.get("moe_balance_weight", 0.01))
+                * output["moe_balance_loss"]
+                + float(train_config.get("moe_diversity_weight", 0.01))
+                * output["moe_diversity_loss"]
             )
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -273,7 +319,8 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
         if step == 1 or step % int(train_config.get("log_every", 20)) == 0:
             logger.info(
                 "zero-shot step %d/%d | loss %.5f | focal %.5f | "
-                "dice %.5f | positive %.3f | branch %s | lr %.3e | grad %.3e",
+                "dice %.5f | positive %.3f | branch %s | balance %.3e | "
+                "diversity %.3e | lr %.3e | grad %.3e",
                 step,
                 total_steps,
                 loss.item(),
@@ -281,6 +328,8 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 dice.item(),
                 float(positive.float().mean()),
                 train_branch,
+                output["moe_balance_loss"].item(),
+                output["moe_diversity_loss"].item(),
                 lr,
                 float(grad_norm),
             )
@@ -318,7 +367,17 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
         final_payload["selection"] = "final fallback; no eligible EMA checkpoint"
         atomic_torch_save(best_path, final_payload)
     selected = torch.load(best_path, map_location="cpu", weights_only=False)
+    load_trainable_zero_shot_state_dict(model, selected["model"])
+    _fit_clean_calibration(model, loader, device, config)
+    selected["model"] = trainable_zero_shot_state_dict(model)
     selected["training_completed_steps"] = total_steps
+    selected["calibration"] = {
+        "source": "Train good images only",
+        "pixel_normal_threshold": float(model.pixel_normal_threshold),
+        "pixel_normal_scale": float(model.pixel_normal_scale),
+        "image_normal_threshold": float(model.image_normal_threshold),
+        "image_normal_scale": float(model.image_normal_scale),
+    }
     atomic_torch_save(best_path, selected)
     logger.info(
         "zero-shot 训练完成：final=%s | best=%s (step=%d, ema_loss=%.6f)",
