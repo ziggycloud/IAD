@@ -68,6 +68,11 @@ def benchmark_single_frame_latency(
     """
 
     # Keep the pure latency summary importable in lightweight environments.
+    from .competition_data import (
+        CompetitionFolderDataset,
+        CompetitionObjectDataset,
+        scan_competition_split,
+    )
     from .data import RealIADMultiViewDataset, RealIADVarietyDataset
     from .metrics import GaussianFilter, top_ratio_mean
     from .modeling import build_model, load_trainable_state_dict
@@ -91,42 +96,72 @@ def benchmark_single_frame_latency(
     dataset_config = config["dataset"]
     multi_view_config = dict(config["model"].get("multi_view", {}))
     multi_view_enabled = bool(multi_view_config.get("enabled", False))
-    common_args = {
-        "json_dir": Path(dataset_config["json_dir"]),
-        "image_dir": Path(dataset_config["image_dir"]),
-        "category": category,
-        "phase": "test",
-        "image_size": int(dataset_config["image_size"]),
-        "crop_size": int(dataset_config["crop_size"]),
-        "image_label_policy": str(dataset_config["image_label_policy"]),
-        "missing_anomaly_mask_policy": str(
-            dataset_config["missing_anomaly_mask_policy"]
-        ),
-        "mask_resize_semantics": str(
-            dataset_config.get(
-                "mask_resize_semantics",
-                "upstream_bilinear_nonzero",
-            )
-        ),
-    }
-    if multi_view_enabled:
-        dataset = RealIADMultiViewDataset(
-            **common_args,
-            num_views=int(multi_view_config.get("num_views", 5)),
-            missing_view_policy=str(
-                multi_view_config.get("missing_view_policy", "error")
-            ),
-            max_objects=1,
+    if dataset_config.get("type") == "competition_folders":
+        manifest = scan_competition_split(
+            Path(dataset_config["test_dir"]),
+            requested=[category],
         )
+        views = manifest.views_for_category(category)
+        if multi_view_enabled:
+            dataset = CompetitionObjectDataset(
+                views,
+                image_size=int(dataset_config["image_size"]),
+                crop_size=int(dataset_config["crop_size"]),
+                num_views=int(multi_view_config.get("num_views", 5)),
+                missing_view_policy=str(
+                    multi_view_config.get("missing_view_policy", "error")
+                ),
+            )
+        else:
+            dataset = CompetitionFolderDataset(
+                views,
+                image_size=int(dataset_config["image_size"]),
+                crop_size=int(dataset_config["crop_size"]),
+            )
     else:
-        dataset = RealIADVarietyDataset(**common_args, max_items=1)
+        common_args = {
+            "json_dir": Path(dataset_config["json_dir"]),
+            "image_dir": Path(dataset_config["image_dir"]),
+            "category": category,
+            "phase": "test",
+            "image_size": int(dataset_config["image_size"]),
+            "crop_size": int(dataset_config["crop_size"]),
+            "image_label_policy": str(dataset_config["image_label_policy"]),
+            "missing_anomaly_mask_policy": str(
+                dataset_config["missing_anomaly_mask_policy"]
+            ),
+            "mask_resize_semantics": str(
+                dataset_config.get(
+                    "mask_resize_semantics",
+                    "upstream_bilinear_nonzero",
+                )
+            ),
+        }
+        if multi_view_enabled:
+            dataset = RealIADMultiViewDataset(
+                **common_args,
+                num_views=int(multi_view_config.get("num_views", 5)),
+                missing_view_policy=str(
+                    multi_view_config.get("missing_view_policy", "error")
+                ),
+                max_objects=1,
+            )
+        else:
+            dataset = RealIADVarietyDataset(**common_args, max_items=1)
     sample = dataset[0]
     image_key = "images" if multi_view_enabled else "image"
     image = sample[image_key].unsqueeze(0).to(device)
     view_ids = (
         sample["view_ids"].unsqueeze(0).to(device)
         if multi_view_enabled
-        else torch.tensor([int(sample["view_id"]) - 1], device=device)
+        else torch.tensor(
+            [
+                int(sample["view_id"])
+                if dataset_type == "competition_folder"
+                else int(sample["view_id"]) - 1
+            ],
+            device=device,
+        )
     )
     valid_view_mask = (
         sample["valid_view_mask"].unsqueeze(0).to(device)

@@ -297,3 +297,29 @@ python run_competition_pipeline.py `
 
 分割边缘假阳性、五视角无监督建模、梯度爆炸诊断和 YAML 调参说明见
 [COMPETITION_TUNING.md](COMPETITION_TUNING.md)。
+
+## Test_C 本地真值评估
+
+`Test_C` 固定使用 `configs/testc_protocol.json` 中的 50 个 seen 与 50 个 unseen
+类别。它从 Real-IAD Variety JSON 的 `test` split 为每类确定性抽取 10 个正常、10
+个异常五视角对象；异常按 defect type 轮转分层。数据只用于评估，训练仍严格限定为
+比赛 `Train` 的 50 类 × 20 个 good 对象。
+
+```powershell
+# 实体复制数据并执行内置结构审计；同签名可断点续传
+python prepare_testc.py
+
+# 审计 → 训练/续训 → normal prior → 原提交路径推理 → 本地 GT 评分
+python run_testc_pipeline.py
+
+# 复用完整 checkpoint，仅推理和评分
+python run_testc_pipeline.py --skip-train --checkpoint auto
+
+# 比较两个或更多历史评估目录
+python compare_testc_runs.py <run1> <run2> --output comparison.csv
+```
+
+默认自动发现相邻 `UAD/data`，也可用 `--data-root`、`--source-root`、`--output`
+显式覆盖。评估直接复用比赛 submission predictor，因此 anomaly map、后处理与五视角
+object score 完全一致。输出包含运行签名、训练/eval JSONL、逐类 CSV/JSON、综合评分、
+性能诊断和模型登记记录；协议与实验记录见 [MODEL_EVOLUTION.md](MODEL_EVOLUTION.md)。
