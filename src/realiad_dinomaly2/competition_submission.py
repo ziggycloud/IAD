@@ -50,7 +50,6 @@ from .runtime import (
 )
 from .zero_shot_model import (
     load_zero_shot_segmenter,
-    score_normal_only_category,
     zero_shot_checkpoint_path,
 )
 
@@ -544,6 +543,7 @@ def generate_competition_submission(
         sigma=float(config["evaluation"]["gaussian_sigma"]),
     ).to(device)
     gaussian.eval()
+    moeclip_inference = config.get("zero_shot", {}).get("inference", {})
 
     all_rows: list[dict[str, Any]] = []
     for index, category in enumerate(manifest.categories, start=1):
@@ -597,10 +597,6 @@ def generate_competition_submission(
             )
         maps: list[np.ndarray] = []
         zero_view_scores: list[float] = []
-        zero_normal_features: list[torch.Tensor] = []
-        zero_semantic: list[torch.Tensor] = []
-        zero_foreground: list[torch.Tensor] = []
-        zero_view_ids: list[torch.Tensor] = []
         visibility_by_group: dict[str, np.ndarray] = {}
         for batch in _loader(dataset, config):
             # Use the dataset payload as the final source of truth. This keeps
@@ -630,16 +626,21 @@ def generate_competition_submission(
                     zero_output = zero_shot_segmenter(
                         flat_images, categories=flat_categories
                     )
-                    zero_normal_features.append(
-                        zero_output["normal_features"].half().cpu()
+                    current = F.interpolate(
+                        zero_output["probability"],
+                        size=(mask_size, mask_size),
+                        mode="bilinear",
+                        align_corners=False,
                     )
-                    zero_semantic.append(
-                        zero_output["semantic_probability"].half().cpu()
+                    current = current.float()
+                    maps.extend(
+                        value
+                        for value in current[:, 0].cpu().numpy().astype(np.float32)
                     )
-                    zero_foreground.append(
-                        zero_output["foreground_probability"].half().cpu()
+                    zero_view_scores.extend(
+                        float(value)
+                        for value in zero_output["image_score"].cpu().tolist()
                     )
-                    zero_view_ids.append(view_ids.reshape(-1).cpu())
                     group_folders = [
                         str(value) for value in batch["group_folder"]
                     ]
@@ -796,16 +797,21 @@ def generate_competition_submission(
                     zero_output = zero_shot_segmenter(
                         images, categories=categories
                     )
-                    zero_normal_features.append(
-                        zero_output["normal_features"].half().cpu()
+                    current = F.interpolate(
+                        zero_output["probability"],
+                        size=(mask_size, mask_size),
+                        mode="bilinear",
+                        align_corners=False,
                     )
-                    zero_semantic.append(
-                        zero_output["semantic_probability"].half().cpu()
+                    current = current.float()
+                    maps.extend(
+                        value
+                        for value in current[:, 0].cpu().numpy().astype(np.float32)
                     )
-                    zero_foreground.append(
-                        zero_output["foreground_probability"].half().cpu()
+                    zero_view_scores.extend(
+                        float(value)
+                        for value in zero_output["image_score"].cpu().tolist()
                     )
-                    zero_view_ids.append(batch["view_id"].cpu())
                     continue
                 category_names = [str(value) for value in batch["category"]]
                 view_ids = batch["view_id"].to(device, dtype=torch.long)
@@ -891,41 +897,30 @@ def generate_competition_submission(
                     array
                     for array in current[:, 0].cpu().numpy().astype(np.float32)
                 )
-        if category_uses_zero_shot:
-            low_resolution_maps, image_scores = score_normal_only_category(
-                torch.cat(zero_normal_features),
-                torch.cat(zero_semantic),
-                torch.cat(zero_foreground),
-                torch.cat(zero_view_ids),
-                config,
-            )
-            current = F.interpolate(
-                low_resolution_maps.float(),
-                size=(mask_size, mask_size),
-                mode="bilinear",
-                align_corners=False,
-            ).clamp(0, 1)
-            maps = [
-                value for value in current[:, 0].numpy().astype(np.float32)
-            ]
-            zero_view_scores = [
-                float(value) for value in image_scores.tolist()
-            ]
         if len(maps) != len(category_views):
             raise RuntimeError(
                 f"Inference count mismatch for {category}: "
                 f"{len(maps)} != {len(category_views)}"
             )
 
-        if category_uses_zero_shot:
-            # Learned probabilities share one absolute scale across unseen
-            # categories. Per-category stretching would turn harmless noise
-            # into bright false positives.
-            lower, upper = 0.0, 1.0
-        else:
-            lower, upper = _calibration_bounds(
-                maps, lower_quantile, upper_quantile
+        lower, upper = _calibration_bounds(
+            maps, lower_quantile, upper_quantile
+        )
+        if category_uses_zero_shot and zero_view_scores:
+            image_array = np.asarray(zero_view_scores, dtype=np.float64)
+            image_low = float(image_array.min())
+            image_high = float(image_array.max())
+            image_scaled = (
+                (image_array - image_low) / max(image_high - image_low, 1e-12)
             )
+            patch_scaled = np.asarray([
+                np.clip((value - lower) / max(upper - lower, 1e-12), 0.0, 1.0).max()
+                for value in maps
+            ])
+            blend = float(moeclip_inference.get("patch_image_blend", 0.5))
+            zero_view_scores = (
+                blend * patch_scaled + (1.0 - blend) * image_scaled
+            ).tolist()
         grouped_maps: dict[str, list[np.ndarray]] = defaultdict(list)
         grouped_zero_scores: dict[str, list[float]] = defaultdict(list)
         for view, current in zip(category_views, maps, strict=True):
@@ -950,9 +945,8 @@ def generate_competition_submission(
             view.group_folder for view in category_views
         ):
             if grouped_zero_scores:
-                # The per-view score already harmonically fuses visual,
-                # textual and maximum-local branches. Only five cameras
-                # remain to be combined here.
+                # Official industrial scoring already blends patch maximum
+                # and the learned image branch; combine the five views here.
                 view_scores = np.asarray(
                     grouped_zero_scores[group_folder], dtype=np.float64
                 )

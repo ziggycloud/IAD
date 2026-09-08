@@ -317,14 +317,14 @@ def main() -> int:
         if (
             not args.skip_train
             and bool(config.get("zero_shot", {}).get("enabled", False))
-            and config["zero_shot"].get("backend") == "normal_only_moe"
+            and config["zero_shot"].get("backend") == "moeclip_official"
         ):
             _write_state(
                 output_dir,
                 status="training_zero_shot",
                 next_action=(
-                    "Train the independent unseen-category branch using "
-                    "normal images and semantic negative anchors."
+                    "Train official MoECLIP adapters from the configured "
+                    "auxiliary real anomaly labels and pixel masks."
                 ),
             )
             train_zero_shot(config, resume=args.resume)

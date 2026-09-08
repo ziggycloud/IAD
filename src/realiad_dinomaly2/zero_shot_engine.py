@@ -1,8 +1,7 @@
-"""Second-stage training for the independent unseen-category path."""
+"""Supervised auxiliary-category training used by official MoECLIP."""
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Any
 
@@ -10,11 +9,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .competition_data import CompetitionObjectDataset, scan_competition_split
+from .moeclip_data import build_moeclip_auxiliary_dataset
 from .runtime import atomic_torch_save, resolve_device, setup_logger, setup_seed
 from .zero_shot_model import (
     ZERO_SHOT_FORMAT_VERSION,
-    LearnedZeroShotSegmenter,
+    MoECLIPSegmenter,
     load_trainable_zero_shot_state_dict,
     trainable_zero_shot_state_dict,
     zero_shot_checkpoint_path,
@@ -24,294 +23,152 @@ from .zero_shot_model import (
 )
 
 
-def _learning_rate(step: int, config: dict[str, Any]) -> float:
-    total = int(config["total_steps"])
-    warmup = int(config.get("warmup_steps", 0))
-    peak = float(config["learning_rate"])
-    minimum = peak * float(config.get("min_lr_ratio", 0.05))
-    if warmup and step <= warmup:
-        return peak * step / warmup
-    progress = min(1.0, max(0.0, (step - warmup) / max(1, total - warmup)))
-    return minimum + 0.5 * (peak - minimum) * (1.0 + math.cos(math.pi * progress))
+def _focal_loss(probability: torch.Tensor, target: torch.Tensor,
+                gamma: float = 2.0, smooth: float = 1e-5) -> torch.Tensor:
+    classes = probability.shape[1]
+    one_hot = F.one_hot(target.long(), classes).permute(0, 3, 1, 2).to(probability.dtype)
+    one_hot = one_hot.clamp(smooth / max(1, classes - 1), 1.0 - smooth)
+    pt = (one_hot * probability).sum(1) + smooth
+    return (-(1.0 - pt).pow(gamma) * pt.log()).mean()
 
 
-def _payload(
-    model: LearnedZeroShotSegmenter,
-    optimizer: torch.optim.Optimizer,
-    config: dict[str, Any],
-    completed_steps: int,
-    *,
-    best_metric: float,
-    best_step: int,
-    ema_loss: float | None,
-) -> dict[str, Any]:
+def _dice_loss(probability: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    probability = probability.flatten(1)
+    target = target.flatten(1)
+    score = (2.0 * (probability * target).sum(1) + 1.0) / (
+        probability.sum(1) + target.sum(1) + 1.0
+    )
+    return 1.0 - score.mean()
+
+
+def _segmentation_loss(probability: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    target = mask[:, 0].long()
+    return (
+        _focal_loss(probability, target)
+        + _dice_loss(probability[:, 0], 1.0 - mask[:, 0])
+        + _dice_loss(probability[:, 1], mask[:, 0])
+    )
+
+
+def _payload(model: MoECLIPSegmenter, optimizer: torch.optim.Optimizer,
+             config: dict[str, Any], completed_steps: int, epoch: int,
+             best_metric: float, best_epoch: int) -> dict[str, Any]:
     return {
         "format_version": ZERO_SHOT_FORMAT_VERSION,
         "config_fingerprint": zero_shot_config_fingerprint(config),
         "completed_steps": completed_steps,
+        "epoch": epoch,
         "best_metric": best_metric,
-        "best_step": best_step,
-        "ema_loss": ema_loss,
-        "selection": "minimum training-loss EMA after warmup",
+        "best_epoch": best_epoch,
+        "selection": "minimum supervised training loss (official protocol)",
         "model": trainable_zero_shot_state_dict(model),
         "optimizer": optimizer.state_dict(),
     }
 
 
 def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None:
-    if not bool(config.get("zero_shot", {}).get("enabled", False)):
+    zero_config = config.get("zero_shot", {})
+    if not bool(zero_config.get("enabled", False)):
         return None
-    train_config = config["zero_shot"]["training"]
+    if str(zero_config.get("backend", "")) != "moeclip_official":
+        raise ValueError("zero_shot.backend must be moeclip_official")
+    train_config = zero_config["training"]
     device = resolve_device(str(config["runtime"]["device"]))
     setup_seed(int(config["experiment"]["seed"]) + 907, False)
     logger = setup_logger(
-        "zero_shot_training",
-        zero_shot_checkpoint_path(config).parent.parent / "train.log",
+        "moeclip_training", zero_shot_checkpoint_path(config).parent.parent / "train.log"
     )
-    manifest = scan_competition_split(
-        Path(config["dataset"]["train_dir"]),
-        requested=config["dataset"]["categories"],
-        limit=config["dataset"].get("category_limit"),
-    )
-    dataset = CompetitionObjectDataset(
-        manifest.views,
-        image_size=int(config["dataset"]["image_size"]),
-        crop_size=int(config["dataset"]["crop_size"]),
-        num_views=5,
-        missing_view_policy="error",
-    )
+    dataset = build_moeclip_auxiliary_dataset(config)
     loader = DataLoader(
         dataset,
-        batch_size=int(train_config.get("object_batch_size", 2)),
+        batch_size=int(train_config.get("batch_size", 2)),
         shuffle=True,
         num_workers=int(train_config.get("num_workers", 4)),
         pin_memory=bool(config["runtime"].get("pin_memory", True)),
-        drop_last=True,
         persistent_workers=int(train_config.get("num_workers", 4)) > 0,
     )
-    model = LearnedZeroShotSegmenter(config, device)
-    decay, no_decay = [], []
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        target_group = (
-            no_decay
-            if name in {"prompt_delta", "layer_logits"} or parameter.ndim == 1
-            else decay
-        )
-        target_group.append(parameter)
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": decay, "weight_decay": float(train_config.get("weight_decay", 1e-4))},
-            {"params": no_decay, "weight_decay": 0.0},
-        ],
-        lr=float(train_config["learning_rate"]),
-        betas=tuple(float(value) for value in train_config.get("adam_betas", [0.9, 0.999])),
+    model = MoECLIPSegmenter(config, device)
+    optimizer = torch.optim.Adam(
+        model.trainable_parameters(),
+        lr=float(train_config.get("learning_rate", 5e-5)),
+        betas=tuple(float(value) for value in train_config.get("adam_betas", [0.5, 0.999])),
+    )
+    milestones = [int(value) for value in train_config.get("lr_milestones", [16000, 32000])]
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer, milestones=milestones, gamma=float(train_config.get("lr_gamma", 0.5))
     )
     last_path = zero_shot_last_checkpoint_path(config)
     best_path = zero_shot_checkpoint_path(config)
+    start_epoch = 0
     completed_steps = 0
     best_metric = float("inf")
-    best_step = 0
-    ema_loss: float | None = None
+    best_epoch = 0
     if resume != "never" and last_path.is_file():
         saved = torch.load(last_path, map_location="cpu", weights_only=False)
         if saved.get("config_fingerprint") != zero_shot_config_fingerprint(config):
-            raise ValueError("zero-shot last checkpoint/config fingerprint mismatch")
+            raise ValueError("MoECLIP last checkpoint/config fingerprint mismatch")
         load_trainable_zero_shot_state_dict(model, saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
-        completed_steps = int(saved["completed_steps"])
+        start_epoch = int(saved.get("epoch", 0))
+        completed_steps = int(saved.get("completed_steps", 0))
         best_metric = float(saved.get("best_metric", float("inf")))
-        best_step = int(saved.get("best_step", 0))
-        saved_ema = saved.get("ema_loss")
-        ema_loss = None if saved_ema is None else float(saved_ema)
-        logger.info("恢复 zero-shot 训练：step=%d", completed_steps)
-
-    total_steps = int(train_config["total_steps"])
-    iterator = iter(loader)
+        best_epoch = int(saved.get("best_epoch", 0))
+        for _ in range(completed_steps):
+            scheduler.step()
+        logger.info("恢复 MoECLIP：epoch=%d step=%d", start_epoch, completed_steps)
+    epochs = int(train_config.get("epochs", 20))
+    balance_weight = float(train_config.get("balance_loss_weight", 0.01))
+    etf_weight = float(train_config.get("etf_loss_weight", 0.01))
+    use_amp = bool(train_config.get("amp", False)) and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if str(train_config.get("amp_dtype", "bfloat16")).lower() in {"bf16", "bfloat16"} else torch.float16
+    log_every = int(train_config.get("log_every", 20))
     model.train()
-    for step in range(completed_steps + 1, total_steps + 1):
-        try:
-            batch = next(iterator)
-        except StopIteration:
-            iterator = iter(loader)
-            batch = next(iterator)
-        object_images = batch["images"]
-        object_batch, view_count = object_images.shape[:2]
-        images = object_images.flatten(0, 1).to(device, non_blocking=True)
-        categories = [
-            str(category)
-            for category in batch["category"]
-            for _ in range(view_count)
-        ]
-        lr = _learning_rate(step, train_config)
-        for group in optimizer.param_groups:
-            group["lr"] = lr
-        optimizer.zero_grad(set_to_none=True)
-        use_amp = bool(train_config.get("amp", True)) and device.type == "cuda"
-        requested_dtype = str(
-            train_config.get("amp_dtype", "bfloat16")
-        ).lower()
-        amp_dtype = (
-            torch.bfloat16
-            if requested_dtype in {"bf16", "bfloat16"}
-            else torch.float16
-        )
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            output = model(images, categories=categories)
-            # The foreground target is an image-derived, detached background
-            # estimate. Every foreground patch and every image is normal;
-            # anomaly text acts only as a semantic negative anchor.
-            foreground = output["color_foreground_probability"].detach()[:, 0]
-            patch_target = torch.where(
-                foreground >= float(train_config.get("foreground_threshold", 0.45)),
-                torch.ones_like(foreground, dtype=torch.long),
-                torch.zeros_like(foreground, dtype=torch.long),
-            )
-            patch_loss = F.cross_entropy(
-                output["class_logits"],
-                patch_target,
-                label_smoothing=float(
-                    train_config.get("label_smoothing", 0.05)
-                ),
-            )
-            global_target = torch.ones(
-                images.shape[0], device=device, dtype=torch.long
-            )
-            image_loss = F.cross_entropy(
-                output["global_logits"],
-                global_target,
-                label_smoothing=float(
-                    train_config.get("label_smoothing", 0.05)
-                ),
-            )
-            margin = F.relu(
-                float(train_config.get("normal_margin", 1.0))
-                - output["global_logits"][:, 1]
-                + output["global_logits"][:, 2]
-            ).mean()
-            normal_probability = output["global_logits"].softmax(-1)[:, 1]
-            view_consistency = normal_probability.reshape(
-                object_batch, view_count
-            ).var(dim=1, unbiased=False).mean()
-            clean_loss = output["semantic_probability"].mean()
-            anchor_loss = model.prompt_delta.square().mean()
-            loss = (
-                float(train_config.get("patch_normal_weight", 1.0)) * patch_loss
-                + float(train_config.get("image_normal_weight", 1.0)) * image_loss
-                + float(train_config.get("normal_margin_weight", 0.25)) * margin
-                + float(train_config.get("view_consistency_weight", 0.1))
-                * view_consistency
-                + float(train_config.get("clean_weight", 0.1)) * clean_loss
-                + float(train_config.get("moe_balance_weight", 0.01))
-                * output["moe_balance_loss"]
-                + float(train_config.get("moe_diversity_weight", 0.01))
-                * output["moe_diversity_loss"]
-                + float(train_config.get("prompt_anchor_weight", 0.01))
-                * anchor_loss
-            )
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.trainable_parameters(),
-            float(train_config.get("gradient_clip_norm", 1.0)),
-        )
-        if not torch.isfinite(grad_norm):
-            raise FloatingPointError(f"non-finite zero-shot gradient at step={step}")
-        optimizer.step()
-        loss_value = float(loss.detach())
-        ema_loss = (
-            loss_value
-            if ema_loss is None
-            else 0.98 * ema_loss + 0.02 * loss_value
-        )
-        best_start = max(
-            int(train_config.get("warmup_steps", 0)),
-            max(1, total_steps // 10),
-        )
-        best_check_every = int(train_config.get("log_every", 20))
-        if (
-            step >= best_start
-            and step % best_check_every == 0
-            and ema_loss < best_metric - 1e-4
-        ):
-            best_metric = ema_loss
-            best_step = step
-            atomic_torch_save(
-                best_path,
-                _payload(
-                    model,
-                    optimizer,
-                    config,
-                    step,
-                    best_metric=best_metric,
-                    best_step=best_step,
-                    ema_loss=ema_loss,
-                ),
-            )
-            logger.info(
-                "更新 zero-shot best：step=%d | ema_loss=%.6f | %s",
-                best_step,
-                best_metric,
-                best_path,
-            )
-        if step == 1 or step % int(train_config.get("log_every", 20)) == 0:
-            logger.info(
-                "normal-only step %d/%d | loss %.5f | patch %.5f | "
-                "image %.5f | margin %.5f | anomaly %.3e | "
-                "balance %.3e | diversity %.3e | lr %.3e | grad %.3e",
-                step,
-                total_steps,
-                loss.item(),
-                patch_loss.item(),
-                image_loss.item(),
-                margin.item(),
-                clean_loss.item(),
-                output["moe_balance_loss"].item(),
-                output["moe_diversity_loss"].item(),
-                lr,
-                float(grad_norm),
-            )
-        if step % int(train_config.get("checkpoint_every", 500)) == 0:
-            atomic_torch_save(
-                last_path,
-                _payload(
-                    model,
-                    optimizer,
-                    config,
-                    step,
-                    best_metric=best_metric,
-                    best_step=best_step,
-                    ema_loss=ema_loss,
-                ),
-            )
-
+    for epoch in range(start_epoch, epochs):
+        epoch_loss = 0.0
+        for batch in loader:
+            images = batch["image"].to(device, non_blocking=True)
+            masks = batch["mask"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
+            categories = [str(value) for value in batch["class_name"]]
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                output = model(images, categories=categories)
+                image_loss = F.cross_entropy(output["image_logits"], labels)
+                segmentation_loss = sum(
+                    _segmentation_loss(probability, masks)
+                    for probability in output["patch_probabilities"]
+                )
+                loss = (
+                    image_loss + segmentation_loss
+                    + balance_weight * output["moe_balance_loss"]
+                    + etf_weight * output["moe_etf_loss"]
+                )
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            completed_steps += 1
+            epoch_loss += float(loss.detach())
+            if completed_steps == 1 or completed_steps % log_every == 0:
+                logger.info(
+                    "MoECLIP epoch %d/%d step %d | loss %.5f | image %.5f | "
+                    "seg %.5f | balance %.3e | etf %.3e | lr %.3e",
+                    epoch + 1, epochs, completed_steps, loss.item(), image_loss.item(),
+                    segmentation_loss.item(), output["moe_balance_loss"].item(),
+                    output["moe_etf_loss"].item(), optimizer.param_groups[0]["lr"],
+                )
+        mean_loss = epoch_loss / max(1, len(loader))
+        payload = _payload(model, optimizer, config, completed_steps, epoch + 1,
+                           best_metric, best_epoch)
+        atomic_torch_save(last_path, payload)
+        if mean_loss < best_metric:
+            best_metric, best_epoch = mean_loss, epoch + 1
+            payload["best_metric"], payload["best_epoch"] = best_metric, best_epoch
+            atomic_torch_save(best_path, payload)
+            logger.info("更新 MoECLIP best：epoch=%d loss=%.6f", best_epoch, best_metric)
     final_path = zero_shot_final_checkpoint_path(config)
-    final_payload = _payload(
-        model,
-        optimizer,
-        config,
-        total_steps,
-        best_metric=best_metric,
-        best_step=best_step,
-        ema_loss=ema_loss,
-    )
-    atomic_torch_save(final_path, final_payload)
-    atomic_torch_save(last_path, final_payload)
-    if not best_path.is_file():
-        best_metric = float(ema_loss) if ema_loss is not None else float("nan")
-        best_step = total_steps
-        final_payload["best_metric"] = best_metric
-        final_payload["best_step"] = best_step
-        final_payload["selection"] = "final fallback; no eligible EMA checkpoint"
-        atomic_torch_save(best_path, final_payload)
-    selected = torch.load(best_path, map_location="cpu", weights_only=False)
-    selected["training_completed_steps"] = total_steps
-    atomic_torch_save(best_path, selected)
-    logger.info(
-        "zero-shot 训练完成：final=%s | best=%s (step=%d, ema_loss=%.6f)",
+    atomic_torch_save(
         final_path,
-        best_path,
-        best_step,
-        best_metric,
+        _payload(model, optimizer, config, completed_steps, epochs, best_metric, best_epoch),
     )
+    logger.info("MoECLIP 训练完成：final=%s best=%s", final_path, best_path)
     return best_path

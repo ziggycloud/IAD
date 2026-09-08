@@ -259,9 +259,9 @@ python run_competition_pipeline.py --test-b --skip-train
 
 Test_B 解压到 `data/competition/Test_B`。`--test-b` 会独立扫描其全部类别，不要求
 类别数、类别名称或每类样本数与 Train/Test_A 相同。Train 中不存在的类别硬路由到
-normal-only CLIP Patch-MoE 分支：按文件夹类名生成提示词，并在推理时按类别/相机从
-无标签 Test_B 特征稳健估计正常原型。Test_B 不参与梯度训练、不读取标签，但同类图像
-会用于 transductive inference；若比赛规则禁止测试集内部统计，应关闭该路由。
+MoECLIP 分支：文件夹类名用于构造 normal/abnormal 提示词，12 个多层多尺度 patch
+相似度图负责定位，独立图像分支负责分类。Test_B 不参与梯度训练，也不再执行测试类别
+内部的无标签正常原型统计。
 显式 `--set` 参数优先于该预设，因此仍可覆盖 Test_B 路径或恢复严格的数据计数检查。
 下载使用天池提供的临时 STS 凭证，凭证只通过 `ossutil` 命令传入，不要写入 YAML、
 脚本或 Git；`Test_B.zip` 和 ossutil 断点目录均已被 `.gitignore` 排除。
@@ -308,6 +308,7 @@ python run_competition_pipeline.py `
 训练/推理阶段和恢复规则见
 [COMPETITION_CLIP_0906.md](COMPETITION_CLIP_0906.md)。
 
-本分支将 unseen 类硬路由到 normal-only Patch-MoE；它不使用真实或合成异常图、
-CutPaste 和异常任务 checkpoint，只加载公开 OpenAI CLIP 基础权重。结构和评分见
-[COMPETITION_NORMAL_ONLY_MOE_0907.md](COMPETITION_NORMAL_ONLY_MOE_0907.md)。
+本分支按官方 MoECLIP 训练协议将 unseen 类硬路由到 Patch-MoE。它不生成异常图，
+但训练需要一个含真实异常、图像标签和像素 mask 的辅助类别数据集；骨干只加载公开
+OpenAI CLIP 基础权重。结构、JSONL 格式和与论文一致性的边界见
+[COMPETITION_MOECLIP_OFFICIAL.md](COMPETITION_MOECLIP_OFFICIAL.md)。

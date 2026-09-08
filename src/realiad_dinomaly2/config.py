@@ -239,10 +239,10 @@ def _validate(config: dict[str, Any]) -> None:
     if not isinstance(zero_shot, dict):
         raise ValueError("zero_shot must be a mapping")
     if bool(zero_shot.get("enabled", False)):
-        backend = str(zero_shot.get("backend", "synthetic"))
-        if backend != "normal_only_moe":
+        backend = str(zero_shot.get("backend", ""))
+        if backend != "moeclip_official":
             raise ValueError(
-                "this branch requires zero_shot.backend=normal_only_moe"
+                "this branch requires zero_shot.backend=moeclip_official"
             )
         if zero_shot.get("route", "unseen_only") != "unseen_only":
             raise ValueError("zero_shot.route currently supports unseen_only")
@@ -257,58 +257,46 @@ def _validate(config: dict[str, Any]) -> None:
         for section_name, section in sections:
             if not isinstance(section, dict):
                 raise ValueError(f"zero_shot.{section_name} must be a mapping")
-        if backend == "normal_only_moe":
-            for key in ("model_name", "pretrained", "weights_dir"):
-                if not str(zero_model.get(key, "")).strip():
-                    raise ValueError(f"zero_shot.model.{key} is required")
-            prompt_keys = ["normal_prompts", "broken_prompts"]
-            if backend == "normal_only_moe":
-                prompt_keys.extend(
-                    [
-                        "background_prompts",
-                        "class_background_prompts",
-                        "class_normal_prompts",
-                        "class_broken_prompts",
-                    ]
-                )
-            for key in prompt_keys:
-                prompts = zero_model.get(key)
-                if not isinstance(prompts, list) or not prompts:
-                    raise ValueError(f"zero_shot.model.{key} must be non-empty")
-            layers = int(zero_model.get("intermediate_layers", 4))
-            weights = zero_model.get("intermediate_layer_weights", [])
-            if layers <= 0 or not isinstance(weights, list) or len(weights) != layers:
-                raise ValueError(
-                    "zero_shot.model.intermediate_layer_weights must match "
-                    "intermediate_layers"
-                )
-            for key in ("total_steps", "object_batch_size", "checkpoint_every"):
-                if int(zero_training.get(key, 0)) <= 0:
-                    raise ValueError(f"zero_shot.training.{key} must be positive")
-            if float(zero_training.get("learning_rate", 0.0)) <= 0:
-                raise ValueError("zero_shot.training.learning_rate must be positive")
-            if int(zero_training.get("warmup_steps", 0)) >= int(
-                zero_training["total_steps"]
-            ):
-                raise ValueError("zero_shot warmup_steps must be below total_steps")
-            label_smoothing = float(
-                zero_training.get("label_smoothing", 0.0)
+        for key in ("model_name", "pretrained", "weights_dir"):
+            if not str(zero_model.get(key, "")).strip():
+                raise ValueError(f"zero_shot.model.{key} is required")
+        levels = zero_model.get("levels")
+        moe_layers = zero_model.get("moe_layers")
+        if (
+            not isinstance(levels, list)
+            or not isinstance(moe_layers, list)
+            or [int(value) - 1 for value in levels]
+            != [int(value) for value in moe_layers]
+        ):
+            raise ValueError(
+                "zero_shot.model.moe_layers must equal levels - 1"
             )
-            if not 0.0 <= label_smoothing < 1.0:
+        if int(zero_model.get("moe_rank", 0)) <= 0:
+            raise ValueError("zero_shot.model.moe_rank must be positive")
+        if not 0 < int(zero_model.get("moe_top_k", 0)) <= int(
+            zero_model.get("moe_num_experts", 0)
+        ):
+            raise ValueError("invalid MoECLIP expert/top-k configuration")
+        auxiliary = zero_training.get("auxiliary_dataset")
+        if not isinstance(auxiliary, dict):
+            raise ValueError(
+                "zero_shot.training.auxiliary_dataset must be a mapping"
+            )
+        for key in ("root", "metadata"):
+            if not str(auxiliary.get(key, "")).strip():
                 raise ValueError(
-                    "zero_shot.training.label_smoothing must be in [0, 1)"
+                    f"zero_shot.training.auxiliary_dataset.{key} is required"
                 )
-            for key in (
-                "prototype_retain_ratio",
-                "normal_distance_quantile",
-                "normal_semantic_quantile",
-                "image_top_ratio",
-            ):
-                value = float(zero_inference.get(key, 0.0))
-                if not 0.0 < value <= 1.0:
-                    raise ValueError(
-                        f"zero_shot.inference.{key} must be in (0, 1]"
-                    )
+        for key in ("epochs", "batch_size"):
+            if int(zero_training.get(key, 0)) <= 0:
+                raise ValueError(f"zero_shot.training.{key} must be positive")
+        if float(zero_training.get("learning_rate", 0.0)) <= 0:
+            raise ValueError("zero_shot.training.learning_rate must be positive")
+        kernel = int(zero_inference.get("gaussian_kernel_size", 7))
+        if kernel <= 0 or kernel % 2 == 0:
+            raise ValueError(
+                "zero_shot.inference.gaussian_kernel_size must be positive and odd"
+            )
 
     evaluation = config["evaluation"]
     if not 0 < float(evaluation["image_top_ratio"]) <= 1:
