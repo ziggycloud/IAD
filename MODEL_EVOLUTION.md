@@ -17,6 +17,8 @@ Every run captures commit/branch/dirty state, resolved config, protocol and Test
 | Date | Commit / run_id | Architecture or training change | Checkpoint selection | Test_C score | Finding / next action |
 |---|---|---|---|---:|---|
 | 2026-09-09 | baseline protocol | Initial reproducible Test_C evaluation pipeline | complete final checkpoint | — | Establish reference run |
+| 2026-09-09 | e89b55e7e2f9 | Baseline diagnostic; visibility-aware object aggregation | 1,000-step final (below 6,000-step protocol) | 66.0830 | Seen classification is strong, but pixel AP/F1 and unseen object ranking dominate the gap. Do not treat this short run as the final baseline. |
+| 2026-09-09 | post-e89b55e7e2f9 | Object-scoped Loose Loss; mean-view aggregation; unseen spatial-novelty debias; Test_C artifacts separated from submissions | Start a new full 6,000-step run, then regenerate prior/predictions | — | Validate localization gains without using Test_C labels in inference; compare against e89b55e7e2f9. |
 
 ## Experiment template
 

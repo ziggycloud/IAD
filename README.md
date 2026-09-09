@@ -252,8 +252,8 @@ python run_competition_pipeline.py --test-b --skip-train
 `data/competition/Test_A` 与 `configs/competition.yaml`。每个 `Sxxxx` 的五张图现在是
 一个 `[5,3,448,448]` 网络样本：共享 DINO 编码器后由 Set Transformer 建模跨视角
 上下文，但五张异常图和 mask 始终独立。分类分数聚合由
-`submission.object_score_aggregation` 控制；`legacy_concat_topk` 可恢复旧基线，默认
-`visibility_aware` 同时保留 max 分量，避免单相机可见缺陷被软共识抹掉。
+`submission.object_score_aggregation` 控制；`legacy_concat_topk` 可恢复旧基线。当前
+baseline 默认使用五视角 `mean`，这是 Test_C 诊断中跨 seen/unseen 更稳定的聚合。
 
 Test_B 解压到 `data/competition/Test_B`。`--test-b` 会独立扫描其全部类别，不要求
 类别数、类别名称或每类样本数与 Train/Test_A 相同；Train 中不存在的类别使用
@@ -309,11 +309,14 @@ python run_competition_pipeline.py `
 # 实体复制数据并执行内置结构审计；同签名可断点续传
 python prepare_testc.py
 
-# 审计 → 训练/续训 → normal prior → 原提交路径推理 → 本地 GT 评分
+# 审计 → 训练/续训 → normal prior → Test_C 预测 → 本地 GT 评分
 python run_testc_pipeline.py
 
 # 复用完整 checkpoint，仅推理和评分
 python run_testc_pipeline.py --skip-train --checkpoint auto
+
+# 仅在需要搬运/检查预测时额外打包；文件名会明确标注不可提交
+python run_testc_pipeline.py --skip-train --export-testc-predictions-zip
 
 # 比较两个或更多历史评估目录
 python compare_testc_runs.py <run1> <run2> --output comparison.csv
@@ -323,3 +326,9 @@ python compare_testc_runs.py <run1> <run2> --output comparison.csv
 显式覆盖。评估直接复用比赛 submission predictor，因此 anomaly map、后处理与五视角
 object score 完全一致。输出包含运行签名、训练/eval JSONL、逐类 CSV/JSON、综合评分、
 性能诊断和模型登记记录；协议与实验记录见 [MODEL_EVOLUTION.md](MODEL_EVOLUTION.md)。
+
+Test_C 默认写入 `outputs/testc_baseline/testc_predictions/`，不会生成官方 submission
+ZIP；即使显式导出，文件也名为 `testc_predictions_not_for_submission.zip`，其 2,000
+行对象来自 Test_C，不能上传比赛官网。只有使用官方 `data/competition/Test_B` 运行
+`python run_competition_pipeline.py --test-b --skip-train --checkpoint <checkpoint>` 后，
+`competition_submission/<签名>/submission.zip` 才是按 Test_B 扫描并校验的可提交包。

@@ -176,6 +176,15 @@ def _category_metrics(
     max_view = _binary_metrics(object_labels, max_view_object_scores)
     mean_view = _binary_metrics(object_labels, mean_view_object_scores)
     segmentation = pixel.summary()
+    normal_scores = [
+        score for label, score in zip(object_labels, object_scores, strict=True)
+        if label == 0
+    ]
+    anomaly_scores = [
+        score for label, score in zip(object_labels, object_scores, strict=True)
+        if label == 1
+    ]
+    pixel_count = segmentation["positive_pixels"] + segmentation["negative_pixels"]
     return {
         "category": category,
         "partition": str(samples[0]["partition"]),
@@ -199,6 +208,12 @@ def _category_metrics(
         "view_f1max": per_view["f1max"],
         "diag_max_view_auroc": max_view["auroc"],
         "diag_mean_view_auroc": mean_view["auroc"],
+        "normal_object_score_mean": float(np.mean(normal_scores)),
+        "anomaly_object_score_mean": float(np.mean(anomaly_scores)),
+        "object_score_margin": float(np.mean(anomaly_scores) - np.mean(normal_scores)),
+        "pixel_positive_fraction": float(
+            segmentation["positive_pixels"] / pixel_count
+        ),
         "object_score_min": float(min(object_scores)),
         "object_score_max": float(max(object_scores)),
         "object_score_mean": float(np.mean(object_scores)),
@@ -265,7 +280,71 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def _report(score: dict[str, Any], rows: list[dict[str, Any]]) -> str:
+def _diagnostics(
+    score: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    checkpoint_steps: int | None,
+    recommended_checkpoint_steps: int | None,
+) -> dict[str, Any]:
+    seen = [row for row in rows if row["partition"] == "seen"]
+    unseen = [row for row in rows if row["partition"] == "unseen"]
+    warnings: list[str] = []
+    if (
+        checkpoint_steps is not None
+        and recommended_checkpoint_steps is not None
+        and checkpoint_steps < recommended_checkpoint_steps
+    ):
+        warnings.append(
+            f"checkpoint has {checkpoint_steps} steps; the baseline protocol "
+            f"recommends at least {recommended_checkpoint_steps}"
+        )
+    return {
+        "quality_warnings": warnings,
+        "score_contribution_points": {
+            "classification": SCORE_WEIGHTS["classification"] * score["s_cls"],
+            "segmentation": SCORE_WEIGHTS["segmentation"] * score["s_seg"],
+            "zero_shot": SCORE_WEIGHTS["zero_shot"] * score["s_zs"],
+        },
+        "classification_minus_pixel_ap_points": {
+            "seen": 100.0
+            * (
+                np.mean([row["c_auroc"] for row in seen])
+                - np.mean([row["p_ap"] for row in seen])
+            ),
+            "unseen": 100.0
+            * (
+                np.mean([row["c_auroc"] for row in unseen])
+                - np.mean([row["p_ap"] for row in unseen])
+            ),
+        },
+        "object_aggregation_auroc": {
+            partition: {
+                "submitted": float(np.mean([row["c_auroc"] for row in current])),
+                "max_view": float(
+                    np.mean([row["diag_max_view_auroc"] for row in current])
+                ),
+                "mean_view": float(
+                    np.mean([row["diag_mean_view_auroc"] for row in current])
+                ),
+            }
+            for partition, current in (("seen", seen), ("unseen", unseen))
+        },
+        "category_standard_deviation": {
+            partition: {
+                metric: float(np.std([row[metric] for row in current], ddof=1))
+                for metric in ("c_auroc", "c_ap", "p_auroc", "p_ap", "p_f1max")
+            }
+            for partition, current in (("seen", seen), ("unseen", unseen))
+        },
+    }
+
+
+def _report(
+    score: dict[str, Any],
+    rows: list[dict[str, Any]],
+    diagnostics: dict[str, Any],
+) -> str:
     weakest = sorted(rows, key=lambda row: float(row["p_ap"]))[:10]
     lines = [
         "# Test_C evaluation",
@@ -288,19 +367,31 @@ def _report(score: dict[str, Any], rows: list[dict[str, Any]]) -> str:
         )
     seen = [row for row in rows if row["partition"] == "seen"]
     unseen = [row for row in rows if row["partition"] == "unseen"]
+    aggregation = diagnostics["object_aggregation_auroc"]
+    contributions = diagnostics["score_contribution_points"]
     lines.extend(
         [
             "",
             "## Bottleneck diagnostics",
             "",
+            f"- Weighted score contributions: classification {contributions['classification']:.2f}, "
+            f"segmentation {contributions['segmentation']:.2f}, zero-shot {contributions['zero_shot']:.2f} points.",
             f"- Seen classification minus pixel AP: "
             f"{100.0 * (np.mean([r['c_auroc'] for r in seen]) - np.mean([r['p_ap'] for r in seen])):.2f} points.",
             f"- Unseen classification minus pixel AP: "
             f"{100.0 * (np.mean([r['c_auroc'] for r in unseen]) - np.mean([r['p_ap'] for r in unseen])):.2f} points.",
+            f"- Seen object AUROC (submitted / max-view / mean-view): "
+            f"{aggregation['seen']['submitted']:.4f} / {aggregation['seen']['max_view']:.4f} / {aggregation['seen']['mean_view']:.4f}.",
+            f"- Unseen object AUROC (submitted / max-view / mean-view): "
+            f"{aggregation['unseen']['submitted']:.4f} / {aggregation['unseen']['max_view']:.4f} / {aggregation['unseen']['mean_view']:.4f}.",
             f"- Mean category evaluation time: {np.mean([r['seconds'] for r in rows]):.2f} seconds.",
             "",
         ]
     )
+    if diagnostics["quality_warnings"]:
+        lines.extend(["## Quality warnings", ""])
+        lines.extend(f"- {warning}" for warning in diagnostics["quality_warnings"])
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -311,6 +402,7 @@ def evaluate_testc_submission(
     submission_result: dict[str, Any],
     output_dir: Path,
     image_top_ratio: float,
+    recommended_checkpoint_steps: int | None = None,
 ) -> dict[str, Any]:
     testc_root = testc_root.expanduser().resolve()
     protocol = load_testc_protocol(protocol_path.expanduser().resolve())
@@ -366,6 +458,15 @@ def evaluate_testc_submission(
         rows.append(row)
     rows.sort(key=lambda row: str(row["category"]))
     score = compute_testc_score(rows)
+    checkpoint_steps = submission_result.get("checkpoint_steps")
+    diagnostics = _diagnostics(
+        score,
+        rows,
+        checkpoint_steps=(
+            int(checkpoint_steps) if checkpoint_steps is not None else None
+        ),
+        recommended_checkpoint_steps=recommended_checkpoint_steps,
+    )
     payload = {
         "status": "complete",
         "completed_at": utc_now(),
@@ -374,6 +475,7 @@ def evaluate_testc_submission(
         "manifest_sha256": file_sha256(manifest_path),
         "submission_result": submission_result,
         "score": score,
+        "diagnostics": diagnostics,
         "metrics_per_category": str(run_dir / "metrics_per_category.csv"),
         "report": str(run_dir / "evaluation_report.md"),
     }
@@ -381,7 +483,7 @@ def evaluate_testc_submission(
     atomic_write_json(run_dir / "metrics_per_category.json", rows)
     atomic_write_json(run_dir / "metrics_and_score.json", payload)
     (run_dir / "evaluation_report.md").write_text(
-        _report(score, rows), encoding="utf-8", newline="\n"
+        _report(score, rows, diagnostics), encoding="utf-8", newline="\n"
     )
     atomic_write_json(
         output_dir / "testc_evaluation" / "latest.json",

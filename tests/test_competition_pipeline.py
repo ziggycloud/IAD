@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import shutil
 import sys
 import unittest
@@ -23,6 +24,7 @@ from realiad_dinomaly2.competition_data import (  # noqa: E402
 )
 from realiad_dinomaly2.competition_submission import (  # noqa: E402
     _aggregate_object_score,
+    _submission_signature,
     _top_ratio_score,
     build_submission_zip,
     validate_submission_layout,
@@ -113,6 +115,31 @@ class CompetitionDataTests(unittest.TestCase):
             score,
             0.5 * _aggregate_object_score(maps, 0.1, mode="max"),
         )
+
+    def test_mean_object_score_is_unweighted_view_consensus(self) -> None:
+        maps = [np.full((4, 4), value, dtype=np.float32) for value in range(5)]
+        per_view = [_top_ratio_score([array], 0.25) for array in maps]
+        self.assertEqual(
+            _aggregate_object_score(maps, 0.25, mode="mean"),
+            float(np.mean(per_view)),
+        )
+
+    def test_submission_signature_tracks_evaluation_semantics(self) -> None:
+        with _temporary_directory() as root:
+            test_root = root / "Test_C"
+            _write_sample(test_root, "part", "S0001")
+            manifest = scan_competition_split(test_root)
+            checkpoint = root / "model.pt"
+            checkpoint.write_bytes(b"checkpoint")
+            config = materialize_paths(
+                load_config(ROOT / "configs" / "competition.yaml")
+            )
+            config["evaluation"]["normal_prior"]["enabled"] = False
+            changed = copy.deepcopy(config)
+            changed["evaluation"]["gaussian_sigma"] = 0.0
+            first, _ = _submission_signature(config, checkpoint, manifest)
+            second, _ = _submission_signature(changed, checkpoint, manifest)
+            self.assertNotEqual(first, second)
 
 
 class CompetitionPackageTests(unittest.TestCase):

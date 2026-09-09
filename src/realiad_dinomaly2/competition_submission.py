@@ -25,7 +25,7 @@ from .competition_data import (
     scan_competition_split,
 )
 from .config import config_fingerprint
-from .losses import anomaly_map
+from .losses import anomaly_map, debias_unseen_novelty
 from .modeling import build_model, load_trainable_state_dict
 from .normal_prior import (
     file_sha256,
@@ -112,6 +112,10 @@ def _submission_signature(
         "checkpoint_mtime_ns": checkpoint_stat.st_mtime_ns,
         "test_root": str(manifest.root),
         "test_manifest_sha256": _manifest_digest(manifest),
+        # These fields change prediction values but deliberately do not belong
+        # to the training checkpoint fingerprint. They must still invalidate
+        # resumed per-category masks and scores.
+        "evaluation": config["evaluation"],
         "submission": config["submission"],
     }
     if bool(config["evaluation"].get("normal_prior", {}).get("enabled", False)):
@@ -220,6 +224,8 @@ def _aggregate_object_score(
     )
     if mode == "max":
         return float(per_view.max())
+    if mode == "mean":
+        return float(per_view.mean())
     if mode == "softmax":
         if softmax_temperature <= 0:
             raise ValueError("softmax_temperature must be positive")
@@ -245,9 +251,38 @@ def _aggregate_object_score(
             + (1.0 - visibility_max_blend) * weighted
         )
     raise ValueError(
-        "object_score_aggregation must be legacy_concat_topk, max, softmax, "
-        "or visibility_aware"
+        "object_score_aggregation must be legacy_concat_topk, max, mean, "
+        "softmax, or visibility_aware"
     )
+
+
+def _debias_unseen_maps(
+    maps: torch.Tensor,
+    *,
+    categories: list[str],
+    seen_categories: set[str] | None,
+    config: dict[str, Any],
+) -> torch.Tensor:
+    """Remove per-frame semantic novelty only for categories absent from Train."""
+
+    settings = config["evaluation"].get("unseen_novelty_debias", {})
+    if not bool(settings.get("enabled", False)) or seen_categories is None:
+        return maps
+    selected = torch.as_tensor(
+        [category not in seen_categories for category in categories],
+        dtype=torch.bool,
+        device=maps.device,
+    )
+    if not bool(selected.any()):
+        return maps
+    result = maps.clone()
+    result[selected] = debias_unseen_novelty(
+        maps[selected],
+        baseline_quantile=float(settings.get("baseline_quantile", 0.5)),
+        local_blend=float(settings.get("local_blend", 0.5)),
+        global_retention=float(settings.get("global_retention", 0.25)),
+    )
+    return result
 
 
 def _probability_like_score(raw_score: float) -> float:
@@ -398,10 +433,19 @@ def generate_competition_submission(
     config: dict[str, Any],
     checkpoint: str = "auto",
     allow_partial: bool = False,
+    *,
+    artifact_kind: str = "competition_submission",
+    package_zip: bool = True,
 ) -> dict[str, Any]:
     # Keep package-layout validation importable in lightweight environments.
     from .metrics import GaussianFilter
 
+    if artifact_kind not in {"competition_submission", "testc_evaluation"}:
+        raise ValueError(f"Unsupported prediction artifact kind: {artifact_kind}")
+    is_competition_submission = artifact_kind == "competition_submission"
+    artifact_namespace = (
+        "competition_submission" if is_competition_submission else "testc_predictions"
+    )
     output_dir = Path(config["experiment"]["output_dir"])
     checkpoint_path = resolve_competition_checkpoint(output_dir, checkpoint)
     dataset_config = config["dataset"]
@@ -417,7 +461,7 @@ def generate_competition_submission(
     signature, signature_inputs = _submission_signature(
         config, checkpoint_path, manifest
     )
-    run_dir = output_dir / "competition_submission" / signature[:12]
+    run_dir = output_dir / artifact_namespace / signature[:12]
     submission_root = run_dir / "package"
     mask_root = submission_root / "predicted_masks"
     category_result_dir = run_dir / "per_category"
@@ -437,6 +481,8 @@ def generate_competition_submission(
                 "created_at": utc_now(),
                 "manifest": manifest.summary(),
                 "inference_workers": world_size,
+                "artifact_kind": artifact_kind,
+                "competition_submission_intent": is_competition_submission,
             },
         )
     setup_seed(
@@ -484,6 +530,15 @@ def generate_competition_submission(
             config,
             checkpoint_path,
         )
+    configured_seen = dataset_config.get("categories")
+    if normal_prior is not None and normal_prior.category_view:
+        seen_categories: set[str] | None = set(normal_prior.category_view)
+    elif isinstance(configured_seen, (list, tuple)):
+        seen_categories = {str(value) for value in configured_seen}
+    else:
+        # `categories: all` cannot identify which test categories participated
+        # in training without the Train-derived prior, so do not guess.
+        seen_categories = None
     mask_size = int(submission.get("mask_size", 448))
     lower_quantile = float(submission.get("lower_quantile", 0.001))
     upper_quantile = float(submission.get("upper_quantile", 0.99999))
@@ -597,6 +652,12 @@ def generate_competition_submission(
                         valid_view_mask=valid_view_mask,
                         config=config,
                     )
+                current = _debias_unseen_maps(
+                    current,
+                    categories=category_names,
+                    seen_categories=seen_categories,
+                    config=config,
+                )
                 batch_size, view_count = current.shape[:2]
                 current = F.interpolate(
                     current.float().reshape(
@@ -656,6 +717,12 @@ def generate_competition_submission(
                         valid_view_mask=valid_view_mask,
                         config=config,
                     )
+                current = _debias_unseen_maps(
+                    current,
+                    categories=category_names,
+                    seen_categories=seen_categories,
+                    config=config,
+                )
                 current = F.interpolate(
                     current.float(),
                     size=(mask_size, mask_size),
@@ -760,10 +827,22 @@ def generate_competition_submission(
     validation = validate_submission_layout(
         submission_root, manifest, mask_size=mask_size
     )
-    zip_path = build_submission_zip(
-        submission_root,
-        run_dir / "submission.zip",
-        manifest,
+    zip_path = None
+    if package_zip:
+        zip_name = (
+            "submission.zip"
+            if is_competition_submission
+            else "testc_predictions_not_for_submission.zip"
+        )
+        zip_path = build_submission_zip(
+            submission_root,
+            run_dir / zip_name,
+            manifest,
+        )
+    competition_submit_ready = bool(
+        is_competition_submission
+        and completed_steps == total_steps
+        and zip_path is not None
     )
     result = {
         "status": "partial_diagnostic" if completed_steps != total_steps else "complete",
@@ -773,18 +852,29 @@ def generate_competition_submission(
         "checkpoint_steps": completed_steps,
         "submission_root": str(submission_root),
         "submission_csv": str(csv_path),
-        "zip": str(zip_path),
+        "artifact_kind": artifact_kind,
+        "competition_submit_ready": competition_submit_ready,
+        "evaluated_split_root": str(manifest.root),
+        "zip": str(zip_path) if zip_path is not None else None,
         "validation": validation,
     }
     atomic_write_json(run_dir / "result.json", result)
     atomic_write_json(
-        output_dir / "competition_submission" / "latest.json",
+        output_dir / artifact_namespace / "latest.json",
         {
             "signature": signature,
             "result": str(run_dir / "result.json"),
-            "zip": str(zip_path),
+            "artifact_kind": artifact_kind,
+            "competition_submit_ready": competition_submit_ready,
+            "zip": str(zip_path) if zip_path is not None else None,
             "updated_at": utc_now(),
         },
     )
-    logger.info("Competition submission ready: %s", zip_path)
+    if is_competition_submission:
+        logger.info("Competition submission ready: %s", zip_path)
+    else:
+        logger.info(
+            "Test_C predictions ready (not competition-submittable): %s",
+            submission_root,
+        )
     return result

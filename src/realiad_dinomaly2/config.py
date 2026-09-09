@@ -122,6 +122,9 @@ def _validate(config: dict[str, Any]) -> None:
                 "model.multi_view.missing_view_policy must be error, "
                 "pad_and_mask, or drop_incomplete"
             )
+    loose_loss_scope = str(config["training"].get("loose_loss_scope", "batch"))
+    if loose_loss_scope not in {"batch", "object"}:
+        raise ValueError("training.loose_loss_scope must be batch or object")
 
     train_image_dir = dataset.get("train_image_dir")
     if train_image_dir is not None and not isinstance(train_image_dir, (str, Path)):
@@ -277,12 +280,13 @@ def _validate(config: dict[str, Any]) -> None:
         if aggregation not in {
             "legacy_concat_topk",
             "max",
+            "mean",
             "softmax",
             "visibility_aware",
         }:
             raise ValueError(
                 "submission.object_score_aggregation must be one of "
-                "legacy_concat_topk, max, softmax, visibility_aware"
+                "legacy_concat_topk, max, mean, softmax, visibility_aware"
             )
         if float(submission.get("object_score_softmax_temperature", 0.25)) <= 0:
             raise ValueError(
@@ -319,6 +323,17 @@ def _validate(config: dict[str, Any]) -> None:
         blend = float(normal_prior.get("blend", 0.8))
         if not 0.0 <= blend <= 1.0:
             raise ValueError("evaluation.normal_prior.blend must be in [0, 1]")
+    unseen_debias = evaluation.get("unseen_novelty_debias", {})
+    if not isinstance(unseen_debias, dict):
+        raise ValueError("evaluation.unseen_novelty_debias must be a mapping")
+    if bool(unseen_debias.get("enabled", False)):
+        for key in ("baseline_quantile", "local_blend", "global_retention"):
+            default = 0.25 if key == "global_retention" else 0.5
+            value = float(unseen_debias.get(key, default))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(
+                    f"evaluation.unseen_novelty_debias.{key} must be in [0, 1]"
+                )
     cache = config.get("cache")
     if cache is not None:
         if "output_dir" not in cache:
@@ -400,6 +415,7 @@ def semantic_config(config: dict[str, Any]) -> dict[str, Any]:
             "final_lr_ratio",
             "loose_loss_warmup_steps",
             "loose_loss_final_discard",
+            "loose_loss_scope",
             "generalized_regularization_weight",
             "gradient_clip_norm",
         )

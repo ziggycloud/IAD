@@ -93,6 +93,9 @@ training:
   # learn the broad normal manifold before difficult normal edges are removed.
   loose_loss_warmup_steps: 1500
   loose_loss_final_discard: 0.7
+  # Per-object selection is invariant to DDP world size, micro-batch fallback,
+  # and gradient accumulation; each object contributes its hardest normal patches.
+  loose_loss_scope: object
   generalized_regularization_weight: 0.01
   multi_view_auxiliary_weights:
     context_consistency: 0.01
@@ -141,6 +144,13 @@ evaluation:
     eps: 1.0e-6
     batch_size: 2
     num_workers: 4
+  # Unknown categories can have a high image-wide reconstruction floor. Remove
+  # part of that semantic novelty while retaining local defect contrast.
+  unseen_novelty_debias:
+    enabled: true
+    baseline_quantile: 0.5
+    local_blend: 0.5
+    global_retention: 0.25
 
 submission:
   mask_size: 448
@@ -152,8 +162,9 @@ submission:
   # anomalous peaks from being collapsed while using the PNG range efficiently.
   lower_quantile: 0.001
   upper_quantile: 0.99999
-  # Baseline option: legacy_concat_topk. Other options: max, softmax.
-  object_score_aggregation: visibility_aware
+  # Test_C diagnostics show mean-view AUROC is more stable than max/learned
+  # visibility on both seen and unseen categories.
+  object_score_aggregation: mean
   object_score_softmax_temperature: 0.25
   # Keep a max component so a defect visible in one camera is not erased.
   visibility_max_blend: 0.5

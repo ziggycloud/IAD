@@ -11,6 +11,8 @@ testc:
   anomaly_objects_per_category: 10
   views_per_object: 5
   image_top_ratio: 0.01
+  # Runs below this remain valid diagnostics but are flagged as under-trained.
+  recommended_checkpoint_steps: 6000
   data_root: auto
 
 latency:

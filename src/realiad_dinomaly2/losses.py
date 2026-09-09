@@ -23,10 +23,13 @@ def reconstruction_loss(
     loose_loss: bool,
     discarded_gradient_factor: float = 0.1,
     valid_view_mask: torch.Tensor | None = None,
+    selection_scope: str = "batch",
 ) -> torch.Tensor:
     if len(encoder_features) != len(decoder_features):
         raise ValueError("encoder/decoder feature groups 数量不一致")
     losses: list[torch.Tensor] = []
+    if selection_scope not in {"batch", "object"}:
+        raise ValueError("selection_scope must be batch or object")
     for encoder_feature, decoder_feature in zip(
         encoder_features,
         decoder_features,
@@ -34,6 +37,7 @@ def reconstruction_loss(
     ):
         if encoder_feature.shape != decoder_feature.shape:
             raise ValueError("encoder/decoder feature shapes do not match")
+        group_ids: torch.Tensor | None = None
         if encoder_feature.ndim == 5:
             batch_size, view_count = encoder_feature.shape[:2]
             encoder_feature = encoder_feature.reshape(
@@ -53,8 +57,25 @@ def reconstruction_loss(
                     raise ValueError("reconstruction loss has no valid views")
                 encoder_feature = encoder_feature[selected]
                 decoder_feature = decoder_feature[selected]
+                group_ids = (
+                    torch.arange(batch_size, device=selected.device)
+                    .unsqueeze(1)
+                    .expand(-1, view_count)
+                    .reshape(-1)[selected]
+                )
+            else:
+                group_ids = (
+                    torch.arange(batch_size, device=encoder_feature.device)
+                    .unsqueeze(1)
+                    .expand(-1, view_count)
+                    .reshape(-1)
+                )
         elif encoder_feature.ndim != 4:
             raise ValueError("features must have shape [B,C,H,W] or [B,V,C,H,W]")
+        elif selection_scope == "object":
+            group_ids = torch.arange(
+                encoder_feature.shape[0], device=encoder_feature.device
+            )
         target = encoder_feature.detach()
         if loose_loss:
             with torch.no_grad():
@@ -67,16 +88,31 @@ def reconstruction_loss(
                     )
                 ).unsqueeze(1)
                 kept_fraction = max(0.0, min(1.0, 1.0 - discard_rate))
-                top_count = max(
-                    1,
-                    int(point_distance.numel() * kept_fraction),
-                )
-                threshold = torch.topk(
-                    point_distance.reshape(-1),
-                    k=top_count,
-                    largest=True,
-                ).values[-1]
-                discarded = point_distance < threshold
+                if selection_scope == "batch":
+                    top_count = max(
+                        1,
+                        int(point_distance.numel() * kept_fraction),
+                    )
+                    threshold = torch.topk(
+                        point_distance.reshape(-1),
+                        k=top_count,
+                        largest=True,
+                    ).values[-1]
+                    discarded = point_distance < threshold
+                else:
+                    if group_ids is None:
+                        raise RuntimeError("object-scoped Loose Loss has no group ids")
+                    discarded = torch.zeros_like(point_distance, dtype=torch.bool)
+                    for group_id in torch.unique(group_ids):
+                        selected_group = group_ids == group_id
+                        values = point_distance[selected_group]
+                        top_count = max(1, int(values.numel() * kept_fraction))
+                        threshold = torch.topk(
+                            values.reshape(-1),
+                            k=top_count,
+                            largest=True,
+                        ).values[-1]
+                        discarded[selected_group] = values < threshold
             decoder_feature.register_hook(
                 partial(
                     _scale_gradient,
@@ -182,8 +218,12 @@ def debias_unseen_novelty(
     enable it unless an explicit unseen-novelty configuration requests it.
     """
 
-    if anomaly_maps.ndim != 4 or anomaly_maps.shape[1] != 1:
-        raise ValueError("unseen novelty debias expects [B,1,H,W] maps")
+    if anomaly_maps.ndim not in {4, 5}:
+        raise ValueError(
+            "unseen novelty debias expects [B,1,H,W] or [B,V,1,H,W] maps"
+        )
+    if anomaly_maps.shape[-3] != 1:
+        raise ValueError("unseen novelty debias requires a singleton channel")
     if not 0.0 <= float(baseline_quantile) <= 1.0:
         raise ValueError("baseline_quantile must be in [0, 1]")
     if not 0.0 <= float(local_blend) <= 1.0:
@@ -193,15 +233,18 @@ def debias_unseen_novelty(
     if anomaly_maps.numel() == 0 or float(local_blend) == 0.0:
         return anomaly_maps
 
-    flattened = anomaly_maps.float().flatten(start_dim=2)
+    original_shape = anomaly_maps.shape
+    maps_4d = anomaly_maps.reshape(-1, *original_shape[-3:])
+    flattened = maps_4d.float().flatten(start_dim=2)
     baseline = torch.quantile(
         flattened,
         q=float(baseline_quantile),
         dim=2,
         keepdim=True,
-    ).reshape(anomaly_maps.shape[0], 1, 1, 1)
-    baseline = baseline.to(dtype=anomaly_maps.dtype)
-    local_excess = (anomaly_maps - baseline).clamp_min(0.0)
+    ).reshape(maps_4d.shape[0], 1, 1, 1)
+    baseline = baseline.to(dtype=maps_4d.dtype)
+    local_excess = (maps_4d - baseline).clamp_min(0.0)
     contrast_map = local_excess + float(global_retention) * baseline
     blend = float(local_blend)
-    return (1.0 - blend) * anomaly_maps + blend * contrast_map
+    result = (1.0 - blend) * maps_4d + blend * contrast_map
+    return result.reshape(original_shape)

@@ -59,6 +59,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-eval", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--allow-partial", action="store_true")
+    parser.add_argument(
+        "--export-testc-predictions-zip",
+        action="store_true",
+        help=(
+            "Optionally archive Test_C predictions for debugging. The archive "
+            "is explicitly marked as not competition-submittable."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -300,6 +308,8 @@ def main() -> int:
                 config,
                 checkpoint=args.checkpoint,
                 allow_partial=args.allow_partial,
+                artifact_kind="testc_evaluation",
+                package_zip=args.export_testc_predictions_zip,
             )
             return 0
         checkpoint_path = resolve_competition_checkpoint(output_dir, args.checkpoint)
@@ -328,6 +338,8 @@ def main() -> int:
             config,
             checkpoint=args.checkpoint,
             allow_partial=args.allow_partial,
+            artifact_kind="testc_evaluation",
+            package_zip=args.export_testc_predictions_zip,
         )
         _update_manifest(run_dir, run_manifest, status="scoring_testc")
         evaluation = evaluate_testc_submission(
@@ -336,6 +348,9 @@ def main() -> int:
             submission_result=submission,
             output_dir=output_dir,
             image_top_ratio=float(wrapper["testc"].get("image_top_ratio", 0.01)),
+            recommended_checkpoint_steps=int(
+                wrapper["testc"].get("recommended_checkpoint_steps", 6000)
+            ),
         )
         latency = None
         if not args.skip_latency and bool(config.get("latency", {}).get("enabled", False)):

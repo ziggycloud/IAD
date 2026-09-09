@@ -365,8 +365,13 @@ def main() -> int:
         _write_state(
             output_dir,
             status=result["status"],
-            next_action="Upload the generated submission.zip manually.",
+            next_action=(
+                "Upload the generated submission.zip manually."
+                if result.get("competition_submit_ready")
+                else "Diagnostic artifact only; do not upload this ZIP."
+            ),
             zip=result["zip"],
+            competition_submit_ready=result.get("competition_submit_ready", False),
             submission_csv=result["submission_csv"],
             validation=result["validation"],
         )

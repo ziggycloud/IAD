@@ -5,6 +5,7 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
+import torch
 
 from realiad_dinomaly2.testc_data import (
     SourceObject,
@@ -13,6 +14,7 @@ from realiad_dinomaly2.testc_data import (
     select_category_objects,
 )
 from realiad_dinomaly2.testc_evaluation import compute_testc_score
+from realiad_dinomaly2.losses import debias_unseen_novelty, reconstruction_loss
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,3 +100,47 @@ def test_protocol_rejects_wrong_category_count(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="50 seen and 50 unseen"):
         load_testc_protocol(path)
+
+
+def test_unseen_novelty_debias_preserves_multiview_shape_and_local_peak() -> None:
+    maps = torch.ones((2, 5, 1, 4, 4))
+    maps[:, :, :, 1, 1] = 3.0
+    result = debias_unseen_novelty(
+        maps,
+        baseline_quantile=0.5,
+        local_blend=1.0,
+        global_retention=0.0,
+    )
+    assert result.shape == maps.shape
+    assert torch.all(result[:, :, :, 0, 0] == 0)
+    assert torch.all(result[:, :, :, 1, 1] == 2)
+
+
+def test_object_scoped_loose_loss_is_micro_batch_invariant() -> None:
+    encoder = torch.randn(2, 5, 4, 2, 2)
+    decoder_values = encoder + 0.2 * torch.randn_like(encoder)
+    decoder = decoder_values.clone().requires_grad_(True)
+    together = reconstruction_loss(
+        [encoder],
+        [decoder],
+        discard_rate=0.5,
+        loose_loss=True,
+        selection_scope="object",
+    )
+    together.backward()
+    together_gradient = decoder.grad.detach().clone()
+
+    decoder_separate = decoder_values.clone().requires_grad_(True)
+    separate = sum(
+        reconstruction_loss(
+            [encoder[index : index + 1]],
+            [decoder_separate[index : index + 1]],
+            discard_rate=0.5,
+            loose_loss=True,
+            selection_scope="object",
+        )
+        for index in range(2)
+    ) / 2
+    separate.backward()
+    assert float(together.detach()) == pytest.approx(float(separate.detach()), abs=1e-6)
+    assert torch.allclose(together_gradient, decoder_separate.grad, atol=1e-6)
