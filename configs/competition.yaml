@@ -144,8 +144,8 @@ evaluation:
 
 submission:
   mask_size: 448
-  # Object batch; each item contains five independent output masks.
-  batch_size: 2
+  # Four objects x five views = a 20-frame inference forward on each GPU.
+  batch_size: 4
   num_workers: 4
   object_top_ratio: 0.01
   # Per-category monotonic 8-bit calibration. The extreme upper quantile keeps

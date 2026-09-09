@@ -307,8 +307,16 @@ def main() -> int:
                 )
             train(config, resume=args.resume)
 
-        # torchrun workers stop here; rank 0 alone writes the shared package.
+        # Rank 0 fits shared priors. Submission inference itself is sharded by
+        # category, so every torchrun worker must join it.
         if not is_primary:
+            if args.skip_inference:
+                return 0
+            generate_competition_submission(
+                config,
+                checkpoint=args.checkpoint,
+                allow_partial=args.allow_partial,
+            )
             return 0
         checkpoint_path = resolve_competition_checkpoint(
             output_dir,

@@ -235,6 +235,13 @@ def main() -> int:
                     _update_manifest(run_dir, run_manifest, status="training_zero_shot")
                 train_zero_shot(config, resume=args.resume)
         if not is_primary:
+            if args.skip_eval:
+                return 0
+            generate_competition_submission(
+                config,
+                checkpoint=args.checkpoint,
+                allow_partial=args.allow_partial,
+            )
             return 0
         checkpoint_path = resolve_competition_checkpoint(output_dir, args.checkpoint)
         _update_manifest(

@@ -12,6 +12,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -40,6 +41,37 @@ from .runtime import (
     setup_seed,
     utc_now,
 )
+
+
+def _inference_worker_context(
+    config: dict[str, Any],
+) -> tuple[torch.device, int, int, bool]:
+    """Use one GPU per torchrun worker and shard independent categories."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    if world_size <= 1:
+        return resolve_device(str(config["runtime"]["device"])), rank, world_size, False
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    configured = torch.device(str(config["runtime"]["device"]))
+    if configured.type == "cuda":
+        if not torch.cuda.is_available() or local_rank >= torch.cuda.device_count():
+            raise RuntimeError(f"LOCAL_RANK={local_rank} is not an available CUDA device")
+        device = torch.device("cuda", local_rank)
+        torch.cuda.set_device(device)
+        backend = "nccl" if dist.is_nccl_available() else "gloo"
+    else:
+        device, backend = configured, "gloo"
+    initialized_here = not dist.is_initialized()
+    if initialized_here:
+        dist.init_process_group(backend=backend, init_method="env://")
+    return device, rank, world_size, initialized_here
+
+
+def _finish_inference_worker(initialized_here: bool) -> None:
+    if dist.is_initialized():
+        dist.barrier()
+    if initialized_here and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def resolve_competition_checkpoint(
@@ -233,7 +265,9 @@ def _write_mask(
     scaled = np.clip((anomaly - lower) / (upper - lower), 0.0, 1.0)
     encoded = np.rint(scaled * 255.0).astype(np.uint8)
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(encoded, mode="L").save(path, format="PNG", optimize=True)
+    Image.fromarray(encoded, mode="L").save(
+        path, format="PNG", optimize=False, compress_level=1
+    )
 
 
 def _category_masks_are_valid(
@@ -345,7 +379,7 @@ def build_submission_zip(
         temporary,
         mode="w",
         compression=zipfile.ZIP_DEFLATED,
-        compresslevel=6,
+        compresslevel=1,
     ) as archive:
         for member in expected_members:
             archive.write(submission_root / Path(member), arcname=member)
@@ -387,20 +421,24 @@ def generate_competition_submission(
     submission_root = run_dir / "package"
     mask_root = submission_root / "predicted_masks"
     category_result_dir = run_dir / "per_category"
+    device, rank, world_size, initialized_here = _inference_worker_context(config)
     logger = setup_logger(
-        "competition_submission", run_dir / "inference.log"
+        "competition_submission",
+        run_dir / ("inference.log" if rank == 0 else f"inference.rank{rank}.log"),
     )
-    atomic_write_json(
-        run_dir / "metadata.json",
-        {
-            "signature": signature,
-            "inputs": signature_inputs,
-            "created_at": utc_now(),
-            "manifest": manifest.summary(),
-        },
-    )
-
-    device = resolve_device(str(config["runtime"]["device"]))
+    if world_size > 1:
+        dist.barrier()
+    if rank == 0:
+        atomic_write_json(
+            run_dir / "metadata.json",
+            {
+                "signature": signature,
+                "inputs": signature_inputs,
+                "created_at": utc_now(),
+                "manifest": manifest.summary(),
+                "inference_workers": world_size,
+            },
+        )
     setup_seed(
         int(config["experiment"]["seed"]),
         bool(config["runtime"]["deterministic"]),
@@ -471,6 +509,8 @@ def generate_competition_submission(
 
     all_rows: list[dict[str, Any]] = []
     for index, category in enumerate(manifest.categories, start=1):
+        if (index - 1) % world_size != rank:
+            continue
         category_views = manifest.views_for_category(category)
         result_path = category_result_dir / f"{category}.json"
         category_mask_root = mask_root / category
@@ -691,6 +731,17 @@ def generate_competition_submission(
             },
         )
         all_rows.extend(rows)
+
+    if world_size > 1:
+        _finish_inference_worker(initialized_here)
+        if rank != 0:
+            return {"status": "worker_complete", "rank": rank, "world_size": world_size}
+        all_rows = []
+        for category in manifest.categories:
+            result_path = category_result_dir / f"{category}.json"
+            if not result_path.is_file():
+                raise RuntimeError(f"Missing distributed inference result: {result_path}")
+            all_rows.extend(_read_category_rows(result_path))
 
     expected_order = list(manifest.group_folders)
     row_by_group = {row["group_folder"]: row for row in all_rows}
