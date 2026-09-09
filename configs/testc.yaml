@@ -11,6 +11,8 @@ testc:
   anomaly_objects_per_category: 10
   views_per_object: 5
   image_top_ratio: 0.01
+  recommended_checkpoint_steps: 6000
+  recommended_zero_shot_steps: 5000
   data_root: auto
 
 latency:

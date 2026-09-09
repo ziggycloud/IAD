@@ -53,6 +53,43 @@ def _dice_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return (1.0 - numerator / denominator).mean()
 
 
+def _map_object_logits(
+    logits: torch.Tensor,
+    frame_labels: torch.Tensor,
+    *,
+    views_per_object: int = 5,
+    top_ratio: float = 0.01,
+    max_blend: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a submission-aligned object score from train-time anomaly maps.
+
+    Training used to supervise a separate global CLIP head even though the
+    competition CSV score is computed only from five local maps. This helper
+    makes the primary image loss optimize the corresponding map-derived
+    five-view statistic before inference-only resizing and smoothing.
+    """
+    if logits.ndim != 4 or logits.shape[1] != 1:
+        raise ValueError("zero-shot map logits must have shape [N,1,H,W]")
+    if logits.shape[0] % views_per_object:
+        raise ValueError("frame count must be divisible by views_per_object")
+    if not 0.0 < top_ratio <= 1.0:
+        raise ValueError("top_ratio must be in (0, 1]")
+    if not 0.0 <= max_blend <= 1.0:
+        raise ValueError("max_blend must be in [0, 1]")
+    probabilities = logits.sigmoid().flatten(1)
+    top_count = max(1, int(probabilities.shape[1] * top_ratio))
+    per_view = probabilities.topk(top_count, dim=1).values.mean(dim=1)
+    per_object = per_view.reshape(-1, views_per_object)
+    object_probability = (
+        max_blend * per_object.max(dim=1).values
+        + (1.0 - max_blend) * per_object.mean(dim=1)
+    )
+    eps = torch.finfo(object_probability.dtype).eps
+    object_logits = torch.logit(object_probability.clamp(eps, 1.0 - eps))
+    object_labels = frame_labels.reshape(-1, views_per_object).max(dim=1).values
+    return object_logits, object_labels
+
+
 def _learning_rate(step: int, config: dict[str, Any]) -> float:
     total = int(config["total_steps"])
     warmup = int(config.get("warmup_steps", 0))
@@ -215,7 +252,17 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 if positive.any()
                 else branch_logits.new_zeros(())
             )
+            object_logits, object_labels = _map_object_logits(
+                branch_logits,
+                labels,
+                views_per_object=5,
+                top_ratio=float(train_config.get("map_object_top_ratio", 0.01)),
+                max_blend=float(train_config.get("map_object_max_blend", 0.5)),
+            )
             image_loss = F.binary_cross_entropy_with_logits(
+                object_logits, object_labels
+            )
+            global_image_loss = F.binary_cross_entropy_with_logits(
                 branch_image_logits, labels
             )
             clean = labels == 0
@@ -235,6 +282,8 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 float(train_config.get("focal_weight", 1.0)) * focal
                 + float(train_config.get("dice_weight", 1.0)) * dice
                 + float(train_config.get("image_weight", 0.25)) * image_loss
+                + float(train_config.get("global_image_weight", 0.1))
+                * global_image_loss
                 + float(train_config.get("clean_weight", 0.2)) * clean_loss
                 + float(train_config.get("prompt_anchor_weight", 0.01))
                 * anchor_loss
@@ -298,6 +347,10 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 "focal_loss": float(focal.detach()),
                 "dice_loss": float(dice.detach()),
                 "image_loss": float(image_loss.detach()),
+                "global_image_loss": float(global_image_loss.detach()),
+                "synthetic_object_positive_fraction": float(
+                    object_labels.float().mean()
+                ),
                 "clean_loss": float(clean_loss.detach()),
                 "prompt_anchor_loss": float(anchor_loss.detach()),
                 "positive_fraction": float(positive.float().mean()),

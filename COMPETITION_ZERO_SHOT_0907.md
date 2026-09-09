@@ -26,8 +26,8 @@ category appeared in Train?
          │  ├─ learned prompt residual
          │  └─ residual textual adapter
          ├─ weighted visual/textual pixel logits -> anomaly mask
-         └─ weighted global logits + local top-1% mean
-            -> per-view anomaly score
+         └─ local map top-1% over five views
+            -> 0.5 * max + 0.5 * mean object score
 ```
 
 The visual and textual adapters are optimized on alternating steps. Each step
@@ -36,8 +36,11 @@ cannot suppress its gradient through a harmonic mean. Dice is evaluated only
 for non-empty anomaly masks; focal loss uses explicit positive alpha. The
 frozen CLIP backbone remains unchanged throughout. Training supervision comes
 from defects synthesized from the competition's normal training views and
-includes pixel focal loss, Dice loss, image-level BCE, clean-image suppression
-and a prompt-anchor regularizer.
+includes pixel focal loss, Dice loss, map-derived five-view object BCE,
+an auxiliary global-head BCE, clean-image suppression and a prompt-anchor
+regularizer. The primary object loss now follows the submission's map-derived
+five-view statistic before inference-only resizing/smoothing, instead of
+supervising only a global head that is absent from final scoring.
 
 At inference, no Dinomaly/CLIP heatmap blending is performed for unseen
 categories. Five per-view image scores are aggregated as

@@ -104,6 +104,31 @@ def _hard_normal_augment(rgb: torch.Tensor, probability: float) -> torch.Tensor:
     return (output * (1.0 - selected) + changed * selected).clamp(0.0, 1.0)
 
 
+def _object_anomaly_visibility(
+    batch: int,
+    *,
+    group_size: int,
+    object_probability: float,
+    view_probability: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sample balanced object labels with potentially invisible defect views."""
+    if group_size <= 0 or batch % group_size:
+        raise ValueError("batch must be divisible by a positive object group size")
+    object_count = batch // group_size
+    object_anomalous = torch.rand(object_count, device=device) < object_probability
+    visible = torch.rand(object_count, group_size, device=device) < view_probability
+    # An anomalous object must have at least one visible synthetic defect, while
+    # the remaining views may stay normal like Test_C's null-mask semantics.
+    missing = object_anomalous & ~visible.any(dim=1)
+    if bool(missing.any()):
+        fallback_view = torch.randint(0, group_size, (int(missing.sum()),), device=device)
+        visible[missing] = False
+        visible[missing, fallback_view] = True
+    visible &= object_anomalous[:, None]
+    return visible.reshape(batch, 1, 1, 1)
+
+
 def synthesize_defects(
     normalized_images: torch.Tensor,
     config: dict[str, Any],
@@ -130,9 +155,21 @@ def synthesize_defects(
         config.get("scratch_probability", 0.35)
     )
     mask = torch.where(choose_scratch, scratch, blob) & support
-    anomalous = torch.rand(batch, 1, 1, 1, device=rgb.device) < float(
-        config.get("anomaly_probability", 0.75)
-    )
+    group_size = int(config.get("object_group_size", 1))
+    if group_size > 1:
+        anomalous = _object_anomaly_visibility(
+            batch,
+            group_size=group_size,
+            object_probability=float(
+                config.get("object_anomaly_probability", 0.5)
+            ),
+            view_probability=float(config.get("view_anomaly_probability", 0.6)),
+            device=rgb.device,
+        )
+    else:
+        anomalous = torch.rand(batch, 1, 1, 1, device=rgb.device) < float(
+            config.get("anomaly_probability", 0.75)
+        )
     mask &= anomalous
 
     # Mix four defect families: foreign texture, discoloration, missing

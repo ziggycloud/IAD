@@ -122,6 +122,9 @@ def _validate(config: dict[str, Any]) -> None:
                 "model.multi_view.missing_view_policy must be error, "
                 "pad_and_mask, or drop_incomplete"
             )
+    loose_loss_scope = str(config["training"].get("loose_loss_scope", "batch"))
+    if loose_loss_scope not in {"batch", "object"}:
+        raise ValueError("training.loose_loss_scope must be batch or object")
 
     train_image_dir = dataset.get("train_image_dir")
     if train_image_dir is not None and not isinstance(train_image_dir, (str, Path)):
@@ -297,7 +300,29 @@ def _validate(config: dict[str, Any]) -> None:
                     "zero_shot.training.focal_alpha must be in (0, 1)"
                 )
             for key in (
+                "focal_weight",
+                "dice_weight",
+                "image_weight",
+                "global_image_weight",
+                "clean_weight",
+                "prompt_anchor_weight",
+            ):
+                if float(zero_training.get(key, 0.0)) < 0:
+                    raise ValueError(f"zero_shot.training.{key} must be non-negative")
+            map_ratio = float(zero_training.get("map_object_top_ratio", 0.01))
+            map_blend = float(zero_training.get("map_object_max_blend", 0.5))
+            if not 0.0 < map_ratio <= 1.0:
+                raise ValueError(
+                    "zero_shot.training.map_object_top_ratio must be in (0, 1]"
+                )
+            if not 0.0 <= map_blend <= 1.0:
+                raise ValueError(
+                    "zero_shot.training.map_object_max_blend must be in [0, 1]"
+                )
+            for key in (
                 "anomaly_probability",
+                "object_anomaly_probability",
+                "view_anomaly_probability",
                 "hard_normal_probability",
                 "scratch_probability",
                 "feature_anomaly_probability",
@@ -307,6 +332,10 @@ def _validate(config: dict[str, Any]) -> None:
                     raise ValueError(
                         f"zero_shot.synthesis.{key} must be in [0, 1]"
                     )
+            if int(synthesis.get("object_group_size", 1)) <= 0:
+                raise ValueError(
+                    "zero_shot.synthesis.object_group_size must be positive"
+                )
             min_area = float(synthesis.get("min_area_ratio", 0.0))
             max_area = float(synthesis.get("max_area_ratio", 0.0))
             if not 0.0 < min_area < max_area < 1.0:
@@ -480,12 +509,13 @@ def _validate(config: dict[str, Any]) -> None:
         if aggregation not in {
             "legacy_concat_topk",
             "max",
+            "mean",
             "softmax",
             "visibility_aware",
         }:
             raise ValueError(
                 "submission.object_score_aggregation must be one of "
-                "legacy_concat_topk, max, softmax, visibility_aware"
+                "legacy_concat_topk, max, mean, softmax, visibility_aware"
             )
         if float(submission.get("object_score_softmax_temperature", 0.25)) <= 0:
             raise ValueError(
@@ -497,6 +527,13 @@ def _validate(config: dict[str, Any]) -> None:
         if not 0.0 <= visibility_max_blend <= 1.0:
             raise ValueError(
                 "submission.visibility_max_blend must be in [0, 1]"
+            )
+        zero_shot_max_blend = float(
+            submission.get("zero_shot_object_max_blend", 0.5)
+        )
+        if not 0.0 <= zero_shot_max_blend <= 1.0:
+            raise ValueError(
+                "submission.zero_shot_object_max_blend must be in [0, 1]"
             )
     normal_prior = evaluation.get("normal_prior", {})
     if not isinstance(normal_prior, dict):
@@ -603,6 +640,7 @@ def semantic_config(config: dict[str, Any]) -> dict[str, Any]:
             "final_lr_ratio",
             "loose_loss_warmup_steps",
             "loose_loss_final_discard",
+            "loose_loss_scope",
             "generalized_regularization_weight",
             "gradient_clip_norm",
         )

@@ -322,11 +322,14 @@ python run_competition_pipeline.py `
 # 实体复制数据并执行内置结构审计；同签名可断点续传
 python prepare_testc.py
 
-# 审计 → 训练/续训 → normal prior → 原提交路径推理 → 本地 GT 评分
+# 审计 → 训练/续训 → normal prior → Test_C 预测 → 本地 GT 评分
 python run_testc_pipeline.py
 
 # 复用完整 checkpoint，仅推理和评分
 python run_testc_pipeline.py --skip-train --checkpoint auto
+
+# 可选导出仅用于搬运/检查的 Test_C 预测包（明确不可提交）
+python run_testc_pipeline.py --skip-train --export-testc-predictions-zip
 
 # 比较两个或更多历史评估目录
 python compare_testc_runs.py <run1> <run2> --output comparison.csv
@@ -336,3 +339,8 @@ python compare_testc_runs.py <run1> <run2> --output comparison.csv
 显式覆盖。评估直接复用比赛 submission predictor，因此 anomaly map、后处理与五视角
 object score 完全一致。输出包含运行签名、训练/eval JSONL、逐类 CSV/JSON、综合评分、
 性能诊断和模型登记记录；协议与实验记录见 [MODEL_EVOLUTION.md](MODEL_EVOLUTION.md)。
+
+Test_C 默认写入 `outputs/testc_adaptclip_0907/testc_predictions/`，不生成比赛
+submission ZIP。只有把官方 Test_B 放在 `data/competition/Test_B` 并运行
+`python run_competition_pipeline.py --test-b --skip-train --checkpoint auto` 后，
+`competition_submission/<签名>/submission.zip` 才是经过 Test_B 布局校验的可提交包。

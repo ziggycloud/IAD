@@ -269,6 +269,8 @@ def _aggregate_object_score(
     )
     if mode == "max":
         return float(per_view.max())
+    if mode == "mean":
+        return float(per_view.mean())
     if mode == "softmax":
         if softmax_temperature <= 0:
             raise ValueError("softmax_temperature must be positive")
@@ -294,8 +296,8 @@ def _aggregate_object_score(
             + (1.0 - visibility_max_blend) * weighted
         )
     raise ValueError(
-        "object_score_aggregation must be legacy_concat_topk, max, softmax, "
-        "or visibility_aware"
+        "object_score_aggregation must be legacy_concat_topk, max, mean, "
+        "softmax, or visibility_aware"
     )
 
 
@@ -472,10 +474,19 @@ def generate_competition_submission(
     config: dict[str, Any],
     checkpoint: str = "auto",
     allow_partial: bool = False,
+    *,
+    artifact_kind: str = "competition_submission",
+    package_zip: bool = True,
 ) -> dict[str, Any]:
     # Keep package-layout validation importable in lightweight environments.
     from .metrics import GaussianFilter
 
+    if artifact_kind not in {"competition_submission", "testc_evaluation"}:
+        raise ValueError(f"Unsupported prediction artifact kind: {artifact_kind}")
+    is_competition_submission = artifact_kind == "competition_submission"
+    artifact_namespace = (
+        "competition_submission" if is_competition_submission else "testc_predictions"
+    )
     output_dir = Path(config["experiment"]["output_dir"])
     checkpoint_path = resolve_competition_checkpoint(output_dir, checkpoint)
     dataset_config = config["dataset"]
@@ -511,7 +522,7 @@ def generate_competition_submission(
         unseen_clip_active=unseen_clip_active,
         zero_shot_active=zero_shot_active,
     )
-    run_dir = output_dir / "competition_submission" / signature[:12]
+    run_dir = output_dir / artifact_namespace / signature[:12]
     submission_root = run_dir / "package"
     mask_root = submission_root / "predicted_masks"
     category_result_dir = run_dir / "per_category"
@@ -533,6 +544,8 @@ def generate_competition_submission(
                 "created_at": utc_now(),
                 "manifest": manifest.summary(),
                 "inference_workers": world_size,
+                "artifact_kind": artifact_kind,
+                "competition_submission_intent": is_competition_submission,
             },
         )
     setup_seed(
@@ -609,6 +622,9 @@ def generate_competition_submission(
     )
     visibility_max_blend = float(
         submission.get("visibility_max_blend", 0.5)
+    )
+    zero_shot_max_blend = float(
+        submission.get("zero_shot_object_max_blend", 0.5)
     )
     gaussian = GaussianFilter(
         kernel_size=int(config["evaluation"]["gaussian_kernel_size"]),
@@ -996,7 +1012,7 @@ def generate_competition_submission(
                 raw_score = _zero_shot_object_score(
                     grouped_maps[group_folder],
                     object_top_ratio,
-                    max_blend=visibility_max_blend,
+                    max_blend=zero_shot_max_blend,
                 )
             else:
                 raw_score = _aggregate_object_score(
@@ -1040,6 +1056,7 @@ def generate_competition_submission(
                     "top_ratio": object_top_ratio,
                     "softmax_temperature": aggregation_temperature,
                     "visibility_max_blend": visibility_max_blend,
+                    "zero_shot_max_blend": zero_shot_max_blend,
                 },
                 "rows": rows,
             },
@@ -1082,31 +1099,72 @@ def generate_competition_submission(
     validation = validate_submission_layout(
         submission_root, manifest, mask_size=mask_size
     )
-    zip_path = build_submission_zip(
-        submission_root,
-        run_dir / "submission.zip",
-        manifest,
+    zip_path = None
+    if package_zip:
+        zip_name = (
+            "submission.zip"
+            if is_competition_submission
+            else "testc_predictions_not_for_submission.zip"
+        )
+        zip_path = build_submission_zip(submission_root, run_dir / zip_name, manifest)
+    zero_shot_metadata: dict[str, Any] = {}
+    zero_shot_complete = True
+    if zero_shot_active:
+        zero_path = zero_shot_checkpoint_path(config)
+        zero_payload = torch.load(zero_path, map_location="cpu", weights_only=False)
+        zero_completed = int(zero_payload.get("completed_steps", -1))
+        zero_training_completed = int(
+            zero_payload.get("training_completed_steps", zero_completed)
+        )
+        zero_total = int(config["zero_shot"]["training"]["total_steps"])
+        zero_shot_complete = zero_training_completed == zero_total
+        zero_shot_metadata = {
+            "zero_shot_checkpoint": str(zero_path),
+            "zero_shot_checkpoint_steps": zero_completed,
+            "zero_shot_training_completed_steps": zero_training_completed,
+            "zero_shot_total_steps": zero_total,
+            "zero_shot_checkpoint_selection": zero_payload.get("selection"),
+        }
+    training_complete = training_completed_steps == total_steps
+    run_complete = training_complete and zero_shot_complete
+    competition_submit_ready = bool(
+        is_competition_submission and run_complete and zip_path is not None
     )
     result = {
-        "status": "partial_diagnostic" if completed_steps != total_steps else "complete",
+        "status": "complete" if run_complete else "partial_diagnostic",
         "completed_at": utc_now(),
         "signature": signature,
         "checkpoint": str(checkpoint_path),
         "checkpoint_steps": completed_steps,
+        "training_completed_steps": training_completed_steps,
+        "total_steps": total_steps,
+        "checkpoint_selection": checkpoint_payload.get("selection"),
         "submission_root": str(submission_root),
         "submission_csv": str(csv_path),
-        "zip": str(zip_path),
+        "artifact_kind": artifact_kind,
+        "competition_submit_ready": competition_submit_ready,
+        "evaluated_split_root": str(manifest.root),
+        "zip": str(zip_path) if zip_path is not None else None,
         "validation": validation,
+        **zero_shot_metadata,
     }
     atomic_write_json(run_dir / "result.json", result)
     atomic_write_json(
-        output_dir / "competition_submission" / "latest.json",
+        output_dir / artifact_namespace / "latest.json",
         {
             "signature": signature,
             "result": str(run_dir / "result.json"),
-            "zip": str(zip_path),
+            "artifact_kind": artifact_kind,
+            "competition_submit_ready": competition_submit_ready,
+            "zip": str(zip_path) if zip_path is not None else None,
             "updated_at": utc_now(),
         },
     )
-    logger.info("Competition submission ready: %s", zip_path)
+    if is_competition_submission:
+        logger.info("Competition submission ready: %s", zip_path)
+    else:
+        logger.info(
+            "Test_C predictions ready (not competition-submittable): %s",
+            submission_root,
+        )
     return result

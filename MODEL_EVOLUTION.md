@@ -17,6 +17,8 @@ Every run captures commit/branch/dirty state, resolved config, protocol and Test
 | Date | Commit / run_id | Architecture or training change | Checkpoint selection | Test_C score | Finding / next action |
 |---|---|---|---|---:|---|
 | 2026-09-09 | AdaptCLIP 0907 protocol | Initial reproducible Test_C evaluation pipeline | complete Dinomaly + best zero-shot | — | Compare against reconstruction-only reference |
+| 2026-09-09 | ec82659f evaluation | AdaptCLIP Test_C diagnostic; Dinomaly best snapshot at step 2660 | Prior run log says Dinomaly training reached configured step 3000; old report incorrectly labeled the best snapshot partial | 70.9619 | Strong unseen classification gain, but unseen pixel AP 0.1948 and pixel AUROC regression expose localization inconsistency. |
+| 2026-09-09 | post-ec82659f | Object-scoped Dinomaly Loose Loss; mean aggregation for seen; map-derived five-view AdaptCLIP object loss; separate checkpoint completion metadata and Test_C artifacts | Retrain both Dinomaly (6000) and zero-shot (5000) from fingerprints changed by training semantics | — | Compare category-level regressions and pixel metrics against ec82659f; do not tune from Test_C labels during inference. |
 
 ## Experiment template
 

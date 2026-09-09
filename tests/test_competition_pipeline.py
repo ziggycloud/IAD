@@ -138,6 +138,14 @@ class CompetitionDataTests(unittest.TestCase):
             0.6,
         )
 
+    def test_mean_object_score_is_unweighted_view_consensus(self) -> None:
+        maps = [np.full((4, 4), value, dtype=np.float32) for value in range(5)]
+        per_view = [_top_ratio_score([array], 0.25) for array in maps]
+        self.assertEqual(
+            _aggregate_object_score(maps, 0.25, mode="mean"),
+            float(np.mean(per_view)),
+        )
+
 
 class CompetitionPackageTests(unittest.TestCase):
     def test_validator_and_zip_have_exact_official_layout(self) -> None:

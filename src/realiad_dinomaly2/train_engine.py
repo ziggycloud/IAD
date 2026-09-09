@@ -451,6 +451,7 @@ def _run_probe(
             discard_rate=0.0,
             loose_loss=bool(config["model"]["loose_loss"]),
             valid_view_mask=valid_view_mask,
+            selection_scope=str(config["training"].get("loose_loss_scope", "batch")),
         )
         loss = (
             reconstruction + regularization_weight * regularizer
@@ -1212,6 +1213,7 @@ def _train_impl(
     if (
         batch_choice.accumulation_steps > 1
         and bool(config["model"]["loose_loss"])
+        and str(config["training"].get("loose_loss_scope", "batch")) == "batch"
     ):
         note = (
             "micro-batch 小于 effective batch 时，Loose Loss 的 top-k 阈值"
@@ -1351,6 +1353,9 @@ def _train_impl(
                                 discard_rate=discard_rate,
                                 loose_loss=bool(config["model"]["loose_loss"]),
                                 valid_view_mask=valid_view_mask,
+                                selection_scope=str(
+                                    config["training"].get("loose_loss_scope", "batch")
+                                ),
                             )
                             raw_loss = (
                                 reconstruction
