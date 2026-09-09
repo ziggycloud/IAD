@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-"""Safely merge independently split Real-IAD Variety ZIP archives.
+"""Safely merge independently split Test_C ZIP archives.
 
-The Test_C evaluators first need a source tree like::
+Two archive layouts are supported:
 
-    <output-root>/
-      realiadvariety_1024/
-      realiadvariety_jsons/
+1. A raw Real-IAD Variety source tree, restored as::
 
-They then build the competition-shaped Test_C from the official JSON test
-split via ``prepare_testc.py``. This program intentionally does *not* sample
-or rename Test_C objects; it only restores the downloaded source archives.
+       <output-root>/realiadvariety_1024/
+       <output-root>/realiadvariety_jsons/
+
+2. The already prepared Test_C layout used by the Test_C evaluation branches::
+
+       <output-root>/images/<category>/<sample>/<view>.png
+       <output-root>/masks/<category>/<sample>/<view>_mask.png
+       <output-root>/manifest.json
+
+For layout 2, the ZIP's leading ``Test_C/`` directory is removed while
+extracting. The output root must therefore be the exact Test_C directory, for
+example ``data/competition/Test_C``. This program never samples or renames
+objects; it only restores the downloaded archive contents.
 """
 
 from __future__ import annotations
@@ -33,6 +41,7 @@ KNOWN_ROOTS = {
     "real-iad_variety_jsons": JSON_ROOT,
     "real_iad_variety_jsons": JSON_ROOT,
 }
+TESTC_ARCHIVE_ROOTS = {"test_c", "test-c", "testc"}
 WRAPPER_NAMES = {
     "real-iad_variety_jsons",
     "real_iad_variety_jsons",
@@ -95,6 +104,9 @@ def _target_for(member_name: str) -> Path | None:
     # Archives may contain a top-level Real-IAD_Variety directory, or may put
     # the two required roots directly at their ZIP root.
     for index, part in enumerate(lowered):
+        if part in TESTC_ARCHIVE_ROOTS:
+            suffix = list(parts[index + 1:])
+            return Path(*suffix) if suffix else None
         if part in KNOWN_ROOTS:
             root = KNOWN_ROOTS[part]
             suffix = list(parts[index + 1:])
@@ -153,7 +165,19 @@ def _archives(directory: Path, expected: int) -> list[Path]:
     return archives
 
 
-def plan(archives: list[Path]) -> tuple[list[Member], dict[str, int]]:
+def _archive_layout(archive: Path, sample_limit: int = 12) -> dict[str, object]:
+    """Return a compact, copy-pasteable archive inventory for diagnosis."""
+    with zipfile.ZipFile(archive) as source:
+        files = [info.filename for info in source.infolist() if not info.is_dir()]
+    return {
+        "archive": archive.name,
+        "file_count": len(files),
+        "top_level": sorted({str(PurePosixPath(name).parts[0]) for name in files}),
+        "sample_paths": files[:sample_limit],
+    }
+
+
+def plan(archives: list[Path]) -> tuple[list[Member], dict[str, object]]:
     members: list[Member] = []
     seen: dict[Path, Member] = {}
     ignored = 0
@@ -183,12 +207,22 @@ def plan(archives: list[Path]) -> tuple[list[Member], dict[str, int]]:
                 members.append(current)
     roots = {item.target.parts[0] for item in members}
     missing_roots = {IMAGE_ROOT, JSON_ROOT} - roots
-    if missing_roots:
+    raw_source = not missing_roots
+    prepared_testc = {"images", "masks"}.issubset(roots) and any(
+        item.target == Path("manifest.json") for item in members
+    )
+    if not raw_source and not prepared_testc:
+        layouts = [_archive_layout(archive) for archive in archives]
         raise ValueError(
-            "ZIP layout does not expose required roots "
-            f"{sorted(missing_roots)}. Inspect the archive top-level names."
+            "ZIP layout is neither a raw Real-IAD source archive nor an "
+            "already prepared Test_C archive. Archive inventory:\n"
+            f"{json.dumps(layouts, ensure_ascii=False, indent=2)}"
         )
-    return members, {"ignored_members": ignored, "planned_members": len(members)}
+    return members, {
+        "layout": "raw_realiad_source" if raw_source else "prepared_testc",
+        "ignored_members": ignored,
+        "planned_members": len(members),
+    }
 
 
 def extract(members: list[Member], output_root: Path, dry_run: bool) -> dict[str, int]:
@@ -234,10 +268,11 @@ def main() -> int:
         "output_root": str(args.output_root.expanduser().resolve()),
         **counts,
         **extract(members, args.output_root, args.dry_run),
-        "required_roots": [IMAGE_ROOT, JSON_ROOT],
         "next_command": (
             "python prepare_testc.py --source-root "
             f"{args.output_root.expanduser().resolve()}"
+            if counts["layout"] == "raw_realiad_source"
+            else "Test_C is ready; run run_testc_pipeline.py with the parent data root."
         ),
     }
     if not args.dry_run:
