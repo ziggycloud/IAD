@@ -228,11 +228,18 @@ def main() -> int:
             if is_primary:
                 _update_manifest(run_dir, run_manifest, status="training")
             train(config, resume=args.resume)
-            if bool(config.get("zero_shot", {}).get("enabled", False)):
+            # The zero-shot trainer is deliberately single-process.  The
+            # preceding Dinomaly phase has already torn down its DDP group;
+            # starting this trainer on every torchrun rank would make every
+            # worker resolve runtime.device (normally cuda:0), duplicating
+            # the CLIP model on one device.  Non-primary ranks continue to
+            # the category-sharded inference rendezvous below and wait there.
+            if is_primary and bool(
+                config.get("zero_shot", {}).get("enabled", False)
+            ):
                 from realiad_dinomaly2.zero_shot_engine import train_zero_shot
 
-                if is_primary:
-                    _update_manifest(run_dir, run_manifest, status="training_zero_shot")
+                _update_manifest(run_dir, run_manifest, status="training_zero_shot")
                 train_zero_shot(config, resume=args.resume)
         # Test_C inference is category-sharded across torchrun ranks. Rank 0
         # performs prior fitting and final scoring; other ranks only write
