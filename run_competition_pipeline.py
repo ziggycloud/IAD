@@ -311,8 +311,17 @@ def main() -> int:
                 )
             train(config, resume=args.resume)
 
-        # torchrun workers stop here; rank 0 alone writes the shared package.
+        # Training and prior fitting are rank-zero operations. Inference below
+        # is category-sharded by generate_competition_submission, so every
+        # torchrun worker must join it.
         if not is_primary:
+            if args.skip_inference:
+                return 0
+            generate_competition_submission(
+                config,
+                checkpoint=args.checkpoint,
+                allow_partial=args.allow_partial,
+            )
             return 0
         if (
             not args.skip_train

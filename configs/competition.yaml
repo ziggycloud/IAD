@@ -302,8 +302,10 @@ zero_shot:
 
 submission:
   mask_size: 448
-  # Object batch; each item contains five independent output masks.
-  batch_size: 2
+  # Object batch; each item contains five independent output masks.  Four
+  # objects means a 20-frame ViT forward, which is appropriate for A40-class
+  # inference GPUs and halves forward calls relative to the old batch of two.
+  batch_size: 4
   num_workers: 4
   object_top_ratio: 0.01
   # Per-category monotonic 8-bit calibration. The extreme upper quantile keeps
