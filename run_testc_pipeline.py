@@ -9,6 +9,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -186,6 +187,46 @@ def _update_manifest(run_dir: Path, payload: dict[str, Any], **changes: Any) -> 
     append_jsonl(run_dir / "pipeline_events.jsonl", {"timestamp": utc_now(), **changes})
 
 
+def _inference_rendezvous_path(output_dir: Path) -> Path:
+    return output_dir / "testc_inference_rendezvous.json"
+
+
+def _set_inference_rendezvous(
+    path: Path, run_id: str, status: str, **details: Any
+) -> None:
+    atomic_write_json(
+        path,
+        {"run_id": run_id, "status": status, "updated_at": utc_now(), **details},
+    )
+
+
+def _wait_for_inference_rendezvous(
+    path: Path, run_id: str, timeout_seconds: int
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_status = "missing"
+    while time.monotonic() < deadline:
+        if path.is_file():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                payload = {}
+            if payload.get("run_id") == run_id:
+                last_status = str(payload.get("status", "unknown"))
+                if last_status == "ready":
+                    return
+                if last_status == "failed":
+                    raise RuntimeError(
+                        "Test_C primary rank failed before distributed inference: "
+                        f"{payload.get('error', 'see run_manifest.json')}"
+                    )
+        time.sleep(1)
+    raise TimeoutError(
+        f"Timed out after {timeout_seconds}s waiting for Test_C primary rank "
+        f"to prepare inference artifacts ({last_status})"
+    )
+
+
 def main() -> int:
     args = parse_args()
     wrapper = _load_wrapper(args.config)
@@ -223,6 +264,14 @@ def main() -> int:
             train_audit=train_audit,
         )
     output_dir = Path(config["experiment"]["output_dir"])
+    rendezvous_path = _inference_rendezvous_path(output_dir)
+    rendezvous_timeout = int(
+        config.get("testc", {}).get("inference_rendezvous_timeout_seconds", 7200)
+    )
+    if is_primary and not args.skip_eval:
+        _set_inference_rendezvous(
+            rendezvous_path, run_manifest["run_id"], "preparing"
+        )
     try:
         if not args.skip_train:
             if is_primary:
@@ -247,6 +296,9 @@ def main() -> int:
         if not is_primary:
             if args.skip_eval:
                 return 0
+            _wait_for_inference_rendezvous(
+                rendezvous_path, run_manifest["run_id"], rendezvous_timeout
+            )
             generate_competition_submission(
                 config,
                 checkpoint=args.checkpoint,
@@ -267,6 +319,13 @@ def main() -> int:
         if args.skip_eval:
             _update_manifest(run_dir, run_manifest, status="trained")
             return 0
+        _set_inference_rendezvous(
+            rendezvous_path,
+            run_manifest["run_id"],
+            "ready",
+            checkpoint=str(checkpoint_path),
+            checkpoint_sha256=file_sha256(checkpoint_path),
+        )
         _update_manifest(run_dir, run_manifest, status="inferring_testc")
         submission = generate_competition_submission(
             config,
@@ -305,10 +364,24 @@ def main() -> int:
         return 0
     except KeyboardInterrupt:
         if is_primary:
+            if not args.skip_eval:
+                _set_inference_rendezvous(
+                    rendezvous_path,
+                    run_manifest["run_id"],
+                    "failed",
+                    error="primary rank interrupted",
+                )
             _update_manifest(run_dir, run_manifest, status="interrupted")
         return 130
     except Exception as exc:
         if is_primary:
+            if not args.skip_eval:
+                _set_inference_rendezvous(
+                    rendezvous_path,
+                    run_manifest["run_id"],
+                    "failed",
+                    error=repr(exc),
+                )
             _update_manifest(
                 run_dir,
                 run_manifest,
