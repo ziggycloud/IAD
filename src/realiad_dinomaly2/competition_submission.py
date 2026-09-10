@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import time
 import zipfile
 from collections import defaultdict
 from pathlib import Path
@@ -12,7 +13,6 @@ from typing import Any, Iterable
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -45,12 +45,12 @@ from .runtime import (
 
 def _inference_worker_context(
     config: dict[str, Any],
-) -> tuple[torch.device, int, int, bool]:
-    """Use one GPU per torchrun worker and shard independent categories."""
+) -> tuple[torch.device, int, int]:
+    """Use one GPU per worker without starting a second NCCL group."""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     if world_size <= 1:
-        return resolve_device(str(config["runtime"]["device"])), rank, world_size, False
+        return resolve_device(str(config["runtime"]["device"])), rank, world_size
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
     configured = torch.device(str(config["runtime"]["device"]))
     if configured.type == "cuda":
@@ -61,17 +61,7 @@ def _inference_worker_context(
         backend = "nccl" if dist.is_nccl_available() else "gloo"
     else:
         device, backend = configured, "gloo"
-    initialized_here = not dist.is_initialized()
-    if initialized_here:
-        dist.init_process_group(backend=backend, init_method="env://")
-    return device, rank, world_size, initialized_here
-
-
-def _finish_inference_worker(initialized_here: bool) -> None:
-    if dist.is_initialized():
-        dist.barrier()
-    if initialized_here and dist.is_initialized():
-        dist.destroy_process_group()
+    return device, rank, world_size
 
 
 def resolve_competition_checkpoint(
@@ -465,13 +455,11 @@ def generate_competition_submission(
     submission_root = run_dir / "package"
     mask_root = submission_root / "predicted_masks"
     category_result_dir = run_dir / "per_category"
-    device, rank, world_size, initialized_here = _inference_worker_context(config)
+    device, rank, world_size = _inference_worker_context(config)
     logger = setup_logger(
         "competition_submission",
         run_dir / ("inference.log" if rank == 0 else f"inference.rank{rank}.log"),
     )
-    if world_size > 1:
-        dist.barrier()
     if rank == 0:
         atomic_write_json(
             run_dir / "metadata.json",
@@ -800,9 +788,23 @@ def generate_competition_submission(
         all_rows.extend(rows)
 
     if world_size > 1:
-        _finish_inference_worker(initialized_here)
         if rank != 0:
             return {"status": "worker_complete", "rank": rank, "world_size": world_size}
+        timeout = int(submission.get("distributed_result_timeout_seconds", 7200))
+        deadline = time.monotonic() + timeout
+        while True:
+            missing = [
+                category for category in manifest.categories
+                if not (category_result_dir / f"{category}.json").is_file()
+            ]
+            if not missing:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for distributed category results: "
+                    f"{missing[:10]}"
+                )
+            time.sleep(1)
         all_rows = []
         for category in manifest.categories:
             result_path = category_result_dir / f"{category}.json"
