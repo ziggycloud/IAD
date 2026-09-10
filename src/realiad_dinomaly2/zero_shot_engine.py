@@ -53,6 +53,31 @@ def _dice_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return (1.0 - numerator / denominator).mean()
 
 
+def _boundary_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Match thin target boundaries without dilating the full anomaly mask."""
+    probability = logits.sigmoid()
+    prediction_edge = F.max_pool2d(probability, 3, stride=1, padding=1) - (
+        -F.max_pool2d(-probability, 3, stride=1, padding=1)
+    )
+    target_edge = F.max_pool2d(targets, 3, stride=1, padding=1) - (
+        -F.max_pool2d(-targets, 3, stride=1, padding=1)
+    )
+    weighting = target_edge + 0.25
+    weighting = weighting / weighting.mean().clamp_min(1e-6)
+    return (weighting * (prediction_edge - target_edge).abs()).mean()
+
+
+def _prompt_diversity_loss(prompts: torch.Tensor) -> torch.Tensor:
+    if prompts.ndim != 2 or prompts.shape[0] <= 2:
+        return prompts.new_zeros(())
+    broken = F.normalize(prompts[1:], dim=-1, eps=1e-6)
+    gram = broken @ broken.transpose(0, 1)
+    off_diagonal = gram - torch.eye(
+        gram.shape[0], device=gram.device, dtype=gram.dtype
+    )
+    return off_diagonal.square().mean()
+
+
 def _map_object_logits(
     logits: torch.Tensor,
     frame_labels: torch.Tensor,
@@ -160,8 +185,8 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
     )
     dataset = CompetitionObjectDataset(
         manifest.views,
-        image_size=int(config["dataset"]["image_size"]),
-        crop_size=int(config["dataset"]["crop_size"]),
+        image_size=int(config["zero_shot"]["model"]["image_size"]),
+        crop_size=int(config["zero_shot"]["model"]["image_size"]),
         num_views=5,
         missing_view_policy="error",
     )
@@ -272,6 +297,11 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 if positive.any()
                 else branch_logits.new_zeros(())
             )
+            boundary = (
+                _boundary_loss(branch_logits[positive], target[positive])
+                if positive.any()
+                else branch_logits.new_zeros(())
+            )
             object_logits, object_labels = _map_object_logits(
                 branch_logits,
                 labels,
@@ -302,15 +332,23 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 if step % 2 == 0
                 else output["logits"].new_zeros(())
             )
+            prompt_diversity = (
+                _prompt_diversity_loss(model.learned_prompts())
+                if step % 2 == 0
+                else output["logits"].new_zeros(())
+            )
             loss = (
                 float(train_config.get("focal_weight", 1.0)) * focal
                 + float(train_config.get("dice_weight", 1.0)) * dice
+                + float(train_config.get("boundary_weight", 0.0)) * boundary
                 + float(train_config.get("image_weight", 0.25)) * image_loss
                 + float(train_config.get("global_image_weight", 0.1))
                 * global_image_loss
                 + float(train_config.get("clean_weight", 0.2)) * clean_loss
                 + float(train_config.get("prompt_anchor_weight", 0.01))
                 * anchor_loss
+                + float(train_config.get("prompt_diversity_weight", 0.0))
+                * prompt_diversity
             )
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -371,6 +409,7 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 "ema_loss": ema_loss,
                 "focal_loss": float(focal.detach()),
                 "dice_loss": float(dice.detach()),
+                "boundary_loss": float(boundary.detach()),
                 "image_loss": float(image_loss.detach()),
                 "global_image_loss": float(global_image_loss.detach()),
                 "synthetic_object_positive_fraction": float(
@@ -378,6 +417,7 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 ),
                 "clean_loss": float(clean_loss.detach()),
                 "prompt_anchor_loss": float(anchor_loss.detach()),
+                "prompt_diversity_loss": float(prompt_diversity.detach()),
                 "positive_fraction": float(positive.float().mean()),
                 "learning_rate": lr,
                 "grad_norm": float(grad_norm),

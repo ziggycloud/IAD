@@ -1,8 +1,8 @@
 base_config: competition.yaml
 
 experiment:
-  name: testc_adaptclip_0907
-  output_dir: outputs/testc_adaptclip_0907
+  name: testc_0910clip
+  output_dir: outputs/testc_0910clip
 
 testc:
   protocol_file: configs/testc_protocol.json
@@ -13,6 +13,9 @@ testc:
   image_top_ratio: 0.01
   recommended_checkpoint_steps: 6000
   recommended_zero_shot_steps: 5000
+  # Non-primary torchrun ranks wait here while rank 0 completes the independent
+  # CLIP stage; high-resolution 5k-step training can exceed the old 2h default.
+  inference_rendezvous_timeout_seconds: 43200
   data_root: auto
 
 latency:

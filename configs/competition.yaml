@@ -121,14 +121,23 @@ zero_shot:
     weights_dir: third_party/OpenCLIP/weights
     force_quick_gelu: true
     image_size: 518
+    # Keep unseen images at this resolution from disk; the old pipeline first
+    # reduced them to 448 and then enlarged them back to 518 inside CLIP.
+    dense_output_size: 259
     intermediate_layers: 4
     intermediate_layer_weights: [0.1, 0.2, 0.3, 0.4]
     semantic_temperature: 0.10
     visual_fusion_weight: 0.65
     image_local_weight: 0.35
-    image_top_ratio: 0.01
+    image_top_ratio: 0.005
     adapter_hidden_dim: 192
+    refiner_hidden_dim: 16
     dropout: 0.1
+    compound_prompt_count: 10
+    prompt_prior_temperature: 1.0
+    frequency_weight: 0.25
+    foreground_suppression: 0.35
+    foreground_floor: 0.20
     normal_prompts:
       - an intact industrial object
       - a flawless undamaged component
@@ -164,22 +173,24 @@ zero_shot:
     focal_alpha: 0.75
     focal_weight: 1.0
     dice_weight: 1.5
+    boundary_weight: 0.5
     image_weight: 0.5
     # Primary image supervision follows the local/global five-view submission
     # statistic before inference-only resizing/smoothing. A per-frame global
     # loss remains as auxiliary supervision for the true CLIP image token.
     global_image_weight: 0.1
-    map_object_top_ratio: 0.01
+    map_object_top_ratio: 0.005
     # The real Test_C report measured mean-view AUROC 0.6908 versus the
     # submitted 0.6718, so train against pure five-view consensus.
     map_object_max_blend: 0.0
     # Add category-agnostic CLIP image-token evidence to the local top-k score.
-    map_object_global_weight: 0.35
+    map_object_global_weight: 0.10
     # Fixed-horizon selection avoids choosing an early synthetic-loss optimum
     # (the latest run selected step 1560/5000) with no real unseen validation.
     checkpoint_selection: final
-    clean_weight: 0.1
+    clean_weight: 0.2
     prompt_anchor_weight: 0.001
+    prompt_diversity_weight: 0.01
     log_every: 20
     checkpoint_every: 500
     auto_resume: true
@@ -191,13 +202,21 @@ zero_shot:
     view_anomaly_probability: 0.60
     anomaly_probability: 0.60
     hard_normal_probability: 0.5
-    scratch_probability: 0.35
-    min_area_ratio: 0.002
-    max_area_ratio: 0.12
+    scratch_probability: 0.30
+    tiny_probability: 0.35
+    ring_probability: 0.15
+    min_area_ratio: 0.0002
+    max_area_ratio: 0.10
     alpha_min: 0.55
     alpha_max: 1.0
     feature_anomaly_probability: 0.2
     feature_noise_std: 0.04
+  inference:
+    # Four overlapping crops recover small LED/pin/fuse anomalies which are
+    # diluted in a single full-frame CLIP token grid.
+    window_enabled: true
+    window_size_ratio: 0.65
+    window_weight: 0.35
 
 
 submission:
@@ -213,8 +232,12 @@ submission:
   object_score_aggregation: legacy_concat_topk
   # AdaptCLIP unseen scoring remains isolated from the seen path.
   zero_shot_object_max_blend: 0.0
-  zero_shot_object_global_weight: 0.35
+  zero_shot_object_global_weight: 0.10
+  zero_shot_object_top_ratio: 0.005
   zero_shot_mask_calibration: per_category
+  # Monotonic dynamic-range expansion before uint8 prevents low-amplitude
+  # unseen maps from collapsing into nearly all-black PNGs.
+  zero_shot_mask_gamma: 0.45
 
 runtime:
   device: cuda:0

@@ -294,6 +294,35 @@ def _validate(config: dict[str, Any]) -> None:
                         raise ValueError(
                             f"zero_shot.model.{key} must be in (0, 1)"
                         )
+                if int(zero_model.get("dense_output_size", 0)) <= 0:
+                    raise ValueError(
+                        "zero_shot.model.dense_output_size must be positive"
+                    )
+                compound_count = int(zero_model.get("compound_prompt_count", 1))
+                if not 1 <= compound_count <= len(zero_model["broken_prompts"]):
+                    raise ValueError(
+                        "zero_shot.model.compound_prompt_count must not exceed "
+                        "the number of broken prompts"
+                    )
+                if float(zero_model.get("frequency_weight", 0.0)) < 0.0:
+                    raise ValueError(
+                        "zero_shot.model.frequency_weight must be non-negative"
+                    )
+                if float(zero_model.get("prompt_prior_temperature", 0.0)) <= 0.0:
+                    raise ValueError(
+                        "zero_shot.model.prompt_prior_temperature must be positive"
+                    )
+                foreground_floor = float(
+                    zero_model.get("foreground_floor", 0.2)
+                )
+                if not 0.0 < foreground_floor <= 1.0:
+                    raise ValueError(
+                        "zero_shot.model.foreground_floor must be in (0, 1]"
+                    )
+                if float(zero_model.get("foreground_suppression", 0.0)) < 0.0:
+                    raise ValueError(
+                        "zero_shot.model.foreground_suppression must be non-negative"
+                    )
             focal_alpha = float(zero_training.get("focal_alpha", 0.75))
             if not 0.0 < focal_alpha < 1.0:
                 raise ValueError(
@@ -306,6 +335,8 @@ def _validate(config: dict[str, Any]) -> None:
                 "global_image_weight",
                 "clean_weight",
                 "prompt_anchor_weight",
+                "boundary_weight",
+                "prompt_diversity_weight",
             ):
                 if float(zero_training.get(key, 0.0)) < 0:
                     raise ValueError(f"zero_shot.training.{key} must be non-negative")
@@ -340,12 +371,42 @@ def _validate(config: dict[str, Any]) -> None:
                 "view_anomaly_probability",
                 "hard_normal_probability",
                 "scratch_probability",
+                "tiny_probability",
+                "ring_probability",
                 "feature_anomaly_probability",
             ):
                 value = float(synthesis.get(key, 0.0))
                 if not 0.0 <= value <= 1.0:
                     raise ValueError(
                         f"zero_shot.synthesis.{key} must be in [0, 1]"
+                    )
+            morphology_probability = sum(
+                float(synthesis.get(key, 0.0))
+                for key in (
+                    "scratch_probability",
+                    "tiny_probability",
+                    "ring_probability",
+                )
+            )
+            if morphology_probability > 1.0:
+                raise ValueError(
+                    "zero_shot synthesis morphology probabilities must sum to <= 1"
+                )
+            zero_inference = zero_shot.get("inference", {})
+            if not isinstance(zero_inference, dict):
+                raise ValueError("zero_shot.inference must be a mapping")
+            if bool(zero_inference.get("window_enabled", False)):
+                window_ratio = float(
+                    zero_inference.get("window_size_ratio", 0.65)
+                )
+                window_weight = float(zero_inference.get("window_weight", 0.35))
+                if not 0.5 <= window_ratio < 1.0:
+                    raise ValueError(
+                        "zero_shot.inference.window_size_ratio must be in [0.5, 1)"
+                    )
+                if not 0.0 <= window_weight <= 1.0:
+                    raise ValueError(
+                        "zero_shot.inference.window_weight must be in [0, 1]"
                     )
             if int(synthesis.get("object_group_size", 1)) <= 0:
                 raise ValueError(
@@ -556,6 +617,23 @@ def _validate(config: dict[str, Any]) -> None:
         if not 0.0 <= zero_shot_global_weight <= 1.0:
             raise ValueError(
                 "submission.zero_shot_object_global_weight must be in [0, 1]"
+            )
+        zero_shot_top_ratio = float(
+            submission.get(
+                "zero_shot_object_top_ratio",
+                submission.get("object_top_ratio", 0.01),
+            )
+        )
+        if not 0.0 < zero_shot_top_ratio <= 1.0:
+            raise ValueError(
+                "submission.zero_shot_object_top_ratio must be in (0, 1]"
+            )
+        zero_shot_mask_gamma = float(
+            submission.get("zero_shot_mask_gamma", 1.0)
+        )
+        if not 0.0 < zero_shot_mask_gamma <= 1.0:
+            raise ValueError(
+                "submission.zero_shot_mask_gamma must be in (0, 1]"
             )
         if submission.get("zero_shot_mask_calibration", "per_category") not in {
             "per_category",

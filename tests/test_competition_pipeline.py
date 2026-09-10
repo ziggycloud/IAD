@@ -22,8 +22,10 @@ from realiad_dinomaly2.competition_data import (  # noqa: E402
     scan_competition_split,
 )
 from realiad_dinomaly2.competition_submission import (  # noqa: E402
+    _calibration_bounds,
     _aggregate_object_score,
     _top_ratio_score,
+    _write_mask,
     _zero_shot_object_score,
     build_submission_zip,
     resolve_competition_checkpoint,
@@ -53,6 +55,31 @@ def _temporary_directory():
 
 
 class CompetitionDataTests(unittest.TestCase):
+    def test_zero_shot_gamma_encoding_prevents_near_black_quantization(self) -> None:
+        anomaly = np.asarray(
+            [[0.0, 1e-6, 4e-6, 9e-6, 16e-6]], dtype=np.float32
+        )
+        with _temporary_directory() as root:
+            linear_path = root / "linear.png"
+            gamma_path = root / "gamma.png"
+            _write_mask(anomaly, linear_path, 0.0, 1e-3)
+            _write_mask(anomaly, gamma_path, 0.0, 1e-3, gamma=0.45)
+            linear = np.asarray(Image.open(linear_path), dtype=np.uint8)
+            expanded = np.asarray(Image.open(gamma_path), dtype=np.uint8)
+            self.assertGreater(int(expanded.max()), int(linear.max()))
+            self.assertGreater(np.unique(expanded).size, np.unique(linear).size)
+            self.assertEqual(np.argsort(expanded.ravel()).tolist(), [0, 1, 2, 3, 4])
+
+    def test_calibration_bounds_resolve_narrow_probability_range(self) -> None:
+        maps = [
+            np.linspace(0.001, 0.00101, 1024, dtype=np.float32).reshape(32, 32),
+            np.linspace(0.001002, 0.00102, 1024, dtype=np.float32).reshape(32, 32),
+        ]
+        lower, upper = _calibration_bounds(maps, 0.001, 0.999)
+        self.assertLess(lower, upper)
+        self.assertGreaterEqual(lower, min(float(value.min()) for value in maps))
+        self.assertLessEqual(upper, max(float(value.max()) for value in maps))
+
     def test_auto_checkpoint_prefers_best_and_falls_back_to_final(self) -> None:
         with _temporary_directory() as root:
             checkpoint_dir = root / "checkpoints"

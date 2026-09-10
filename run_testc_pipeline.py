@@ -53,7 +53,22 @@ from realiad_dinomaly2.train_engine import train  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train on competition Train and evaluate the exact Test_B categories on Test_C."
+        description=(
+            "Train on competition Train and evaluate the exact Test_B "
+            "categories on Test_C."
+        )
+    )
+    parser.add_argument(
+        "data_root_positional",
+        nargs="?",
+        type=Path,
+        help="Data root (positional shorthand for --data-root).",
+    )
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        choices=("testb",),
+        help="Append 'testb' to run submission-only packaging.",
     )
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "testc.yaml")
     parser.add_argument("--data-root", type=Path, default=None)
@@ -300,12 +315,17 @@ def _wait_for_inference_rendezvous(
 
 def main() -> int:
     args = parse_args()
-    if args.testb:
+    if args.data_root is not None and args.data_root_positional is not None:
+        raise ValueError(
+            "Pass the data root either positionally or via --data-root, not both"
+        )
+    data_root_argument = args.data_root or args.data_root_positional
+    if args.testb or args.mode == "testb":
         from run_testb_submission import run_testb_submission
 
         result = run_testb_submission(
             config_path=args.config,
-            data_root=args.data_root,
+            data_root=data_root_argument,
             testb_dir=args.testb_dir,
             checkpoint=args.checkpoint,
             checkpoint_config=args.checkpoint_config,
@@ -316,7 +336,7 @@ def main() -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     wrapper = _load_wrapper(args.config)
-    data_root = _resolve_data_root(wrapper, args.data_root)
+    data_root = _resolve_data_root(wrapper, data_root_argument)
     protocol_path = ROOT / "configs" / "testc_protocol.json"
     protocol = load_testc_protocol(protocol_path)
     testc_root = data_root / "competition" / "Test_C"

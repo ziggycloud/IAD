@@ -50,12 +50,13 @@ from .runtime import (
     utc_now,
 )
 from .zero_shot_model import (
+    infer_zero_shot_multiscale,
     load_zero_shot_segmenter,
     zero_shot_checkpoint_path,
 )
 
 
-ZERO_SHOT_SCORING_VERSION = "map_global_view_mean_v2"
+ZERO_SHOT_SCORING_VERSION = "compound_multiscale_gamma_v3"
 
 
 def _inference_worker_context(
@@ -339,8 +340,17 @@ def _write_mask(
     path: Path,
     lower: float,
     upper: float,
+    gamma: float = 1.0,
 ) -> None:
     scaled = np.clip((anomaly - lower) / (upper - lower), 0.0, 1.0)
+    if not 0.0 < gamma <= 1.0:
+        raise ValueError("mask gamma must be in (0, 1]")
+    # CLIP anomaly probabilities often occupy a very narrow interval with a
+    # sparse high tail. A monotonic gamma before uint8 encoding preserves the
+    # ordering while preventing almost every non-peak pixel from quantizing to
+    # black. This is applied only to zero-shot masks.
+    if gamma != 1.0:
+        scaled = np.power(scaled, gamma)
     encoded = np.rint(scaled * 255.0).astype(np.uint8)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Pillow's optimize pass is disproportionately expensive for thousands of
@@ -631,6 +641,13 @@ def generate_competition_submission(
     zero_shot_global_weight = float(
         submission.get("zero_shot_object_global_weight", 0.0)
     )
+    zero_shot_top_ratio = float(
+        submission.get("zero_shot_object_top_ratio", object_top_ratio)
+    )
+    zero_shot_mask_gamma = float(
+        submission.get("zero_shot_mask_gamma", 1.0)
+    )
+    zero_shot_inference = config.get("zero_shot", {}).get("inference", {})
     zero_shot_mask_calibration = str(
         submission.get("zero_shot_mask_calibration", "per_category")
     )
@@ -676,11 +693,25 @@ def generate_competition_submission(
             len(category_views),
             "zero_shot" if category_uses_zero_shot else "dinomaly",
         )
+        # Do not downsample unseen inputs to the 448px Dinomaly resolution and
+        # then enlarge them inside CLIP. Read them directly at CLIP's native
+        # configured resolution so its 37x37 token grid contains
+        # real image detail rather than interpolated 32x32 content.
+        inference_image_size = (
+            int(config["zero_shot"]["model"]["image_size"])
+            if category_uses_zero_shot
+            else int(dataset_config["image_size"])
+        )
+        inference_crop_size = (
+            inference_image_size
+            if category_uses_zero_shot
+            else int(dataset_config["crop_size"])
+        )
         if multi_view_enabled:
             dataset = CompetitionObjectDataset(
                 category_views,
-                image_size=int(dataset_config["image_size"]),
-                crop_size=int(dataset_config["crop_size"]),
+                image_size=inference_image_size,
+                crop_size=inference_crop_size,
                 num_views=int(multi_view_config.get("num_views", 5)),
                 missing_view_policy=str(
                     multi_view_config.get("missing_view_policy", "error")
@@ -689,8 +720,8 @@ def generate_competition_submission(
         else:
             dataset = CompetitionFolderDataset(
                 category_views,
-                image_size=int(dataset_config["image_size"]),
-                crop_size=int(dataset_config["crop_size"]),
+                image_size=inference_image_size,
+                crop_size=inference_crop_size,
             )
         maps: list[np.ndarray] = []
         zero_shot_global_scores: list[float] = []
@@ -715,7 +746,11 @@ def generate_competition_submission(
                     flat_images = images.reshape(
                         batch_size * view_count, *images.shape[2:]
                     )
-                    zero_output = zero_shot_segmenter(flat_images)
+                    zero_output = infer_zero_shot_multiscale(
+                        zero_shot_segmenter,
+                        flat_images,
+                        zero_shot_inference,
+                    )
                     current = zero_output["probability"]
                     current_global = zero_output["global_probability"].reshape(
                         batch_size, view_count
@@ -891,7 +926,11 @@ def generate_competition_submission(
                 )
                 if category_uses_zero_shot:
                     assert zero_shot_segmenter is not None
-                    zero_output = zero_shot_segmenter(images)
+                    zero_output = infer_zero_shot_multiscale(
+                        zero_shot_segmenter,
+                        images,
+                        zero_shot_inference,
+                    )
                     current = zero_output["probability"]
                     zero_shot_global_scores.extend(
                         float(value)
@@ -1030,6 +1069,9 @@ def generate_competition_submission(
                 / f"{view.view_id}_mask.png",
                 lower,
                 upper,
+                gamma=(
+                    zero_shot_mask_gamma if category_uses_zero_shot else 1.0
+                ),
             )
         rows = []
         for group_folder in dict.fromkeys(
@@ -1038,7 +1080,7 @@ def generate_competition_submission(
             if category_uses_zero_shot:
                 raw_score = _zero_shot_object_score(
                     grouped_maps[group_folder],
-                    object_top_ratio,
+                    zero_shot_top_ratio,
                     global_scores=grouped_global_scores[group_folder],
                     global_weight=zero_shot_global_weight,
                     max_blend=zero_shot_max_blend,
@@ -1079,6 +1121,9 @@ def generate_competition_submission(
                     "upper": upper,
                     "lower_quantile": lower_quantile,
                     "upper_quantile": upper_quantile,
+                    "gamma": (
+                        zero_shot_mask_gamma if category_uses_zero_shot else 1.0
+                    ),
                     "mode": (
                         zero_shot_mask_calibration
                         if category_uses_zero_shot
@@ -1092,6 +1137,7 @@ def generate_competition_submission(
                     "visibility_max_blend": visibility_max_blend,
                     "zero_shot_max_blend": zero_shot_max_blend,
                     "zero_shot_global_weight": zero_shot_global_weight,
+                    "zero_shot_top_ratio": zero_shot_top_ratio,
                 },
                 "rows": rows,
             },

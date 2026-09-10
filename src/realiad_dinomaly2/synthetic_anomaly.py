@@ -94,6 +94,50 @@ def _scratch_mask(
     return (distance < thickness)[:, None]
 
 
+def _tiny_mask(
+    batch: int, height: int, width: int, device: torch.device
+) -> torch.Tensor:
+    """Pins, LEDs and fuse defects often occupy far below 0.2% of the image."""
+    yy, xx = torch.meshgrid(
+        torch.arange(height, device=device),
+        torch.arange(width, device=device),
+        indexing="ij",
+    )
+    xx = xx.float()[None]
+    yy = yy.float()[None]
+    center_x = torch.rand(batch, 1, 1, device=device) * width
+    center_y = torch.rand(batch, 1, 1, device=device) * height
+    radius = (0.003 + 0.012 * torch.rand(batch, 1, 1, device=device)) * min(
+        height, width
+    )
+    aspect = torch.empty(batch, 1, 1, device=device).uniform_(0.35, 1.0)
+    distance = ((xx - center_x) / aspect).square() + (yy - center_y).square()
+    return (distance < radius.square())[:, None]
+
+
+def _ring_mask(
+    batch: int, height: int, width: int, device: torch.device
+) -> torch.Tensor:
+    yy, xx = torch.meshgrid(
+        torch.arange(height, device=device),
+        torch.arange(width, device=device),
+        indexing="ij",
+    )
+    xx = xx.float()[None]
+    yy = yy.float()[None]
+    center_x = torch.rand(batch, 1, 1, device=device) * width
+    center_y = torch.rand(batch, 1, 1, device=device) * height
+    radius = (0.01 + 0.04 * torch.rand(batch, 1, 1, device=device)) * min(
+        height, width
+    )
+    thickness = torch.maximum(
+        torch.ones_like(radius),
+        radius * torch.empty(batch, 1, 1, device=device).uniform_(0.15, 0.35),
+    )
+    distance = ((xx - center_x).square() + (yy - center_y).square()).sqrt()
+    return ((distance > radius - thickness) & (distance < radius + thickness))[:, None]
+
+
 def _hard_normal_augment(rgb: torch.Tensor, probability: float) -> torch.Tensor:
     output = rgb.clone()
     selected = (torch.rand(rgb.shape[0], 1, 1, 1, device=rgb.device) < probability).float()
@@ -151,10 +195,29 @@ def synthesize_defects(
         float(config.get("max_area_ratio", 0.18)),
     )
     scratch = _scratch_mask(batch, height, width, rgb.device)
-    choose_scratch = torch.rand(batch, 1, 1, 1, device=rgb.device) < float(
-        config.get("scratch_probability", 0.35)
+    tiny = _tiny_mask(batch, height, width, rgb.device)
+    ring = _ring_mask(batch, height, width, rgb.device)
+    selector = torch.rand(batch, 1, 1, 1, device=rgb.device)
+    tiny_probability = float(config.get("tiny_probability", 0.0))
+    ring_probability = float(config.get("ring_probability", 0.0))
+    scratch_probability = float(config.get("scratch_probability", 0.35))
+    mask = torch.where(selector < tiny_probability, tiny, blob)
+    mask = torch.where(
+        (selector >= tiny_probability)
+        & (selector < tiny_probability + ring_probability),
+        ring,
+        mask,
     )
-    mask = torch.where(choose_scratch, scratch, blob) & support
+    mask = torch.where(
+        (selector >= tiny_probability + ring_probability)
+        & (
+            selector
+            < tiny_probability + ring_probability + scratch_probability
+        ),
+        scratch,
+        mask,
+    )
+    mask &= support
     group_size = int(config.get("object_group_size", 1))
     if group_size > 1:
         anomalous = _object_anomaly_visibility(
