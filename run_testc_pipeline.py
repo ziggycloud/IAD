@@ -67,6 +67,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument(
+        "--testb",
+        "--test-b",
+        action="store_true",
+        help=(
+            "Submission-only mode: use completed checkpoints to infer Test_B "
+            "and build submission.zip; skip all Test_C preparation, training, "
+            "evaluation, and latency work."
+        ),
+    )
+    parser.add_argument(
+        "--testb-dir",
+        type=Path,
+        default=None,
+        help="Optional Test_B directory; defaults to <data-root>/competition/Test_B.",
+    )
+    parser.add_argument(
         "--export-testc-predictions-zip",
         action="store_true",
         help="Archive Test_C predictions as an explicitly non-submittable ZIP.",
@@ -284,6 +300,21 @@ def _wait_for_inference_rendezvous(
 
 def main() -> int:
     args = parse_args()
+    if args.testb:
+        from run_testb_submission import run_testb_submission
+
+        result = run_testb_submission(
+            config_path=args.config,
+            data_root=args.data_root,
+            testb_dir=args.testb_dir,
+            checkpoint=args.checkpoint,
+            checkpoint_config=args.checkpoint_config,
+            overrides=args.set,
+            allow_partial=args.allow_partial,
+        )
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     wrapper = _load_wrapper(args.config)
     data_root = _resolve_data_root(wrapper, args.data_root)
     protocol_path = ROOT / "configs" / "testc_protocol.json"

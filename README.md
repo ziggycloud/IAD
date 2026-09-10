@@ -247,6 +247,12 @@ python run_competition_pipeline.py --test-b
 
 # 已有完整 checkpoint 时只执行 Test_B 推理与打包
 python run_competition_pipeline.py --test-b --skip-train
+
+# 从 Test_C 入口直接进入 submission-only 模式；不准备/训练/评估 Test_C
+python run_testc_pipeline.py --testb
+
+# 同一功能也可以直接调用独立脚本
+python run_testb_submission.py
 ```
 
 默认数据路径和配置分别为 `data/competition/Train`、
