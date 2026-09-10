@@ -310,7 +310,10 @@ def _validate(config: dict[str, Any]) -> None:
                 if float(zero_training.get(key, 0.0)) < 0:
                     raise ValueError(f"zero_shot.training.{key} must be non-negative")
             map_ratio = float(zero_training.get("map_object_top_ratio", 0.01))
-            map_blend = float(zero_training.get("map_object_max_blend", 0.5))
+            map_blend = float(zero_training.get("map_object_max_blend", 0.0))
+            map_global_weight = float(
+                zero_training.get("map_object_global_weight", 0.0)
+            )
             if not 0.0 < map_ratio <= 1.0:
                 raise ValueError(
                     "zero_shot.training.map_object_top_ratio must be in (0, 1]"
@@ -318,6 +321,18 @@ def _validate(config: dict[str, Any]) -> None:
             if not 0.0 <= map_blend <= 1.0:
                 raise ValueError(
                     "zero_shot.training.map_object_max_blend must be in [0, 1]"
+                )
+            if not 0.0 <= map_global_weight <= 1.0:
+                raise ValueError(
+                    "zero_shot.training.map_object_global_weight must be in [0, 1]"
+                )
+            checkpoint_selection = str(
+                zero_training.get("checkpoint_selection", "final")
+            )
+            if checkpoint_selection not in {"final", "training_ema"}:
+                raise ValueError(
+                    "zero_shot.training.checkpoint_selection must be final or "
+                    "training_ema"
                 )
             for key in (
                 "anomaly_probability",
@@ -529,11 +544,26 @@ def _validate(config: dict[str, Any]) -> None:
                 "submission.visibility_max_blend must be in [0, 1]"
             )
         zero_shot_max_blend = float(
-            submission.get("zero_shot_object_max_blend", 0.5)
+            submission.get("zero_shot_object_max_blend", 0.0)
         )
         if not 0.0 <= zero_shot_max_blend <= 1.0:
             raise ValueError(
                 "submission.zero_shot_object_max_blend must be in [0, 1]"
+            )
+        zero_shot_global_weight = float(
+            submission.get("zero_shot_object_global_weight", 0.0)
+        )
+        if not 0.0 <= zero_shot_global_weight <= 1.0:
+            raise ValueError(
+                "submission.zero_shot_object_global_weight must be in [0, 1]"
+            )
+        if submission.get("zero_shot_mask_calibration", "per_category") not in {
+            "per_category",
+            "probability",
+        }:
+            raise ValueError(
+                "submission.zero_shot_mask_calibration must be per_category or "
+                "probability"
             )
     normal_prior = evaluation.get("normal_prior", {})
     if not isinstance(normal_prior, dict):

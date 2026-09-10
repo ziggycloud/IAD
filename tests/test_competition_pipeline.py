@@ -128,7 +128,7 @@ class CompetitionDataTests(unittest.TestCase):
             0.5 * _aggregate_object_score(maps, 0.1, mode="max"),
         )
 
-    def test_zero_shot_score_is_coupled_to_written_maps(self) -> None:
+    def test_zero_shot_score_combines_local_and_global_evidence(self) -> None:
         maps = [np.zeros((4, 4), dtype=np.float32) for _ in range(5)]
         self.assertEqual(_zero_shot_object_score(maps, 0.1), 0.0)
 
@@ -136,6 +136,16 @@ class CompetitionDataTests(unittest.TestCase):
         self.assertAlmostEqual(
             _zero_shot_object_score(maps, 0.1, max_blend=0.5),
             0.6,
+        )
+        self.assertAlmostEqual(
+            _zero_shot_object_score(
+                maps,
+                0.1,
+                global_scores=[0.2] * 5,
+                global_weight=0.25,
+                max_blend=0.0,
+            ),
+            0.2,
         )
 
     def test_mean_object_score_is_unweighted_view_consensus(self) -> None:

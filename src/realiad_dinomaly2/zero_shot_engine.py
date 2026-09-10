@@ -57,9 +57,11 @@ def _map_object_logits(
     logits: torch.Tensor,
     frame_labels: torch.Tensor,
     *,
+    global_logits: torch.Tensor | None = None,
+    global_weight: float = 0.0,
     views_per_object: int = 5,
     top_ratio: float = 0.01,
-    max_blend: float = 0.5,
+    max_blend: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build a submission-aligned object score from train-time anomaly maps.
 
@@ -76,9 +78,19 @@ def _map_object_logits(
         raise ValueError("top_ratio must be in (0, 1]")
     if not 0.0 <= max_blend <= 1.0:
         raise ValueError("max_blend must be in [0, 1]")
+    if not 0.0 <= global_weight <= 1.0:
+        raise ValueError("global_weight must be in [0, 1]")
     probabilities = logits.sigmoid().flatten(1)
     top_count = max(1, int(probabilities.shape[1] * top_ratio))
     per_view = probabilities.topk(top_count, dim=1).values.mean(dim=1)
+    if global_logits is not None:
+        global_logits = global_logits.reshape(-1)
+        if global_logits.shape != per_view.shape:
+            raise ValueError("global logits must provide one score per frame")
+        per_view = (
+            (1.0 - global_weight) * per_view
+            + global_weight * global_logits.sigmoid()
+        )
     per_object = per_view.reshape(-1, views_per_object)
     object_probability = (
         max_blend * per_object.max(dim=1).values
@@ -111,6 +123,11 @@ def _payload(
     best_step: int,
     ema_loss: float | None,
 ) -> dict[str, Any]:
+    selection = str(
+        config["zero_shot"]["training"].get(
+            "checkpoint_selection", "final"
+        )
+    )
     return {
         "format_version": ZERO_SHOT_FORMAT_VERSION,
         "config_fingerprint": zero_shot_config_fingerprint(config),
@@ -118,7 +135,7 @@ def _payload(
         "best_metric": best_metric,
         "best_step": best_step,
         "ema_loss": ema_loss,
-        "selection": "minimum training-loss EMA after warmup",
+        "selection": selection,
         "model": trainable_zero_shot_state_dict(model),
         "optimizer": optimizer.state_dict(),
     }
@@ -196,6 +213,9 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
         logger.info("恢复 zero-shot 训练：step=%d", completed_steps)
 
     total_steps = int(train_config["total_steps"])
+    checkpoint_selection = str(
+        train_config.get("checkpoint_selection", "final")
+    )
     iterator = iter(loader)
     model.train()
     started = time.perf_counter()
@@ -255,9 +275,13 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
             object_logits, object_labels = _map_object_logits(
                 branch_logits,
                 labels,
+                global_logits=branch_image_logits,
+                global_weight=float(
+                    train_config.get("map_object_global_weight", 0.0)
+                ),
                 views_per_object=5,
                 top_ratio=float(train_config.get("map_object_top_ratio", 0.01)),
-                max_blend=float(train_config.get("map_object_max_blend", 0.5)),
+                max_blend=float(train_config.get("map_object_max_blend", 0.0)),
             )
             image_loss = F.binary_cross_entropy_with_logits(
                 object_logits, object_labels
@@ -308,7 +332,8 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
         )
         best_check_every = int(train_config.get("log_every", 20))
         if (
-            step >= best_start
+            checkpoint_selection == "training_ema"
+            and step >= best_start
             and step % best_check_every == 0
             and ema_loss < best_metric - 1e-4
         ):
@@ -394,6 +419,9 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
             )
 
     final_path = zero_shot_final_checkpoint_path(config)
+    if checkpoint_selection == "final":
+        best_metric = float(ema_loss) if ema_loss is not None else float("nan")
+        best_step = total_steps
     final_payload = _payload(
         model,
         optimizer,
@@ -405,12 +433,14 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
     )
     atomic_torch_save(final_path, final_payload)
     atomic_torch_save(last_path, final_payload)
-    if not best_path.is_file():
+    if checkpoint_selection == "final":
+        atomic_torch_save(best_path, final_payload)
+    elif not best_path.is_file():
         best_metric = float(ema_loss) if ema_loss is not None else float("nan")
         best_step = total_steps
         final_payload["best_metric"] = best_metric
         final_payload["best_step"] = best_step
-        final_payload["selection"] = "final fallback; no eligible EMA checkpoint"
+        final_payload["selection"] = "final fallback; no eligible training EMA checkpoint"
         atomic_torch_save(best_path, final_payload)
     selected = torch.load(best_path, map_location="cpu", weights_only=False)
     selected["training_completed_steps"] = total_steps

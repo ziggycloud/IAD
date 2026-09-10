@@ -55,7 +55,7 @@ from .zero_shot_model import (
 )
 
 
-ZERO_SHOT_SCORING_VERSION = "mask_topk_v1"
+ZERO_SHOT_SCORING_VERSION = "map_global_view_mean_v2"
 
 
 def _inference_worker_context(
@@ -296,17 +296,32 @@ def _zero_shot_object_score(
     arrays: list[np.ndarray],
     ratio: float,
     *,
-    max_blend: float = 0.5,
+    global_scores: list[float] | None = None,
+    global_weight: float = 0.0,
+    max_blend: float = 0.0,
 ) -> float:
-    """Score unseen objects from the exact float maps written as masks."""
+    """Fuse local evidence and CLIP-global evidence, then aggregate views."""
     if not arrays:
         raise ValueError("zero-shot object scoring requires at least one map")
     if not 0.0 <= max_blend <= 1.0:
         raise ValueError("max_blend must be in [0, 1]")
+    if not 0.0 <= global_weight <= 1.0:
+        raise ValueError("global_weight must be in [0, 1]")
     per_view = np.asarray(
         [_top_ratio_score([array], ratio) for array in arrays],
         dtype=np.float64,
     )
+    if global_scores is not None:
+        global_array = np.asarray(global_scores, dtype=np.float64)
+        if global_array.shape != per_view.shape:
+            raise ValueError("global_scores must provide one score per map")
+        if not np.isfinite(global_array).all():
+            raise FloatingPointError("global_scores contain non-finite values")
+        global_array = np.clip(global_array, 0.0, 1.0)
+        per_view = (
+            (1.0 - global_weight) * per_view
+            + global_weight * global_array
+        )
     return float(
         max_blend * per_view.max()
         + (1.0 - max_blend) * per_view.mean()
@@ -611,7 +626,13 @@ def generate_competition_submission(
         submission.get("visibility_max_blend", 0.5)
     )
     zero_shot_max_blend = float(
-        submission.get("zero_shot_object_max_blend", 0.5)
+        submission.get("zero_shot_object_max_blend", 0.0)
+    )
+    zero_shot_global_weight = float(
+        submission.get("zero_shot_object_global_weight", 0.0)
+    )
+    zero_shot_mask_calibration = str(
+        submission.get("zero_shot_mask_calibration", "per_category")
     )
     gaussian = GaussianFilter(
         kernel_size=int(config["evaluation"]["gaussian_kernel_size"]),
@@ -672,6 +693,7 @@ def generate_competition_submission(
                 crop_size=int(dataset_config["crop_size"]),
             )
         maps: list[np.ndarray] = []
+        zero_shot_global_scores: list[float] = []
         visibility_by_group: dict[str, np.ndarray] = {}
         for batch in _loader(dataset, config):
             # Use the dataset payload as the final source of truth. This keeps
@@ -695,6 +717,9 @@ def generate_competition_submission(
                     )
                     zero_output = zero_shot_segmenter(flat_images)
                     current = zero_output["probability"]
+                    current_global = zero_output["global_probability"].reshape(
+                        batch_size, view_count
+                    )
                     current = F.interpolate(
                         current,
                         size=(mask_size, mask_size),
@@ -717,6 +742,10 @@ def generate_competition_submission(
                             .cpu()
                             .numpy()
                             .astype(np.float32)
+                        )
+                        zero_shot_global_scores.extend(
+                            float(value)
+                            for value in current_global[batch_index].cpu().tolist()
                         )
                     continue
                 category_names = [str(value) for value in batch["category"]]
@@ -864,6 +893,10 @@ def generate_competition_submission(
                     assert zero_shot_segmenter is not None
                     zero_output = zero_shot_segmenter(images)
                     current = zero_output["probability"]
+                    zero_shot_global_scores.extend(
+                        float(value)
+                        for value in zero_output["global_probability"].cpu().tolist()
+                    )
                     current = F.interpolate(
                         current,
                         size=(mask_size, mask_size),
@@ -968,18 +1001,28 @@ def generate_competition_submission(
                 f"{len(maps)} != {len(category_views)}"
             )
 
-        if category_uses_zero_shot:
-            # Learned probabilities share one absolute scale across unseen
-            # categories. Per-category stretching would turn harmless noise
-            # into bright false positives.
+        if category_uses_zero_shot and len(zero_shot_global_scores) != len(maps):
+            raise RuntimeError(
+                f"Global score count mismatch for {category}: "
+                f"{len(zero_shot_global_scores)} != {len(maps)}"
+            )
+
+        if category_uses_zero_shot and zero_shot_mask_calibration == "probability":
             lower, upper = 0.0, 1.0
         else:
             lower, upper = _calibration_bounds(
                 maps, lower_quantile, upper_quantile
             )
         grouped_maps: dict[str, list[np.ndarray]] = defaultdict(list)
-        for view, current in zip(category_views, maps, strict=True):
+        grouped_global_scores: dict[str, list[float]] = defaultdict(list)
+        for view_index, (view, current) in enumerate(
+            zip(category_views, maps, strict=True)
+        ):
             grouped_maps[view.group_folder].append(current)
+            if category_uses_zero_shot:
+                grouped_global_scores[view.group_folder].append(
+                    zero_shot_global_scores[view_index]
+                )
             _write_mask(
                 current,
                 category_mask_root
@@ -993,12 +1036,11 @@ def generate_competition_submission(
             view.group_folder for view in category_views
         ):
             if category_uses_zero_shot:
-                # A global CLIP head can be confident while every local mask
-                # is empty. Score the same float maps used to write PNGs so a
-                # black localization result can never produce a high score.
                 raw_score = _zero_shot_object_score(
                     grouped_maps[group_folder],
                     object_top_ratio,
+                    global_scores=grouped_global_scores[group_folder],
+                    global_weight=zero_shot_global_weight,
                     max_blend=zero_shot_max_blend,
                 )
             else:
@@ -1037,6 +1079,11 @@ def generate_competition_submission(
                     "upper": upper,
                     "lower_quantile": lower_quantile,
                     "upper_quantile": upper_quantile,
+                    "mode": (
+                        zero_shot_mask_calibration
+                        if category_uses_zero_shot
+                        else "per_category"
+                    ),
                 },
                 "object_score_aggregation": {
                     "mode": aggregation_mode,
@@ -1044,6 +1091,7 @@ def generate_competition_submission(
                     "softmax_temperature": aggregation_temperature,
                     "visibility_max_blend": visibility_max_blend,
                     "zero_shot_max_blend": zero_shot_max_blend,
+                    "zero_shot_global_weight": zero_shot_global_weight,
                 },
                 "rows": rows,
             },

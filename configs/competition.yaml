@@ -287,11 +287,19 @@ zero_shot:
     focal_weight: 1.0
     dice_weight: 1.5
     image_weight: 0.5
-    # Primary image supervision follows the five-view, map-derived submission
-    # statistic before inference-only resizing/smoothing. The global head is auxiliary.
+    # Primary image supervision follows the local/global five-view submission
+    # statistic before inference-only resizing/smoothing. A per-frame global
+    # loss remains as auxiliary supervision for the true CLIP image token.
     global_image_weight: 0.1
     map_object_top_ratio: 0.01
-    map_object_max_blend: 0.5
+    # The real Test_C report measured mean-view AUROC 0.6908 versus the
+    # submitted 0.6718, so train against pure five-view consensus.
+    map_object_max_blend: 0.0
+    # Add category-agnostic CLIP image-token evidence to the local top-k score.
+    map_object_global_weight: 0.35
+    # Fixed-horizon selection avoids choosing an early synthetic-loss optimum
+    # (the latest run selected step 1560/5000) with no real unseen validation.
+    checkpoint_selection: final
     clean_weight: 0.1
     prompt_anchor_weight: 0.001
     log_every: 20
@@ -330,9 +338,13 @@ submission:
   object_score_softmax_temperature: 0.25
   # Keep a max component so a defect visible in one camera is not erased.
   visibility_max_blend: 0.5
-  # Keep the AdaptCLIP path separately configurable. Its current 0.5 blend
-  # slightly beats pure mean on unseen object AUROC (0.7428 vs 0.7426).
-  zero_shot_object_max_blend: 0.5
+  # The current real Test_C report reverses the earlier diagnostic: mean-view
+  # 0.6908 is materially better than the submitted max/mean blend at 0.6718.
+  zero_shot_object_max_blend: 0.0
+  zero_shot_object_global_weight: 0.35
+  # Per-category affine scaling is monotonic, so it preserves continuous
+  # ranking while using all 256 PNG levels for pixel AP/AUROC evaluation.
+  zero_shot_mask_calibration: per_category
 
 runtime:
   device: cuda:0

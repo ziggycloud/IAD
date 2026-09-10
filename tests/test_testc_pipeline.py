@@ -138,6 +138,23 @@ def test_zero_shot_map_object_loss_matches_five_view_submission_rule() -> None:
     assert object_labels.tolist() == [1.0, 0.0]
 
 
+def test_zero_shot_map_object_loss_fuses_global_frame_evidence() -> None:
+    local = torch.full((5, 1, 1, 1), -1.3862944)
+    global_logits = torch.full((5,), 1.3862944)
+    labels = torch.tensor([0, 0, 0, 0, 1], dtype=torch.float32)
+    object_logits, object_labels = _map_object_logits(
+        local,
+        labels,
+        global_logits=global_logits,
+        global_weight=0.5,
+        views_per_object=5,
+        top_ratio=1.0,
+        max_blend=0.0,
+    )
+    assert object_logits.sigmoid().item() == pytest.approx(0.5)
+    assert object_labels.tolist() == [1.0]
+
+
 def test_synthetic_object_visibility_balances_at_object_level() -> None:
     visible = _object_anomaly_visibility(
         10, group_size=5, object_probability=1.0, view_probability=0.0,

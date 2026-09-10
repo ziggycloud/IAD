@@ -21,7 +21,7 @@ from .config import resolve_path
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-ZERO_SHOT_FORMAT_VERSION = 3
+ZERO_SHOT_FORMAT_VERSION = 4
 
 
 def zero_shot_checkpoint_path(config: dict[str, Any]) -> Path:
@@ -272,7 +272,9 @@ class LearnedZeroShotSegmenter(nn.Module):
             )
         return F.normalize(patches.float(), dim=-1, eps=1e-6)
 
-    def _clip_features(self, images: torch.Tensor) -> list[torch.Tensor]:
+    def _clip_features(
+        self, images: torch.Tensor
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
         rgb = (
             images.float() * self.imagenet_std + self.imagenet_mean
         ).clamp(0.0, 1.0)
@@ -295,13 +297,24 @@ class LearnedZeroShotSegmenter(nn.Module):
                 clip_images,
                 indices=self.intermediate_layers,
                 normalize_intermediates=True,
-                intermediates_only=True,
+                intermediates_only=False,
                 output_fmt="NCHW",
             )
         features = output.get("image_intermediates")
         if not isinstance(features, list) or len(features) != self.intermediate_layers:
             raise RuntimeError("OpenCLIP returned unexpected spatial intermediates")
-        return features
+        image_features = output.get("image_features")
+        if not isinstance(image_features, torch.Tensor):
+            raise RuntimeError("OpenCLIP did not return its global image feature")
+        image_features = image_features.float()
+        if (
+            image_features.ndim != 2
+            or image_features.shape[-1] != self.prompt_anchors.shape[-1]
+        ):
+            raise RuntimeError(
+                "OpenCLIP returned a global feature incompatible with text prompts"
+            )
+        return features, F.normalize(image_features, dim=-1, eps=1e-6)
 
     def forward(
         self,
@@ -311,9 +324,9 @@ class LearnedZeroShotSegmenter(nn.Module):
         feature_noise_std: float = 0.0,
         train_branch: str | None = None,
     ) -> dict[str, torch.Tensor]:
+        clip_layers, global_feature = self._clip_features(images)
         projected_layers = torch.stack(
-            [self._project_patches(feature) for feature in self._clip_features(images)],
-            dim=0,
+            [self._project_patches(feature) for feature in clip_layers], dim=0
         )
         layer_weights = self.layer_logits.softmax(dim=0).to(
             projected_layers.dtype
@@ -330,7 +343,6 @@ class LearnedZeroShotSegmenter(nn.Module):
                 * feature_mask
                 * float(feature_noise_std)
             )
-        global_feature = F.normalize(patches.mean(dim=(1, 2)), dim=-1, eps=1e-6)
         visual_patches = F.normalize(
             patches + self.local_visual_adapter(patches), dim=-1, eps=1e-6
         )
@@ -392,11 +404,13 @@ class LearnedZeroShotSegmenter(nn.Module):
             + self.image_local_weight * local_logit
         )
         image_probability = image_logits.sigmoid().clamp(1e-6, 1.0 - 1e-6)
+        global_probability = global_margin.sigmoid().clamp(1e-6, 1.0 - 1e-6)
         return {
             "logits": logits.float(),
             "probability": probability.float(),
             "image_logits": image_logits.float(),
             "image_probability": image_probability.float(),
+            "global_probability": global_probability.float(),
             "visual_margin": visual_margin.float(),
             "textual_margin": textual_margin.float(),
             "visual_image_margin": visual_image_margin.float(),
