@@ -23,12 +23,18 @@ from realiad_dinomaly2.bootstrap import ensure_iad_runtime  # noqa: E402
 ensure_iad_runtime(ROOT, Path(__file__), sys.argv[1:])
 
 import yaml  # noqa: E402
+import torch  # noqa: E402
 
 from realiad_dinomaly2.competition_submission import (  # noqa: E402
     generate_competition_submission,
     resolve_competition_checkpoint,
 )
-from realiad_dinomaly2.config import dump_resolved_config, load_config, materialize_paths  # noqa: E402
+from realiad_dinomaly2.config import (  # noqa: E402
+    config_fingerprint,
+    dump_resolved_config,
+    load_config,
+    materialize_paths,
+)
 from realiad_dinomaly2.latency import benchmark_single_frame_latency  # noqa: E402
 from realiad_dinomaly2.normal_prior import fit_normal_prior  # noqa: E402
 from realiad_dinomaly2.runtime import append_jsonl, atomic_write_json, utc_now  # noqa: E402
@@ -53,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--resume", default="auto")
     parser.add_argument("--checkpoint", default="auto")
+    parser.add_argument("--checkpoint-config", type=Path, default=None)
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--skip-train", action="store_true")
@@ -65,6 +72,49 @@ def parse_args() -> argparse.Namespace:
         help="Archive Test_C predictions as an explicitly non-submittable ZIP.",
     )
     return parser.parse_args()
+
+
+_TRAINING_DATASET_KEYS = (
+    "type", "json_dir", "image_dir", "train_image_dir", "train_dir",
+    "categories", "category_limit", "image_size", "crop_size", "train_mode",
+    "image_label_policy", "missing_anomaly_mask_policy", "mask_resize_semantics",
+)
+
+
+def _restore_checkpoint_training_config(
+    config: dict[str, Any], checkpoint_path: Path, explicit: Path | None
+) -> tuple[dict[str, Any], Path]:
+    """Use the original training YAML, preserving current Test_C inference fields."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    fingerprint = checkpoint.get("config_fingerprint")
+    if not isinstance(fingerprint, str):
+        raise ValueError("checkpoint has no config_fingerprint")
+    output_dir = Path(config["experiment"]["output_dir"])
+    candidates = (
+        [explicit.expanduser().resolve()] if explicit is not None else
+        sorted(output_dir.glob("testc_runs/*/resolved_config.yaml"), reverse=True)
+        + [output_dir / "resolved_config.yaml"]
+    )
+    for path in candidates:
+        if not path.is_file():
+            continue
+        candidate = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(candidate, dict) or config_fingerprint(candidate) != fingerprint:
+            continue
+        restored = copy.deepcopy(config)
+        restored["model"] = copy.deepcopy(candidate["model"])
+        restored["training"] = copy.deepcopy(candidate["training"])
+        restored["experiment"]["seed"] = candidate["experiment"]["seed"]
+        for key in _TRAINING_DATASET_KEYS:
+            if key in candidate["dataset"]:
+                restored["dataset"][key] = copy.deepcopy(candidate["dataset"][key])
+        if config_fingerprint(restored) != fingerprint:
+            raise RuntimeError(f"restored config from {path} still mismatches checkpoint")
+        return restored, path
+    raise ValueError(
+        "No resolved training YAML matches this checkpoint; pass "
+        "--checkpoint-config /path/to/resolved_config.yaml"
+    )
 
 
 def _load_wrapper(path: Path) -> dict[str, Any]:
@@ -255,6 +305,14 @@ def main() -> int:
     audit = audit_testc(testc_root, protocol_path)
     train_audit = audit_competition_train(competition_train, source_root, protocol_path)
     config = _build_config(wrapper, data_root, protocol, args.set)
+    if args.skip_train:
+        checkpoint_path = resolve_competition_checkpoint(
+            Path(config["experiment"]["output_dir"]), args.checkpoint
+        )
+        config, restored_path = _restore_checkpoint_training_config(
+            config, checkpoint_path, args.checkpoint_config
+        )
+        print(f"Restored checkpoint training semantics from {restored_path}")
     rank = int(os.environ.get("RANK", "0"))
     is_primary = rank == 0
     run_dir, run_manifest = _run_manifest(
