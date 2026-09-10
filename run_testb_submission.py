@@ -131,9 +131,6 @@ def _restore_checkpoint_training_config(
     fingerprint = checkpoint.get("config_fingerprint")
     if not isinstance(fingerprint, str):
         raise ValueError("seen checkpoint has no config_fingerprint")
-    if config_fingerprint(config) == fingerprint:
-        return config, None
-
     output_dir = Path(config["experiment"]["output_dir"])
     candidates = (
         [explicit.expanduser().resolve()]
@@ -156,6 +153,7 @@ def _restore_checkpoint_training_config(
         ):
             continue
         restored = copy.deepcopy(config)
+        zero_shot_checkpoint = restored.get("zero_shot", {}).get("checkpoint")
         restored["model"] = copy.deepcopy(candidate["model"])
         restored["training"] = copy.deepcopy(candidate["training"])
         restored["experiment"]["seed"] = candidate["experiment"]["seed"]
@@ -164,11 +162,20 @@ def _restore_checkpoint_training_config(
                 restored["dataset"][key] = copy.deepcopy(
                     candidate["dataset"][key]
                 )
+        # The main checkpoint fingerprint excludes the independent zero-shot
+        # branch. Restore its exact training semantics from the same run while
+        # retaining the caller's best/final checkpoint choice.
+        if "zero_shot" in candidate:
+            restored["zero_shot"] = copy.deepcopy(candidate["zero_shot"])
+            if zero_shot_checkpoint is not None:
+                restored["zero_shot"]["checkpoint"] = zero_shot_checkpoint
         if config_fingerprint(restored) != fingerprint:
             raise RuntimeError(
                 f"restored config from {path} still mismatches checkpoint"
             )
         return restored, path
+    if config_fingerprint(config) == fingerprint:
+        return config, None
     raise ValueError(
         "The seen checkpoint does not match the current training config "
         "and no matching resolved YAML was found; pass "

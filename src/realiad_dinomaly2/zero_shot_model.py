@@ -469,7 +469,7 @@ def load_zero_shot_segmenter(
     expected_steps = int(config["zero_shot"]["training"]["total_steps"])
     if completed != expected_steps:
         raise ValueError(
-            f"Zero-shot best checkpoint is partial ({completed}/{expected_steps})"
+            f"Zero-shot checkpoint is partial ({completed}/{expected_steps})"
         )
     expected = zero_shot_config_fingerprint(config)
     if payload.get("config_fingerprint") != expected:
