@@ -20,7 +20,7 @@
 1. unseen 对象分数的五视角 `max_blend` 从 0.5 改为报告实测更好的纯均值，并让训练期对象级 BCE 使用同一规则。
 2. OpenCLIP 单次前向同时返回 spatial intermediates 与真正的 global image feature，取代 patch 均值伪全局特征；提交分数以 0.35 权重融合全局和局部证据，训练期同步使用完全一致的融合。
 3. unseen mask 改为逐类别共享的 robust affine 8-bit 标定。该变换在类别内单调，不使用标签，不改变连续排序，但能减少窄概率区间直接映射到 `[0,255]` 时的大量 ties。
-4. zero-shot checkpoint 默认选择完整 5000 步的终点，不再用 synthetic training-loss EMA 选择早期权重。本次快照停在 1560/5000 步，而该指标没有真实 unseen 泛化含义。
+4. unseen 推理明确读取完整 5000 步的 `final_model.pt`，不再使用 synthetic training-loss EMA 选出的早期 best。本次 best 快照停在 1560/5000 步，而该指标没有真实 unseen 泛化含义；seen 仍优先使用其 `best_model.pt`，不存在时回退 final。
 
 这些修改会使旧 zero-shot checkpoint 失配（format version 提升），需要重新训练 adapter；seen Dinomaly checkpoint 不受影响。报告同时警告 seen 实际只训练了 3000 步，而默认配置是 6000 步，因此下一次正式比较应先完成既定训练预算，避免把代码改动与训练未完成混为一谈。
 

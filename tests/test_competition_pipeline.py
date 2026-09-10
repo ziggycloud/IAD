@@ -53,7 +53,7 @@ def _temporary_directory():
 
 
 class CompetitionDataTests(unittest.TestCase):
-    def test_auto_checkpoint_uses_commit_71eebcc_final_model(self) -> None:
+    def test_auto_checkpoint_prefers_best_and_falls_back_to_final(self) -> None:
         with _temporary_directory() as root:
             checkpoint_dir = root / "checkpoints"
             checkpoint_dir.mkdir()
@@ -63,7 +63,7 @@ class CompetitionDataTests(unittest.TestCase):
 
             best_path = checkpoint_dir / "best_model.pt"
             best_path.write_bytes(b"best")
-            self.assertEqual(resolve_competition_checkpoint(root, "auto"), final_path)
+            self.assertEqual(resolve_competition_checkpoint(root, "auto"), best_path)
 
     def test_scan_and_dataset_preserve_five_view_topology(self) -> None:
         with _temporary_directory() as root:

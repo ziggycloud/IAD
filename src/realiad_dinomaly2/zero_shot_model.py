@@ -461,7 +461,11 @@ def load_zero_shot_segmenter(
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if payload.get("format_version") != ZERO_SHOT_FORMAT_VERSION:
         raise ValueError("Zero-shot checkpoint format is incompatible")
-    completed = int(payload.get("training_completed_steps", -1))
+    # Older completed final_model.pt files predate training_completed_steps;
+    # their completed_steps is the authoritative fixed-horizon value.
+    completed = int(
+        payload.get("training_completed_steps", payload.get("completed_steps", -1))
+    )
     expected_steps = int(config["zero_shot"]["training"]["total_steps"])
     if completed != expected_steps:
         raise ValueError(

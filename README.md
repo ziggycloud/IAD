@@ -236,7 +236,7 @@ python run_competition_pipeline.py
 # 只检查目录、类别和五视角完整性
 python run_competition_pipeline.py --validate-only
 
-# 已有 final_model.pt 时跳过训练并推理打包
+# 已有 best_model.pt（不存在时回退 final_model.pt）时跳过训练并推理打包
 python run_competition_pipeline.py --skip-train
 
 # 只训练，暂不推理

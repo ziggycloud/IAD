@@ -112,7 +112,9 @@ zero_shot:
   enabled: true
   backend: adaptclip_inspired
   route: unseen_only
-  checkpoint: zero_shot_stable/checkpoints/best_model.pt
+  # Test_C indicates that the synthetic-loss early best snapshot generalizes
+  # worse than completing the fixed training horizon.
+  checkpoint: zero_shot_stable/checkpoints/final_model.pt
   model:
     model_name: ViT-L-14-336
     pretrained: openai
