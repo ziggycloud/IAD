@@ -79,9 +79,10 @@ training:
   generalized_regularization_weight: 0.01
   gradient_clip_norm: 0.1
   gradient_guard:
-    # The logged norm is measured before clipping. Skip only catastrophic
-    # outliers; after three consecutive skips stop and preserve the last ckpt.
-    skip_step_norm: 1.0
+    # The logged norm is measured before clipping and is naturally around
+    # 200 during warmup for this ViT-L decoder. Let clip_grad_norm_ bound every
+    # finite update; the guard remains responsible only for non-finite values.
+    skip_step_norm: null
     max_consecutive_skips: 3
     fail_on_nonfinite: true
   log_every: 20

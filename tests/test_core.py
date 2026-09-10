@@ -200,6 +200,11 @@ class StabilityTests(unittest.TestCase):
         self.assertTrue(_gradient_step_should_be_skipped(40.0, guard))
         self.assertTrue(_gradient_step_should_be_skipped(float("nan"), guard))
 
+    def test_gradient_guard_allows_finite_preclip_norm_when_threshold_disabled(self) -> None:
+        guard = {"skip_step_norm": None, "fail_on_nonfinite": True}
+        self.assertFalse(_gradient_step_should_be_skipped(199.1771, guard))
+        self.assertTrue(_gradient_step_should_be_skipped(float("inf"), guard))
+
     def test_anomaly_map_layer_weights(self) -> None:
         encoder = [
             torch.tensor([[[[1.0]], [[0.0]]]]),
