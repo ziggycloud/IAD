@@ -1,6 +1,9 @@
-# 五视角联合 Dinomaly 架构
+# 五视角联合 Dinomaly 架构（历史实验，当前不启用）
 
-本文档描述当前真正以“一个零件的五个固定相机视图”为一个样本的无监督异常检测
+> 当前 competition/Test_C 的 seen 路线已完整恢复到 commit `71eebcc`；本文描述的
+> Set Transformer、visibility adapter 和 normal prior 不在当前默认执行路径中。
+
+本文档描述历史上以“一个零件的五个固定相机视图”为一个样本的无监督异常检测
 实现。它不使用类别 ID、异常训练标签、测试 mask 或 Test_A 统计量，也不要求不同
 相机的像素坐标对齐。
 

@@ -53,7 +53,7 @@ def _temporary_directory():
 
 
 class CompetitionDataTests(unittest.TestCase):
-    def test_auto_checkpoint_prefers_best_and_supports_legacy_final(self) -> None:
+    def test_auto_checkpoint_uses_commit_71eebcc_final_model(self) -> None:
         with _temporary_directory() as root:
             checkpoint_dir = root / "checkpoints"
             checkpoint_dir.mkdir()
@@ -63,7 +63,7 @@ class CompetitionDataTests(unittest.TestCase):
 
             best_path = checkpoint_dir / "best_model.pt"
             best_path.write_bytes(b"best")
-            self.assertEqual(resolve_competition_checkpoint(root, "auto"), best_path)
+            self.assertEqual(resolve_competition_checkpoint(root, "auto"), final_path)
 
     def test_scan_and_dataset_preserve_five_view_topology(self) -> None:
         with _temporary_directory() as root:
@@ -105,8 +105,9 @@ class CompetitionDataTests(unittest.TestCase):
         self.assertEqual(config["dataset"]["type"], "competition_folders")
         self.assertTrue(Path(config["dataset"]["train_dir"]).is_absolute())
         self.assertTrue(Path(config["dataset"]["test_dir"]).is_absolute())
-        self.assertTrue(config["model"]["multi_view"]["enabled"])
-        self.assertEqual(config["training"]["effective_batch_size"], 12)
+        self.assertNotIn("multi_view", config["model"])
+        self.assertEqual(config["training"]["effective_batch_size"], 64)
+        self.assertEqual(config["training"]["learning_rate"], 0.0003)
 
     def test_object_score_modes_keep_single_view_anomaly(self) -> None:
         maps = [np.zeros((4, 4), dtype=np.float32) for _ in range(5)]

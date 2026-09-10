@@ -34,14 +34,14 @@ Real-IAD Variety v2 包含 160 类、198,950 张高分辨率图像，覆盖 28 �
 
 ### Seen 路线
 
-Seen 类走 DINOv2-register ViT-L/14、compositional reference bank、category-free router、三尺度 experts、Set Transformer 五视角 context、visibility-aware object aggregation 和 train-only category/view median-MAD normal prior。训练输入以一个对象的五张固定相机图像为一个样本，主目标仍是正常特征重建，附加 context consistency、variance、visibility balance 和 attention entropy 正则。
+Seen 类现已完整恢复到 commit `71eebcc`：DINOv2-register ViT-L/14、compositional reference bank、category-free router 和三尺度 experts。五张相机图按独立视图训练，effective batch 为 64；不再使用 Set Transformer、visibility adapter、multi-view auxiliary loss 或 train-only normal prior。训练参数同该提交：6000 步、LR 3e-4、500 步 warmup、Loose Loss 在 2000 步渐进到 0.7、gradient clip 0.1。
 
-这条路线的优点是全程只使用正常 Train，且 normal prior、checkpoint 和 config 都有 fingerprint。主要风险是：
+这条路线的优点是全程只使用正常 Train，且与已知提交的模型结构、训练方式和 checkpoint fingerprint 完全一致。主要风险是：
 
 - 512 个共享 reference 和统一 decoder 同时覆盖 50 个 Train 类，仍可能发生 capacity-diversity conflict。
 - 32×32 patch residual 双线性上采样到 448，之后 Gaussian sigma=2，容易把轮廓错误扩展成光晕。
 - 当前没有像 Dinomaly+ / OneNIP 那样的高分辨率监督 refiner，P-PR/P-F1max 可能先于 P-AUROC 触顶。
-- visibility head 只由正常数据上的间接正则训练；若其权重并不代表“缺陷可见性”，用于分类聚合可能反而压低单视角缺陷。
+- 五视角只在对象分数阶段拼接聚合，网络本身不建模跨相机上下文。
 
 ### Unseen 路线
 
@@ -49,7 +49,7 @@ Unseen 类硬路由到 frozen OpenAI CLIP ViT-L/14@336，最后四层 patch feat
 
 这不是官方 AdaptCLIP 的等价实现：
 
-- 官方 zero-shot 使用真正的 CLIP global image token 做图像级预测；当前实现用融合 patch 的均值替代。
+- 当前实现已恢复真正的 CLIP global image token，并将其与局部 top-k 证据联合用于图像级预测。
 - 官方 textual adapter 学习 prompt token，并经 frozen text encoder 得到文本表示；当前实现是在两个已编码 prompt anchor 上加 embedding residual/MLP。
 - 官方 zero-shot 推理平均 visual/textual 预测；当前使用固定 `visual_fusion_weight=0.65`。
 - 官方 AdaptCLIP 在辅助数据集的真实异常标注上训练，并用另一数据集评估；当前仅在目标 competition Train 的正常图上使用简化 synthetic defects。因此官方成绩只能作为结构参考，不能作为当前 checkpoint 的预期值。[^3]

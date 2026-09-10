@@ -670,17 +670,14 @@ def semantic_config(config: dict[str, Any]) -> dict[str, Any]:
             "final_lr_ratio",
             "loose_loss_warmup_steps",
             "loose_loss_final_discard",
-            "loose_loss_scope",
             "generalized_regularization_weight",
             "gradient_clip_norm",
         )
     }
-    for optional_key in (
-        "optimizer",
-        "scheduler",
-        "gradient_guard",
-        "multi_view_auxiliary_weights",
-    ):
+    # Keep the seen checkpoint fingerprint byte-for-byte compatible with
+    # commit 71eebcc. Unseen-only settings are fingerprinted separately by
+    # zero_shot_config_fingerprint.
+    for optional_key in ("optimizer", "scheduler", "gradient_guard"):
         if optional_key in config["training"]:
             training_semantics[optional_key] = copy.deepcopy(
                 config["training"][optional_key]

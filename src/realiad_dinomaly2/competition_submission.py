@@ -87,12 +87,12 @@ def resolve_competition_checkpoint(
     output_dir: Path,
     checkpoint: str,
 ) -> Path:
-    if checkpoint == "auto":
-        best = output_dir / "checkpoints" / "best_model.pt"
-        final = output_dir / "checkpoints" / "final_model.pt"
-        path = best if best.is_file() else final
-    else:
-        path = Path(checkpoint).expanduser().resolve()
+    # Commit 71eebcc produces and evaluates the fixed-horizon final checkpoint.
+    path = (
+        output_dir / "checkpoints" / "final_model.pt"
+        if checkpoint == "auto"
+        else Path(checkpoint).expanduser().resolve()
+    )
     if not path.is_file():
         raise FileNotFoundError(f"Competition checkpoint does not exist: {path}")
     return path.resolve()

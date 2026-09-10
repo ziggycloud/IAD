@@ -14,7 +14,6 @@ from realiad_dinomaly2.testc_data import (
     select_category_objects,
 )
 from realiad_dinomaly2.testc_evaluation import compute_testc_score
-from realiad_dinomaly2.losses import reconstruction_loss
 from realiad_dinomaly2.zero_shot_engine import _map_object_logits
 from realiad_dinomaly2.synthetic_anomaly import _object_anomaly_visibility
 
@@ -102,29 +101,6 @@ def test_protocol_rejects_wrong_category_count(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="50 seen and 50 unseen"):
         load_testc_protocol(path)
-
-
-def test_object_scoped_loose_loss_is_micro_batch_invariant() -> None:
-    encoder = torch.randn(2, 5, 4, 2, 2)
-    decoder_values = encoder + 0.2 * torch.randn_like(encoder)
-    decoder = decoder_values.clone().requires_grad_(True)
-    together = reconstruction_loss(
-        [encoder], [decoder], discard_rate=0.5, loose_loss=True,
-        selection_scope="object",
-    )
-    together.backward()
-    together_gradient = decoder.grad.detach().clone()
-    decoder_separate = decoder_values.clone().requires_grad_(True)
-    separate = sum(
-        reconstruction_loss(
-            [encoder[index:index + 1]], [decoder_separate[index:index + 1]],
-            discard_rate=0.5, loose_loss=True, selection_scope="object",
-        )
-        for index in range(2)
-    ) / 2
-    separate.backward()
-    assert float(together.detach()) == pytest.approx(float(separate.detach()), abs=1e-6)
-    assert torch.allclose(together_gradient, decoder_separate.grad, atol=1e-6)
 
 
 def test_zero_shot_map_object_loss_matches_five_view_submission_rule() -> None:

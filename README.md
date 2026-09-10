@@ -220,9 +220,8 @@ python run_unseen_pipeline.py
 完整参数、公式和恢复方式见 [UNSEEN_PROTOCOL.md](UNSEEN_PROTOCOL.md)，任务交接状态见
 [UNSEEN_RUN_LOG.md](UNSEEN_RUN_LOG.md)。
 
-真正的五视角 object batch、Set Transformer、visibility-aware adapter、Train-only
-正常边缘先验及消融方式见
-[MULTIVIEW_ARCHITECTURE.md](MULTIVIEW_ARCHITECTURE.md)。
+五视角联合网络保留为历史实验记录；当前 competition/Test_C 的 seen 路线已固定恢复到
+commit `71eebcc` 的逐视角稳定基线。
 
 ## 比赛 Train / Test_A / Test_B 提交流水线
 
@@ -231,13 +230,13 @@ python run_unseen_pipeline.py
 ViT-L/14，并把输入对齐到提交 mask 的 448 × 448：
 
 ```powershell
-# 一键：审计 → 多视角训练 → DINO prior → Test_A 推理 → 校验并打 ZIP
+# 一键：审计 → commit 71eebcc seen 训练 → Test_A 推理 → 校验并打 ZIP
 python run_competition_pipeline.py
 
 # 只检查目录、类别和五视角完整性
 python run_competition_pipeline.py --validate-only
 
-# 已有 best_model.pt（旧运行可用 final_model.pt）时跳过训练并推理打包
+# 已有 final_model.pt 时跳过训练并推理打包
 python run_competition_pipeline.py --skip-train
 
 # 只训练，暂不推理
@@ -251,22 +250,17 @@ python run_competition_pipeline.py --test-b --skip-train
 ```
 
 默认数据路径和配置分别为 `data/competition/Train`、
-`data/competition/Test_A` 与 `configs/competition.yaml`。每个 `Sxxxx` 的五张图现在是
-一个 `[5,3,448,448]` 网络样本：共享 DINO 编码器后由 Set Transformer 建模跨视角
-上下文，但五张异常图和 mask 始终独立。分类分数聚合由
-`submission.object_score_aggregation` 控制；`legacy_concat_topk` 可恢复旧基线，默认
-`visibility_aware` 同时保留 max 分量，避免单相机可见缺陷被软共识抹掉。
+`data/competition/Test_A` 与 `configs/competition.yaml`。seen 训练完全采用
+`71eebcc`：五张相机图作为独立的 `[3,448,448]` 样本，effective view batch 为 64，
+不使用 Set Transformer、visibility adapter 或 normal prior。对象分类恢复为五张异常图
+拼接后的 top-1% 分数；Train 中不存在的类别仍硬路由到独立 AdaptCLIP-inspired 分支。
 
 Test_B 解压到 `data/competition/Test_B`。`--test-b` 会独立扫描其全部类别，不要求
-类别数、类别名称或每类样本数与 Train/Test_A 相同；Train 中不存在的类别先使用
-view-global DINO Normal Prior，再启用冻结 CLIP 语义残差。CLIP 的常见正常响应也只
-由 Train 正常图拟合为 view-global prior。显式 `--set` 参数优先于该预设，因此仍可
-覆盖 Test_B 路径或恢复严格的数据计数检查。Test_B 不参与训练和任何 prior 拟合。
+类别数、类别名称或每类样本数与 Train/Test_A 相同；Train 中不存在的类别直接路由到
+AdaptCLIP-inspired 分支。显式 `--set` 参数优先于该预设，因此仍可覆盖 Test_B 路径
+或恢复严格的数据计数检查。Test_B 不参与训练。
 下载使用天池提供的临时 STS 凭证，凭证只通过 `ossutil` 命令传入，不要写入 YAML、
 脚本或 Git；`Test_B.zip` 和 ossutil 断点目录均已被 `.gitignore` 排除。
-
-正常边缘先验仅扫描 Train 正常图，并把 checkpoint/config fingerprint 写入 artifact；
-不匹配时拒绝复用。Test_A 只在 prior 保存后进入推理，不参与统计或阈值选择。
 
 完成后读取：
 

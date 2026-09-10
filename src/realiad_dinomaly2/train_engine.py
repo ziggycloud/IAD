@@ -325,48 +325,6 @@ def _trainable_parameters(bundle: ModelBundle) -> list[torch.nn.Parameter]:
     ]
 
 
-def _multi_view_settings(config: dict[str, Any]) -> tuple[bool, int, str]:
-    settings = dict(config["model"].get("multi_view", {}))
-    return (
-        bool(settings.get("enabled", False)),
-        int(settings.get("num_views", 5)),
-        str(settings.get("missing_view_policy", "error")),
-    )
-
-
-def _auxiliary_weights(config: dict[str, Any]) -> dict[str, float] | None:
-    weights = dict(
-        config["model"].get("generalized", {}).get("auxiliary_weights", {})
-    )
-    weights.update(
-        {
-            str(name): float(value)
-            for name, value in config["training"]
-            .get("multi_view_auxiliary_weights", {})
-            .items()
-        }
-    )
-    return weights or None
-
-
-def _batch_model_inputs(
-    batch: dict[str, Any],
-    config: dict[str, Any],
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    enabled, _, _ = _multi_view_settings(config)
-    image_key = "images" if enabled else "image"
-    images = batch[image_key].to(
-        device,
-        non_blocking=bool(config["runtime"]["pin_memory"]),
-    )
-    if not enabled:
-        return images, None, None
-    view_ids = batch["view_ids"].to(device, non_blocking=True)
-    valid_view_mask = batch["valid_view_mask"].to(device, non_blocking=True)
-    return images, view_ids, valid_view_mask
-
-
 def _optimizer_group_gradient_norms(optimizer) -> dict[str, float]:
     """Return pre-clipping L2 norms, grouped for spike diagnosis."""
     result: dict[str, float] = {}
@@ -405,25 +363,12 @@ def _run_probe(
     optimizer = build_optimizer(bundle, config)
     scaler = make_grad_scaler(dtype, device)
     crop_size = int(config["dataset"]["crop_size"])
-    multi_view_enabled, num_views, _ = _multi_view_settings(config)
-    synthetic_shape = (
-        (candidate, num_views, 3, crop_size, crop_size)
-        if multi_view_enabled
-        else (candidate, 3, crop_size, crop_size)
-    )
     synthetic = torch.randn(
-        *synthetic_shape,
+        candidate,
+        3,
+        crop_size,
+        crop_size,
         device=device,
-    )
-    view_ids = (
-        torch.arange(num_views, device=device).unsqueeze(0).expand(candidate, -1)
-        if multi_view_enabled
-        else None
-    )
-    valid_view_mask = (
-        torch.ones((candidate, num_views), dtype=torch.bool, device=device)
-        if multi_view_enabled
-        else None
     )
     optimizer.zero_grad(set_to_none=True)
     torch.cuda.reset_peak_memory_stats(device)
@@ -431,7 +376,9 @@ def _run_probe(
     regularization_weight = float(
         config["training"].get("generalized_regularization_weight", 0.0)
     )
-    auxiliary_weights = _auxiliary_weights(config)
+    auxiliary_weights = config["model"].get("generalized", {}).get(
+        "auxiliary_weights"
+    )
     with autocast_context(dtype, device):
         (
             encoder_features,
@@ -442,16 +389,12 @@ def _run_probe(
             bundle.model,
             synthetic,
             weights=auxiliary_weights,
-            view_ids=view_ids,
-            valid_view_mask=valid_view_mask,
         )
         reconstruction = reconstruction_loss(
             encoder_features,
             decoder_features,
             discard_rate=0.0,
             loose_loss=bool(config["model"]["loose_loss"]),
-            valid_view_mask=valid_view_mask,
-            selection_scope=str(config["training"].get("loose_loss_scope", "batch")),
         )
         loss = (
             reconstruction + regularization_weight * regularizer
@@ -473,8 +416,6 @@ def _run_probe(
     peak_reserved = torch.cuda.max_memory_reserved(device)
     result = {
         "batch_size": candidate,
-        "batch_unit": "objects" if multi_view_enabled else "views",
-        "equivalent_view_batch_size": candidate * num_views,
         "status": "ok",
         "loss": float(loss.detach().cpu()),
         "reconstruction_loss": float(reconstruction.detach().cpu()),
@@ -496,8 +437,6 @@ def _run_probe(
         auxiliary,
         loss,
         synthetic,
-        view_ids,
-        valid_view_mask,
         optimizer,
         scaler,
     )
@@ -517,7 +456,6 @@ def choose_batch_size(
     world_size: int = 1,
 ) -> BatchChoice:
     training = config["training"]
-    multi_view_enabled, num_views, _ = _multi_view_settings(config)
     effective = int(training["effective_batch_size"])
     requested = training["micro_batch_size"]
     if requested != "auto":
@@ -602,13 +540,6 @@ def choose_batch_size(
                         "selected_micro_batch_size": choice.micro_batch_size,
                         "accumulation_steps": choice.accumulation_steps,
                         "effective_batch_size": choice.effective_batch_size,
-                        "batch_unit": (
-                            "objects" if multi_view_enabled else "views"
-                        ),
-                        "effective_view_batch_size": (
-                            choice.effective_batch_size
-                            * (num_views if multi_view_enabled else 1)
-                        ),
                         "world_size": choice.world_size,
                         "global_micro_batch_size": (
                             choice.global_micro_batch_size
@@ -696,11 +627,7 @@ def save_checkpoint(
     completed_steps: int,
     batch_choice: BatchChoice,
     rng_states: list[dict[str, Any]] | None = None,
-    best_metric: float = float("inf"),
-    best_step: int = 0,
-    ema_loss: float | None = None,
 ) -> None:
-    multi_view_enabled, num_views, _ = _multi_view_settings(config)
     atomic_torch_save(
         path,
         {
@@ -710,25 +637,13 @@ def save_checkpoint(
             "created_at": utc_now(),
             "config_fingerprint": config_fingerprint(config),
             "completed_steps": completed_steps,
-            "best_metric": best_metric,
-            "best_step": best_step,
-            "ema_loss": ema_loss,
-            "selection": "minimum logged training-loss EMA after warmup",
             "micro_batch_size": batch_choice.micro_batch_size,
             "accumulation_steps": batch_choice.accumulation_steps,
             "effective_batch_size": batch_choice.effective_batch_size,
-            "batch_unit": "objects" if multi_view_enabled else "views",
-            "effective_view_batch_size": (
-                batch_choice.effective_batch_size * num_views
-            ),
             "global_micro_batch_size": batch_choice.global_micro_batch_size,
             "world_size": batch_choice.world_size,
             "model": trainable_state_dict(bundle),
             "optimizer": optimizer.state_dict(),
-            "scheduler": {
-                "completed_steps": completed_steps,
-                "config": dict(config["training"].get("scheduler", {})),
-            },
             "scaler": scaler.state_dict(),
             "rng_state": _rng_state(),
             "rng_states": rng_states,
@@ -761,9 +676,6 @@ def _save_checkpoint_for_all_ranks(
     completed_steps: int,
     batch_choice: BatchChoice,
     context: DistributedContext,
-    best_metric: float = float("inf"),
-    best_step: int = 0,
-    ema_loss: float | None = None,
 ) -> None:
     rng_states = _gather_rng_states(context)
     if context.is_primary:
@@ -776,9 +688,6 @@ def _save_checkpoint_for_all_ranks(
             completed_steps=completed_steps,
             batch_choice=batch_choice,
             rng_states=rng_states,
-            best_metric=best_metric,
-            best_step=best_step,
-            ema_loss=ema_loss,
         )
     _barrier(context)
 
@@ -798,7 +707,6 @@ def _resolve_resume(
             for path in (
                 checkpoint_dir / "last.pt",
                 checkpoint_dir / "final_model.pt",
-                checkpoint_dir / "best_model.pt",
             )
             if path.is_file()
         ]
@@ -980,7 +888,6 @@ def _train_impl(
         "dinomaly2_train", log_dir / "train.log", context.is_primary
     )
     progress_path = log_dir / "progress.jsonl"
-    testc_progress_path = log_dir / "training_progress.jsonl"
     state_path = output_dir / "run_state.json"
     if context.is_primary:
         dump_resolved_config(config, output_dir / "resolved_config.yaml")
@@ -1004,7 +911,6 @@ def _train_impl(
 
     dataset_config = config["dataset"]
     dataset_type = str(dataset_config.get("type", "realiad_variety"))
-    multi_view_enabled, num_views, missing_view_policy = _multi_view_settings(config)
     if dataset_type == "competition_folders":
         image_dir = Path(dataset_config["train_dir"])
         dataset, competition_manifest = build_competition_train_dataset(
@@ -1013,9 +919,6 @@ def _train_impl(
             category_limit=dataset_config.get("category_limit"),
             image_size=int(dataset_config["image_size"]),
             crop_size=int(dataset_config["crop_size"]),
-            multi_view_enabled=multi_view_enabled,
-            num_views=num_views,
-            missing_view_policy=missing_view_policy,
         )
         categories = list(competition_manifest.categories)
     else:
@@ -1066,16 +969,11 @@ def _train_impl(
             categories=categories,
             image_size=int(dataset_config["image_size"]),
             crop_size=int(dataset_config["crop_size"]),
-            multi_view_enabled=multi_view_enabled,
-            num_views=num_views,
-            missing_view_policy=missing_view_policy,
         )
     logger.info(
-        "训练 manifest：%d 类，%d 个%s（等效 %d 张正常视图）",
+        "训练 manifest：%d 类，%d 张正常视图",
         len(categories),
         len(dataset),
-        "对象" if multi_view_enabled else "视图",
-        len(dataset) * (num_views if multi_view_enabled else 1),
     )
 
     state: dict[str, Any] = {
@@ -1114,14 +1012,6 @@ def _train_impl(
             )
         load_trainable_state_dict(bundle, checkpoint["model"])
         completed_steps = int(checkpoint["completed_steps"])
-        scheduler_state = checkpoint.get("scheduler")
-        if scheduler_state is not None:
-            if int(scheduler_state.get("completed_steps", -1)) != completed_steps:
-                raise ValueError("checkpoint scheduler step is inconsistent")
-            if dict(scheduler_state.get("config", {})) != dict(
-                config["training"].get("scheduler", {})
-            ):
-                raise ValueError("checkpoint scheduler config is inconsistent")
         checkpoint_world_size = int(checkpoint.get("world_size", 1))
         if checkpoint_world_size != context.world_size:
             raise ValueError(
@@ -1182,38 +1072,23 @@ def _train_impl(
             _restore_rng_state(checkpoint["rng_state"])
 
     total_steps = int(config["training"]["total_steps"])
-    best_metric = float(
-        checkpoint.get("best_metric", float("inf"))
-        if checkpoint is not None
-        else float("inf")
-    )
-    best_step = int(
-        checkpoint.get("best_step", 0) if checkpoint is not None else 0
-    )
-    saved_ema = checkpoint.get("ema_loss") if checkpoint is not None else None
-    ema_loss = None if saved_ema is None else float(saved_ema)
     if completed_steps > total_steps:
         raise ValueError(
             f"checkpoint 已完成 {completed_steps} 步，超过配置 {total_steps}"
         )
     logger.info(
-        "运行 batch（单位=%s）：per-GPU micro=%d, global micro=%d, "
-        "accumulate=%d, effective=%d, equivalent views=%d；从 step=%d 开始",
-        "objects" if multi_view_enabled else "views",
+        "运行 batch：per-GPU micro=%d, global micro=%d, accumulate=%d, "
+        "effective=%d；从 step=%d 开始",
         batch_choice.micro_batch_size,
         batch_choice.global_micro_batch_size,
         batch_choice.accumulation_steps,
         batch_choice.effective_batch_size,
-        batch_choice.effective_batch_size * (
-            num_views if multi_view_enabled else 1
-        ),
         completed_steps,
     )
     protocol_notes: list[str] = []
     if (
         batch_choice.accumulation_steps > 1
         and bool(config["model"]["loose_loss"])
-        and str(config["training"].get("loose_loss_scope", "batch")) == "batch"
     ):
         note = (
             "micro-batch 小于 effective batch 时，Loose Loss 的 top-k 阈值"
@@ -1233,11 +1108,6 @@ def _train_impl(
             "multi_gpu_strategy": context.strategy,
             "accumulation_steps": batch_choice.accumulation_steps,
             "effective_batch_size": batch_choice.effective_batch_size,
-            "batch_unit": "objects" if multi_view_enabled else "views",
-            "effective_view_batch_size": (
-                batch_choice.effective_batch_size
-                * (num_views if multi_view_enabled else 1)
-            ),
             "next_action": "继续训练；中断后重新运行 train.ps1 将自动续跑",
             "protocol_notes": protocol_notes,
         }
@@ -1265,7 +1135,9 @@ def _train_impl(
                 "generalized_regularization_weight", 0.0
             )
         )
-        auxiliary_weights = _auxiliary_weights(config)
+        auxiliary_weights = config["model"].get("generalized", {}).get(
+            "auxiliary_weights"
+        )
         started = time.perf_counter()
         interval_started = started
         consecutive_skipped_steps = 0
@@ -1318,10 +1190,9 @@ def _train_impl(
                     batch_choice.accumulation_steps
                 ):
                     batch = next(iterator)
-                    images, view_ids, valid_view_mask = _batch_model_inputs(
-                        batch,
-                        config,
+                    images = batch["image"].to(
                         device,
+                        non_blocking=bool(config["runtime"]["pin_memory"]),
                     )
                     synchronize = (
                         not context.is_ddp
@@ -1344,18 +1215,12 @@ def _train_impl(
                                 bundle.model,
                                 images,
                                 weights=auxiliary_weights,
-                                view_ids=view_ids,
-                                valid_view_mask=valid_view_mask,
                             )
                             reconstruction = reconstruction_loss(
                                 encoder_features,
                                 decoder_features,
                                 discard_rate=discard_rate,
                                 loose_loss=bool(config["model"]["loose_loss"]),
-                                valid_view_mask=valid_view_mask,
-                                selection_scope=str(
-                                    config["training"].get("loose_loss_scope", "batch")
-                                ),
                             )
                             raw_loss = (
                                 reconstruction
@@ -1430,7 +1295,6 @@ def _train_impl(
                     scaler.update()
                     consecutive_skipped_steps = 0
                 completed_steps = step_index + 1
-                new_best = False
 
                 should_log = scheduled_log or skip_optimizer_step
                 if should_log:
@@ -1458,30 +1322,6 @@ def _train_impl(
                             accumulated_auxiliary.items()
                         )
                     }
-                    ema_loss = (
-                        mean_loss
-                        if ema_loss is None
-                        else 0.9 * ema_loss + 0.1 * mean_loss
-                    )
-                    best_start = max(
-                        int(
-                            config["training"]
-                            .get("scheduler", {})
-                            .get(
-                                "warmup_steps",
-                                config["training"].get("warmup_steps", 0),
-                            )
-                        ),
-                        max(1, total_steps // 10),
-                    )
-                    if (
-                        not skip_optimizer_step
-                        and completed_steps >= best_start
-                        and ema_loss < best_metric - 1e-4
-                    ):
-                        best_metric = ema_loss
-                        best_step = completed_steps
-                        new_best = True
                     now = time.perf_counter()
                     elapsed = now - started
                     mean_step_seconds = elapsed / max(
@@ -1525,29 +1365,9 @@ def _train_impl(
                         "global_micro_batch_size": (
                             batch_choice.global_micro_batch_size
                         ),
-                        "batch_unit": (
-                            "objects" if multi_view_enabled else "views"
-                        ),
-                        "effective_view_batch_size": (
-                            batch_choice.effective_batch_size
-                            * (num_views if multi_view_enabled else 1)
-                        ),
                         "world_size": context.world_size,
                         "accumulation_steps": batch_choice.accumulation_steps,
                         "eta_seconds": eta_seconds,
-                        "mean_step_seconds": mean_step_seconds,
-                        "objects_per_second": (
-                            batch_choice.effective_batch_size / mean_step_seconds
-                            if mean_step_seconds > 0
-                            else 0.0
-                        ),
-                        "views_per_second": (
-                            batch_choice.effective_batch_size
-                            * (num_views if multi_view_enabled else 1)
-                            / mean_step_seconds
-                            if mean_step_seconds > 0
-                            else 0.0
-                        ),
                     }
                     if device.type == "cuda":
                         payload["gpu_allocated_bytes"] = (
@@ -1558,7 +1378,6 @@ def _train_impl(
                         )
                     if context.is_primary:
                         append_jsonl(progress_path, payload)
-                        append_jsonl(testc_progress_path, payload)
                     logger.info(
                         "step %d/%d | loss %.6f | lr %.3e | grad_preclip %.4f "
                         "| clipped_to %.4f | skipped %s | ETA %.1fh",
@@ -1605,26 +1424,6 @@ def _train_impl(
                         f"last pre-clip norm={grad_norm_value:.6g}"
                     )
 
-                if new_best:
-                    logger.info(
-                        "更新 best_model step=%d | ema_loss=%.6f",
-                        best_step,
-                        best_metric,
-                    )
-                    _save_checkpoint_for_all_ranks(
-                        checkpoint_dir / "best_model.pt",
-                        bundle=bundle,
-                        optimizer=optimizer,
-                        scaler=scaler,
-                        config=config,
-                        completed_steps=completed_steps,
-                        batch_choice=batch_choice,
-                        context=context,
-                        best_metric=best_metric,
-                        best_step=best_step,
-                        ema_loss=ema_loss,
-                    )
-
                 if (
                     completed_steps % checkpoint_every == 0
                     or completed_steps == total_steps
@@ -1639,9 +1438,6 @@ def _train_impl(
                         completed_steps=completed_steps,
                         batch_choice=batch_choice,
                         context=context,
-                        best_metric=best_metric,
-                        best_step=best_step,
-                        ema_loss=ema_loss,
                     )
         except KeyboardInterrupt:
             logger.warning("收到中断，正在保存可续跑断点")
@@ -1654,9 +1450,6 @@ def _train_impl(
                     config=config,
                     completed_steps=completed_steps,
                     batch_choice=batch_choice,
-                    best_metric=best_metric,
-                    best_step=best_step,
-                    ema_loss=ema_loss,
                 )
             state.update(
                 {
@@ -1694,55 +1487,22 @@ def _train_impl(
                 "created_at": utc_now(),
                 "config_fingerprint": config_fingerprint(config),
                 "completed_steps": total_steps,
-                "best_metric": best_metric,
-                "best_step": best_step,
-                "ema_loss": ema_loss,
-                "selection": "minimum logged training-loss EMA after warmup",
-                "scheduler": {
-                    "completed_steps": total_steps,
-                    "config": dict(config["training"].get("scheduler", {})),
-                },
                 "model": trainable_state_dict(bundle),
                 "backbone": bundle.backbone_name,
                 "world_size": context.world_size,
                 "effective_batch_size": batch_choice.effective_batch_size,
-                "batch_unit": "objects" if multi_view_enabled else "views",
-                "effective_view_batch_size": (
-                    batch_choice.effective_batch_size
-                    * (num_views if multi_view_enabled else 1)
-                ),
                 "global_micro_batch_size": (
                     batch_choice.global_micro_batch_size
                 ),
             },
         )
-        best_path = checkpoint_dir / "best_model.pt"
-        if not best_path.is_file():
-            fallback = torch.load(
-                final_path, map_location="cpu", weights_only=False
-            )
-            fallback["best_metric"] = (
-                float(ema_loss) if ema_loss is not None else float("nan")
-            )
-            fallback["best_step"] = total_steps
-            fallback["selection"] = (
-                "final fallback; no eligible EMA checkpoint"
-            )
-            atomic_torch_save(best_path, fallback)
-        selected = torch.load(
-            best_path, map_location="cpu", weights_only=False
-        )
-        selected["training_completed_steps"] = total_steps
-        atomic_torch_save(best_path, selected)
     _barrier(context)
     state.update(
         {
             "status": "trained",
             "updated_at": utc_now(),
             "completed_steps": total_steps,
-            "checkpoint": str(checkpoint_dir / "best_model.pt"),
-            "final_checkpoint": str(final_path),
-            "best_step": best_step,
+            "checkpoint": str(final_path),
             "next_action": "运行 evaluate.ps1 计算论文七项指标",
         }
     )
@@ -1754,16 +1514,10 @@ def _train_impl(
                 "timestamp": utc_now(),
                 "event": "training_complete",
                 "step": total_steps,
-                "checkpoint": str(checkpoint_dir / "best_model.pt"),
-                "final_checkpoint": str(final_path),
-                "best_step": best_step,
+                "checkpoint": str(final_path),
             },
         )
-    logger.info(
-        "训练完成：final=%s | inference_default=%s",
-        final_path,
-        checkpoint_dir / "best_model.pt",
-    )
+    logger.info("训练完成：%s", final_path)
     return state
 
 
@@ -1822,7 +1576,6 @@ def _probe_batch_impl(
         logger=logger,
         output_dir=output_dir,
     )
-    multi_view_enabled, num_views, _ = _multi_view_settings(config)
     result = {
         "status": "batch_tuned",
         "updated_at": utc_now(),
@@ -1836,10 +1589,6 @@ def _probe_batch_impl(
         "world_size": choice.world_size,
         "accumulation_steps": choice.accumulation_steps,
         "effective_batch_size": choice.effective_batch_size,
-        "batch_unit": "objects" if multi_view_enabled else "views",
-        "effective_view_batch_size": (
-            choice.effective_batch_size * (num_views if multi_view_enabled else 1)
-        ),
         "next_action": "运行 train.ps1；训练启动时会重新确认当前可用显存",
         "environment": environment_summary(device),
     }

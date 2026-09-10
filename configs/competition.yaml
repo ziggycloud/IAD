@@ -1,8 +1,8 @@
 experiment:
-  name: multiview_generalized_dinomaly_zeroshot_0907
-  # Keep this run separate: scheduler/optimizer semantics are checkpoint-bound.
-  output_dir: outputs/multiview_generalized_dinomaly_zeroshot_0907
-  seed: 20260830
+  name: generalized_dinomaly_competition_seen50_vitl448_stable_v2
+  # A new directory is intentional: do not resume the already destabilized run.
+  output_dir: outputs/generalized_dinomaly_competition_seen50_vitl448_stable_v2
+  seed: 20260803
 
 dataset:
   type: competition_folders
@@ -10,13 +10,7 @@ dataset:
   test_dir: data/competition/Test_A
   categories: all
   category_limit: null
-  # Test selection is independent so Test_B may contain categories absent from
-  # Train. The default Test_A policy remains strict and backward compatible.
-  test_categories: all
-  test_category_limit: null
-  require_same_categories: true
   expected_categories: 50
-  expected_test_categories: 50
   expected_train_samples_per_category: 20
   expected_test_samples_per_category: 15
   image_size: 448
@@ -47,33 +41,19 @@ model:
       router_balance: 1.0
       router_entropy_penalty: 0.05
       expert_diversity: 0.05
-  multi_view:
-    enabled: true
-    num_views: 5
-    context_dim: 384
-    num_set_layers: 2
-    num_heads: 6
-    view_embedding: true
-    view_dropout_probability: 0.2
-    visibility_temperature: 1.0
-    cross_view_dropout: 0.1
-    # Official competition folders must contain exactly 0.png..4.png.
-    missing_view_policy: error
-    variance_target: 1.0
 
 training:
-  # Object batch 12 equals 60 views. Do not set this to the old view batch 64,
-  # which would silently become 320 images per optimizer step.
+  # 6k x global batch 64 over 5,000 views is about 76.8 passes.
   total_steps: 6000
-  effective_batch_size: 12
+  effective_batch_size: 64
   micro_batch_size: auto
-  # Per GPU, measured by a real five-view forward/backward probe.
-  batch_candidates: [3, 2, 1]
+  batch_candidates: [16, 8, 4, 2, 1]
   memory_headroom_mb: 3000
   amp: true
   amp_dtype: bfloat16
-  # Conservative peak LR for the large trainable decoder/reference/router.
-  learning_rate: 0.0001
+  # 1e-3 became unstable when total_steps was extended to 15k. Start with
+  # 3e-4; tune [1e-4, 3e-4, 5e-4] before changing the architecture.
+  learning_rate: 0.0003
   first_bottleneck_lr_scale: 0.2
   weight_decay: 0.0001
   adam_betas: [0.9, 0.999]
@@ -82,43 +62,36 @@ training:
     # Supported: stable_adamw, adamw, adam.
     type: stable_adamw
     amsgrad: false
-    stable_clip_threshold: 0.5
+    stable_clip_threshold: 1.0
   scheduler:
-    # 500-step linear warmup, then one half-cosine cycle to 5e-6.
+    # Supported: cosine, linear, polynomial, constant, step, multistep.
     type: cosine
     warmup_steps: 500
     min_lr_ratio: 0.05
     step_offset: 1
-  # Ramp hard-token rejection more slowly than LR warmup so references first
-  # learn the broad normal manifold before difficult normal edges are removed.
-  loose_loss_warmup_steps: 1500
+    # polynomial: power: 2.0
+    # step: step_size: 1500, gamma: 0.5
+    # multistep: milestones: [2500, 4500], gamma: 0.3
+  # A slower, less aggressive Loose Loss avoids locking onto persistent
+  # normal edges as the only hard tokens.
+  loose_loss_warmup_steps: 2000
   loose_loss_final_discard: 0.7
-  # Per-object top-k selection is invariant to DDP world size, micro-batch,
-  # and gradient accumulation while retaining the five-view object boundary.
-  loose_loss_scope: object
   generalized_regularization_weight: 0.01
-  multi_view_auxiliary_weights:
-    context_consistency: 0.01
-    context_variance: 0.001
-    visibility_balance: 0.001
-    attention_entropy: 0.001
-  # 0.1 over-clips routine updates; 0.5 remains conservative for ViT-L.
-  gradient_clip_norm: 0.5
+  gradient_clip_norm: 0.1
   gradient_guard:
-    # This 100M-parameter trainable stack starts around norm 170. Keep the
-    # guard well above that normal regime; clipping handles routine gradients.
-    skip_step_norm: 1000.0
+    # The logged norm is measured before clipping. Skip only catastrophic
+    # outliers; after three consecutive skips stop and preserve the last ckpt.
+    skip_step_norm: 1.0
     max_consecutive_skips: 3
     fail_on_nonfinite: true
   log_every: 20
-  checkpoint_every: 500
+  checkpoint_every: 250
   auto_resume: true
 
 evaluation:
   # Used by competition inference; no labels or local metrics are required.
   amp: true
-  # Object batch; equivalent view batch is 10.
-  batch_size: 2
+  batch_size: 4
   num_workers: 4
   resize_mask: 448
   image_top_ratio: 0.01
@@ -132,103 +105,6 @@ evaluation:
   anomaly_map_align_corners: false
   metric_bins: 1000
   resume: true
-  normal_prior:
-    enabled: true
-    resolution: patch
-    category_view_enabled: true
-    unseen_fallback: view_global
-    statistic: median_mad
-    threshold: 2.0
-    temperature: 0.5
-    blend: 0.8
-    eps: 1.0e-6
-    batch_size: 2
-    num_workers: 4
-  # Legacy inference-only fusion is disabled. The trained independent branch
-  # below owns every category absent from Train.
-  unseen_clip:
-    enabled: false
-    model_name: ViT-B-16
-    pretrained: openai
-    weights_dir: third_party/OpenCLIP/weights
-    image_size: 448
-    intermediate_layers: 4
-    # Suppress shallow texture noise and favor the deeper semantic layers.
-    intermediate_layer_weights: [0.1, 0.2, 0.3, 0.4]
-    temperature: 0.07
-    prompt_aggregation: topk_mean
-    prompt_top_k: 3
-    patch_smoothing_kernel: 3
-    reconstruction_gain: 1.0
-    semantic_gain: 1.0
-    semantic_scale_floor: 0.02
-    broken_threshold: 0.5
-    upper_quantile: 0.995
-    confidence_power: 2.0
-    foreground_low_quantile: 0.2
-    foreground_high_quantile: 0.7
-    foreground_floor: 0.0
-    foreground_dilation_kernel: 9
-    final_gaussian_smoothing: true
-    # Fit only on Train normals and use a category-agnostic prior per camera.
-    normal_prior:
-      enabled: true
-      statistic: median_mad
-      threshold: 2.0
-      temperature: 0.5
-      blend: 0.8
-      eps: 1.0e-6
-      mad_floor: 0.02
-      batch_size: 2
-      num_workers: 4
-    normal_prompts:
-      - a close-up photo of an intact industrial object
-      - a normal undamaged component
-      - a flawless object surface
-      - a complete object without defects
-      - a correctly assembled industrial component
-      - an object with all parts present
-      - a clean object without contamination
-      - a component with correct wiring and connections
-      - an object with a smooth uniform coating
-      - an object with clear complete printed characters
-      - a component with open unobstructed holes
-      - an object with the correct shape and alignment
-    broken_prompts:
-      - a close-up photo of a broken industrial object
-      - an industrial object with abrasion or a worn surface
-      - an industrial object with missing or incomplete printed characters
-      - an industrial object with discoloration or abnormal color
-      - an industrial object with an exposed inner surface
-      - an industrial object contaminated by glue or gelatinous residue
-      - an industrial object contaminated by metallic debris
-      - an industrial object with a pit or surface cavity
-      - an industrial object with a scratch or gouge
-      - an industrial object fitted with the wrong plug or wrong component
-      - an industrial object with a broken or disconnected wire
-      - a visibly damaged industrial component
-      - an industrial object with excessive material or material overflow
-      - an industrial object with fiber burrs or frayed fibers
-      - an industrial object with a blocked or obstructed hole
-      - an industrial object with a missing part or absent component
-      - an industrial object with porosity, pores, or air holes
-      - an industrial object with a twisted or tangled wire
-      - an industrial object with a wire jumping out of its correct position
-      - an industrial object with a burn mark or heat damage
-      - an industrial object with deformation, warping, or bending
-      - an industrial object with exposed copper or exposed conductor
-      - an industrial object with a fracture, crack, or split
-      - an industrial object with impact damage, denting, or crushing
-      - an industrial object with an oil stain or greasy contamination
-      - an industrial object with uneven coating or patchy paint
-      - an industrial object with corrosion, oxidation, or rust
-      - an industrial object with peeling, delamination, or flaking
-      - an industrial object with a chip, notch, or broken edge
-      - an industrial object with a puncture, tear, or unwanted hole
-      - an industrial object with a loose connection or detached part
-      - an industrial object with a bent pin or misaligned connector
-      - an industrial object with foreign material, dirt, or contamination
-      - an industrial object with an incorrect assembly or misplaced part
 
 # AdaptCLIP-inspired branch trained locally from public OpenAI CLIP base
 # weights. It never loads another anomaly model's task-specific checkpoint.
@@ -321,11 +197,9 @@ zero_shot:
     feature_anomaly_probability: 0.2
     feature_noise_std: 0.04
 
+
 submission:
   mask_size: 448
-  # Object batch; each item contains five independent output masks.  Four
-  # objects means a 20-frame ViT forward, which is appropriate for A40-class
-  # inference GPUs and halves forward calls relative to the old batch of two.
   batch_size: 4
   num_workers: 4
   object_top_ratio: 0.01
@@ -333,17 +207,11 @@ submission:
   # anomalous peaks from being collapsed while using the PNG range efficiently.
   lower_quantile: 0.001
   upper_quantile: 0.99999
-  # Seen Test_C AUROC: mean 0.9418 vs submitted 0.9358 and max 0.9214.
-  object_score_aggregation: mean
-  object_score_softmax_temperature: 0.25
-  # Keep a max component so a defect visible in one camera is not erased.
-  visibility_max_blend: 0.5
-  # The current real Test_C report reverses the earlier diagnostic: mean-view
-  # 0.6908 is materially better than the submitted max/mean blend at 0.6718.
+  # Preserve commit 71eebcc's concatenated five-view top-k rule for seen.
+  object_score_aggregation: legacy_concat_topk
+  # AdaptCLIP unseen scoring remains isolated from the seen path.
   zero_shot_object_max_blend: 0.0
   zero_shot_object_global_weight: 0.35
-  # Per-category affine scaling is monotonic, so it preserves continuous
-  # ranking while using all 256 PNG levels for pixel AP/AUROC evaluation.
   zero_shot_mask_calibration: per_category
 
 runtime:

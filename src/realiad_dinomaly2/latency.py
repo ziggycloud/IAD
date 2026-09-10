@@ -68,15 +68,9 @@ def benchmark_single_frame_latency(
     """
 
     # Keep the pure latency summary importable in lightweight environments.
-    from .competition_data import (
-        CompetitionFolderDataset,
-        CompetitionObjectDataset,
-        scan_competition_split,
-    )
-    from .data import RealIADMultiViewDataset, RealIADVarietyDataset
+    from .data import RealIADVarietyDataset
     from .metrics import GaussianFilter, top_ratio_mean
     from .modeling import build_model, load_trainable_state_dict
-    from .normal_prior import load_normal_prior, normal_prior_path
 
     latency_config = config.get("latency", {})
     warmup = int(latency_config.get("warmup_iterations", 10))
@@ -94,80 +88,27 @@ def benchmark_single_frame_latency(
         else None
     )
     dataset_config = config["dataset"]
-    multi_view_config = dict(config["model"].get("multi_view", {}))
-    multi_view_enabled = bool(multi_view_config.get("enabled", False))
-    if dataset_config.get("type") == "competition_folders":
-        manifest = scan_competition_split(
-            Path(dataset_config["test_dir"]),
-            requested=[category],
-        )
-        views = manifest.views_for_category(category)
-        if multi_view_enabled:
-            dataset = CompetitionObjectDataset(
-                views,
-                image_size=int(dataset_config["image_size"]),
-                crop_size=int(dataset_config["crop_size"]),
-                num_views=int(multi_view_config.get("num_views", 5)),
-                missing_view_policy=str(
-                    multi_view_config.get("missing_view_policy", "error")
-                ),
+    dataset = RealIADVarietyDataset(
+        json_dir=Path(dataset_config["json_dir"]),
+        image_dir=Path(dataset_config["image_dir"]),
+        category=category,
+        phase="test",
+        image_size=int(dataset_config["image_size"]),
+        crop_size=int(dataset_config["crop_size"]),
+        max_items=1,
+        image_label_policy=str(dataset_config["image_label_policy"]),
+        missing_anomaly_mask_policy=str(
+            dataset_config["missing_anomaly_mask_policy"]
+        ),
+        mask_resize_semantics=str(
+            dataset_config.get(
+                "mask_resize_semantics",
+                "upstream_bilinear_nonzero",
             )
-        else:
-            dataset = CompetitionFolderDataset(
-                views,
-                image_size=int(dataset_config["image_size"]),
-                crop_size=int(dataset_config["crop_size"]),
-            )
-    else:
-        common_args = {
-            "json_dir": Path(dataset_config["json_dir"]),
-            "image_dir": Path(dataset_config["image_dir"]),
-            "category": category,
-            "phase": "test",
-            "image_size": int(dataset_config["image_size"]),
-            "crop_size": int(dataset_config["crop_size"]),
-            "image_label_policy": str(dataset_config["image_label_policy"]),
-            "missing_anomaly_mask_policy": str(
-                dataset_config["missing_anomaly_mask_policy"]
-            ),
-            "mask_resize_semantics": str(
-                dataset_config.get(
-                    "mask_resize_semantics",
-                    "upstream_bilinear_nonzero",
-                )
-            ),
-        }
-        if multi_view_enabled:
-            dataset = RealIADMultiViewDataset(
-                **common_args,
-                num_views=int(multi_view_config.get("num_views", 5)),
-                missing_view_policy=str(
-                    multi_view_config.get("missing_view_policy", "error")
-                ),
-                max_objects=1,
-            )
-        else:
-            dataset = RealIADVarietyDataset(**common_args, max_items=1)
+        ),
+    )
     sample = dataset[0]
-    image_key = "images" if multi_view_enabled else "image"
-    image = sample[image_key].unsqueeze(0).to(device)
-    view_ids = (
-        sample["view_ids"].unsqueeze(0).to(device)
-        if multi_view_enabled
-        else torch.tensor(
-            [
-                int(sample["view_id"])
-                if dataset_type == "competition_folder"
-                else int(sample["view_id"]) - 1
-            ],
-            device=device,
-        )
-    )
-    valid_view_mask = (
-        sample["valid_view_mask"].unsqueeze(0).to(device)
-        if multi_view_enabled
-        else torch.ones(1, dtype=torch.bool, device=device)
-    )
+    image = sample["image"].unsqueeze(0).to(device)
 
     checkpoint_path = Path(checkpoint).expanduser().resolve()
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -183,13 +124,6 @@ def benchmark_single_frame_latency(
         raise ValueError("latency checkpoint backbone SHA-256 does not match")
     load_trainable_state_dict(bundle, payload["model"])
     bundle.model.eval()
-    normal_prior = None
-    if bool(config["evaluation"].get("normal_prior", {}).get("enabled", False)):
-        normal_prior = load_normal_prior(
-            normal_prior_path(config),
-            config,
-            checkpoint_path,
-        )
 
     evaluation = config["evaluation"]
     resize_mask = int(evaluation["resize_mask"])
@@ -201,33 +135,16 @@ def benchmark_single_frame_latency(
 
     def run_once() -> None:
         with autocast_context(dtype, device):
-            if multi_view_enabled:
-                encoder_features, decoder_features = bundle.model(
-                    image,
-                    view_ids=view_ids,
-                    valid_view_mask=valid_view_mask,
-                )
-            else:
-                encoder_features, decoder_features = bundle.model(image)
+            encoder_features, decoder_features = bundle.model(image)
             maps = anomaly_map(
                 encoder_features,
                 decoder_features,
-                output_size=int(dataset_config["crop_size"]) // 14,
+                output_size=int(dataset_config["crop_size"]),
                 layer_weights=evaluation.get("anomaly_map_layer_weights"),
                 align_corners=bool(
                     evaluation.get("anomaly_map_align_corners", True)
                 ),
             )
-        if normal_prior is not None:
-            maps = normal_prior.calibrate(
-                maps,
-                categories=[category],
-                view_ids=view_ids,
-                valid_view_mask=valid_view_mask,
-                config=config,
-            )
-        if maps.ndim == 5:
-            maps = maps.reshape(-1, *maps.shape[2:])
         maps = F.interpolate(
             maps.float(),
             size=(resize_mask, resize_mask),
@@ -256,20 +173,11 @@ def benchmark_single_frame_latency(
             "device": str(device),
             "gpu_name": torch.cuda.get_device_properties(device).name,
             "category": category,
-            "image_path": str(
-                sample.get("image_path", sample.get("image_paths"))
-            ),
+            "image_path": str(sample["image_path"]),
             "warmup_iterations": warmup,
             "scope": (
                 "model forward + anomaly map + metric resize + Gaussian + "
-                "image score and optional Train-normal prior; disk "
-                "decode/preprocessing excluded"
-            ),
-            "batch_unit": "object" if multi_view_enabled else "view",
-            "equivalent_views": (
-                int(multi_view_config.get("num_views", 5))
-                if multi_view_enabled
-                else 1
+                "image score; disk decode/preprocessing excluded"
             ),
             "checkpoint": str(checkpoint_path),
         }

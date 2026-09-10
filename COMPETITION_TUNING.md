@@ -1,7 +1,7 @@
 # 比赛分割调优与训练稳定性说明
 
-五视角网络、数据 shape、辅助损失、正常先验 artifact 与恢复规则的完整说明见
-[MULTIVIEW_ARCHITECTURE.md](MULTIVIEW_ARCHITECTURE.md)。
+当前 seen 路线已恢复为 commit `71eebcc` 的逐视角稳定基线。本文件后半部分的五视角
+网络与正常先验仅保留为历史消融记录，不属于当前默认训练路径。
 
 ## 1. 为什么 P-AUROC 高，但 P-AUPR / P-F1max 只有 0.5–0.6
 
@@ -26,7 +26,7 @@
 - 高斯平滑：建议先比较 sigma 0、1、2，原来的 4 通常不利于小缺陷 precision。
 - 梯度保护：记录裁剪前总范数和每个参数组范数，超过阈值时跳过 optimizer step。
 
-稳定版默认值是 LR 3e-4、Adam epsilon 1e-8、500-step warmup、cosine、Loose Loss 2000-step 渐进到 0.7、sigma 2、两层权重 `[0.35, 0.65]`。五视角版本使用独立的 `*_v3` 输出目录，避免恢复单视角 optimizer 状态。
+稳定版默认值是 LR 3e-4、effective view batch 64、Adam epsilon 1e-8、500-step warmup、cosine、Loose Loss 2000-step 渐进到 0.7、sigma 2、两层权重 `[0.35, 0.65]`。
 
 建议一次只改变一个变量，优先顺序如下：
 
@@ -37,9 +37,9 @@
 
 不要使用 Test_A 标签反向训练或按测试标签选阈值。若比赛允许本地验证，应该仅从 Train 的正常样本中留出少量 normal validation，用于监控正常边缘响应和训练稳定性；它不能直接估计缺陷 P-AUPR。
 
-## 3. 已实现的五视角联合架构
+## 3. 历史消融：五视角联合架构（当前不启用）
 
-当前默认实现不拼接 RGB，也不施加跨相机像素对齐约束。一个 `Sxxxx` 的五张图组成
+该历史实现不拼接 RGB，也不施加跨相机像素对齐约束。一个 `Sxxxx` 的五张图组成
 一个 object batch 元素；共享冻结 DINO 编码器产生五组 patch token，再由带 view
 embedding 的 robust pooling、两层 Set Attention 和 visibility head 产生 object context、
 per-view cross-view context 与可靠性。跨视角信息只通过 router conditioning 和有界
@@ -72,7 +72,7 @@ gate 而不是 hard ReLU，保留局部排序。artifact 记录版本、checkpoi
 
 ## 5. 运行和覆盖示例
 
-默认五视角配置（effective object batch 12，等效 view batch 60）：
+当前逐视角稳定配置（effective view batch 64）：
 
 ```bash
 python run_competition_pipeline.py

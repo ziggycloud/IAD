@@ -124,9 +124,9 @@ class ClipCompetitionConfigTests(unittest.TestCase):
     def test_new_competition_config_uses_trained_zero_shot_route(self) -> None:
         config = load_config(ROOT / "configs" / "competition.yaml")
 
-        self.assertTrue(config["model"]["multi_view"]["enabled"])
-        self.assertTrue(config["evaluation"]["normal_prior"]["enabled"])
-        self.assertFalse(config["evaluation"]["unseen_clip"]["enabled"])
+        self.assertNotIn("multi_view", config["model"])
+        self.assertNotIn("normal_prior", config["evaluation"])
+        self.assertNotIn("unseen_clip", config["evaluation"])
         self.assertTrue(config["zero_shot"]["enabled"])
         self.assertEqual(config["zero_shot"]["route"], "unseen_only")
         self.assertEqual(
