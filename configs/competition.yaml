@@ -141,8 +141,8 @@ zero_shot:
     compound_prompt_count: 10
     prompt_prior_temperature: 1.0
     # RGB-frequency/refiner features learned synthetic texture shortcuts and
-    # hurt 47/50 unseen categories. Keep them available for ablations but off
-    # in the score-oriented recipe.
+    # coincided with a broad unseen regression. Keep them available for
+    # ablations but off in the score-oriented recipe.
     layer_specific_adapters: false
     dense_refinement_enabled: false
     frequency_weight: 0.0
