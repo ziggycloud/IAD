@@ -78,10 +78,8 @@ def _inference_worker_context(
             raise RuntimeError(f"LOCAL_RANK={local_rank} is not an available CUDA device")
         device = torch.device("cuda", local_rank)
         torch.cuda.set_device(device)
-        backend = "nccl" if dist.is_nccl_available() else "gloo"
     else:
         device = configured
-        backend = "gloo"
     return device, rank, world_size
 
 
