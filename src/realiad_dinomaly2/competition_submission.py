@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import time
 import zipfile
 from collections import defaultdict
 from pathlib import Path
@@ -12,7 +13,6 @@ from typing import Any, Iterable
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -60,14 +60,17 @@ ZERO_SHOT_SCORING_VERSION = "mask_topk_v1"
 
 def _inference_worker_context(
     config: dict[str, Any],
-) -> tuple[torch.device, int, int, bool]:
-    """Choose one device per torchrun worker for category-parallel inference."""
+) -> tuple[torch.device, int, int]:
+    """Choose one device per torchrun worker without a second DDP group.
+
+    Inference categories are independent. Filesystem result markers provide
+    the only coordination needed, which avoids NCCL rendezvous failures under
+    GPU virtualization after training has already destroyed its DDP group.
+    """
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     if world_size <= 1:
-        return resolve_device(str(config["runtime"]["device"])), rank, world_size, False
-    if not dist.is_available():
-        raise RuntimeError("torch.distributed is unavailable for multi-process inference")
+        return resolve_device(str(config["runtime"]["device"])), rank, world_size
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
     configured = torch.device(str(config["runtime"]["device"]))
     if configured.type == "cuda":
@@ -79,17 +82,7 @@ def _inference_worker_context(
     else:
         device = configured
         backend = "gloo"
-    initialized_here = not dist.is_initialized()
-    if initialized_here:
-        dist.init_process_group(backend=backend, init_method="env://")
-    return device, rank, world_size, initialized_here
-
-
-def _finish_inference_worker(initialized_here: bool) -> None:
-    if dist.is_initialized():
-        dist.barrier()
-    if initialized_here and dist.is_initialized():
-        dist.destroy_process_group()
+    return device, rank, world_size
 
 
 def resolve_competition_checkpoint(
@@ -526,15 +519,11 @@ def generate_competition_submission(
     submission_root = run_dir / "package"
     mask_root = submission_root / "predicted_masks"
     category_result_dir = run_dir / "per_category"
-    device, rank, world_size, initialized_here = _inference_worker_context(config)
+    device, rank, world_size = _inference_worker_context(config)
     logger = setup_logger(
         "competition_submission",
         run_dir / ("inference.log" if rank == 0 else f"inference.rank{rank}.log"),
     )
-    # Rank 1 may arrive here while rank 0 is still fitting the normal prior.
-    # Do not load any shared inference artifact until every worker has joined.
-    if world_size > 1:
-        dist.barrier()
     if rank == 0:
         atomic_write_json(
             run_dir / "metadata.json",
@@ -1064,7 +1053,6 @@ def generate_competition_submission(
         all_rows.extend(rows)
 
     if world_size > 1:
-        _finish_inference_worker(initialized_here)
         if rank != 0:
             return {
                 "status": "worker_complete",
@@ -1072,9 +1060,23 @@ def generate_competition_submission(
                 "world_size": world_size,
                 "signature": signature,
             }
-        # Each worker owns a disjoint category subset. Re-read all durable
-        # category files after synchronization so rank 0 can package one exact
-        # submission without moving 448x448 maps through collective comms.
+        # Each worker owns a disjoint category subset. Wait for durable result
+        # files rather than using NCCL: no tensor needs to cross GPUs here.
+        timeout = int(submission.get("distributed_result_timeout_seconds", 7200))
+        deadline = time.monotonic() + timeout
+        while True:
+            missing = [
+                category for category in manifest.categories
+                if not (category_result_dir / f"{category}.json").is_file()
+            ]
+            if not missing:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for distributed category results: "
+                    f"{missing[:10]}"
+                )
+            time.sleep(1)
         all_rows = []
         for category in manifest.categories:
             result_path = category_result_dir / f"{category}.json"
