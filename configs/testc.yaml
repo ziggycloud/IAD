@@ -1,8 +1,8 @@
 base_config: competition.yaml
 
 experiment:
-  name: testc_0910clip
-  output_dir: outputs/testc_0910clip
+  name: testc_09111clip
+  output_dir: outputs/testc_09111clip
 
 testc:
   protocol_file: configs/testc_protocol.json

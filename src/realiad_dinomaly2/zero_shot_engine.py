@@ -297,9 +297,10 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 if positive.any()
                 else branch_logits.new_zeros(())
             )
+            boundary_weight = float(train_config.get("boundary_weight", 0.0))
             boundary = (
                 _boundary_loss(branch_logits[positive], target[positive])
-                if positive.any()
+                if boundary_weight > 0.0 and positive.any()
                 else branch_logits.new_zeros(())
             )
             object_logits, object_labels = _map_object_logits(
@@ -332,23 +333,25 @@ def train_zero_shot(config: dict[str, Any], resume: str = "auto") -> Path | None
                 if step % 2 == 0
                 else output["logits"].new_zeros(())
             )
+            prompt_diversity_weight = float(
+                train_config.get("prompt_diversity_weight", 0.0)
+            )
             prompt_diversity = (
                 _prompt_diversity_loss(model.learned_prompts())
-                if step % 2 == 0
+                if prompt_diversity_weight > 0.0 and step % 2 == 0
                 else output["logits"].new_zeros(())
             )
             loss = (
                 float(train_config.get("focal_weight", 1.0)) * focal
                 + float(train_config.get("dice_weight", 1.0)) * dice
-                + float(train_config.get("boundary_weight", 0.0)) * boundary
+                + boundary_weight * boundary
                 + float(train_config.get("image_weight", 0.25)) * image_loss
                 + float(train_config.get("global_image_weight", 0.1))
                 * global_image_loss
                 + float(train_config.get("clean_weight", 0.2)) * clean_loss
                 + float(train_config.get("prompt_anchor_weight", 0.01))
                 * anchor_loss
-                + float(train_config.get("prompt_diversity_weight", 0.0))
-                * prompt_diversity
+                + prompt_diversity_weight * prompt_diversity
             )
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(

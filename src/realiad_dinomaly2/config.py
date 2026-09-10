@@ -304,6 +304,14 @@ def _validate(config: dict[str, Any]) -> None:
                         "zero_shot.model.compound_prompt_count must not exceed "
                         "the number of broken prompts"
                     )
+                if zero_model.get("prompt_aggregation", "dynamic_prior") not in {
+                    "dynamic_prior",
+                    "mean_anchor",
+                }:
+                    raise ValueError(
+                        "zero_shot.model.prompt_aggregation must be "
+                        "dynamic_prior or mean_anchor"
+                    )
                 if float(zero_model.get("frequency_weight", 0.0)) < 0.0:
                     raise ValueError(
                         "zero_shot.model.frequency_weight must be non-negative"

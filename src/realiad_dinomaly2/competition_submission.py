@@ -56,7 +56,7 @@ from .zero_shot_model import (
 )
 
 
-ZERO_SHOT_SCORING_VERSION = "compound_multiscale_gamma_v3"
+ZERO_SHOT_SCORING_VERSION = "conservative_semantic_gamma_v4"
 
 
 def _inference_worker_context(

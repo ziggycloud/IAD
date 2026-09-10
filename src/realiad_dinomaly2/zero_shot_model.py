@@ -21,7 +21,7 @@ from .config import resolve_path
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-ZERO_SHOT_FORMAT_VERSION = 5
+ZERO_SHOT_FORMAT_VERSION = 6
 
 
 def zero_shot_checkpoint_path(config: dict[str, Any]) -> Path:
@@ -127,6 +127,12 @@ class LearnedZeroShotSegmenter(nn.Module):
         self.prompt_prior_temperature = float(
             model_config.get("prompt_prior_temperature", 1.0)
         )
+        self.dense_refinement_enabled = bool(
+            model_config.get("dense_refinement_enabled", True)
+        )
+        self.layer_specific_adapters = bool(
+            model_config.get("layer_specific_adapters", True)
+        )
         model_name = str(model_config.get("model_name", "ViT-B-16"))
         pretrained = str(model_config.get("pretrained", "openai"))
         cache_dir = resolve_path(
@@ -201,13 +207,23 @@ class LearnedZeroShotSegmenter(nn.Module):
                 "zero_shot.model.compound_prompt_count must be between 1 and "
                 "the number of broken_prompts"
             )
-        # Keep complementary defect semantics separate. Averaging crack,
-        # contamination, missing-part and deformation prompts into one vector
-        # erased exactly the fine-grained signal required by Real-IAD Variety.
         broken_anchors = broken_anchors[:compound_count]
-        prompt_anchors = torch.cat(
-            [normal_anchor[None], broken_anchors], dim=0
+        prompt_aggregation = str(
+            model_config.get("prompt_aggregation", "dynamic_prior")
         )
+        if prompt_aggregation == "mean_anchor":
+            # A single normalized defect anchor is deliberately conservative:
+            # it cannot suppress a local defect because a global image token
+            # happened to select the wrong defect subtype.
+            broken_anchors = F.normalize(
+                broken_anchors.mean(dim=0, keepdim=True), dim=-1, eps=1e-6
+            )
+        elif prompt_aggregation != "dynamic_prior":
+            raise ValueError(
+                "zero_shot.model.prompt_aggregation must be mean_anchor or "
+                "dynamic_prior"
+            )
+        prompt_anchors = torch.cat([normal_anchor[None], broken_anchors], dim=0)
         prompt_anchors = F.normalize(prompt_anchors, dim=-1, eps=1e-6)
         self.register_buffer("prompt_anchors", prompt_anchors, persistent=True)
         text_dim = int(prompt_anchors.shape[-1])
@@ -236,7 +252,9 @@ class LearnedZeroShotSegmenter(nn.Module):
                     nn.Dropout(dropout),
                     nn.Linear(adapter_hidden, text_dim),
                 )
-                for _ in range(self.intermediate_layers)
+                for _ in range(
+                    self.intermediate_layers if self.layer_specific_adapters else 1
+                )
             ]
         )
         self.global_visual_adapter = nn.Sequential(
@@ -286,6 +304,11 @@ class LearnedZeroShotSegmenter(nn.Module):
         for refiner in (self.visual_refiner, self.textual_refiner):
             nn.init.zeros_(refiner[-1].weight)
             nn.init.zeros_(refiner[-1].bias)
+        if self.frequency_weight <= 0.0:
+            self.frequency_adapter.requires_grad_(False)
+        if not self.dense_refinement_enabled:
+            self.visual_refiner.requires_grad_(False)
+            self.textual_refiner.requires_grad_(False)
         self.to(device)
         self.clip.eval()
 
@@ -399,6 +422,8 @@ class LearnedZeroShotSegmenter(nn.Module):
         *,
         apply_foreground_suppression: bool,
     ) -> torch.Tensor:
+        if not self.dense_refinement_enabled:
+            return margin
         output_size = (self.dense_output_size, self.dense_output_size)
         coarse = F.interpolate(
             margin.float(), size=output_size, mode="bilinear", align_corners=False
@@ -464,43 +489,54 @@ class LearnedZeroShotSegmenter(nn.Module):
         layer_weights = self.layer_logits.softmax(dim=0).to(
             projected_layers.dtype
         )
+        patches = torch.einsum("l,lbhwc->bhwc", layer_weights, projected_layers)
         if feature_anomaly_mask is not None and feature_noise_std > 0.0:
             feature_mask = F.interpolate(
                 feature_anomaly_mask.float(),
-                size=projected_layers.shape[2:4],
+                size=patches.shape[1:3],
                 mode="area",
             ).permute(0, 2, 3, 1)
-            projected_layers = projected_layers + (
-                torch.randn_like(projected_layers)
-                * feature_mask.unsqueeze(0)
+            patches = patches + (
+                torch.randn_like(patches)
+                * feature_mask
                 * float(feature_noise_std)
             )
-        patches = torch.einsum("l,lbhwc->bhwc", layer_weights, projected_layers)
-        visual_layers = torch.stack(
-            [
-                F.normalize(
-                    layer + adapter(layer), dim=-1, eps=1e-6
-                )
-                for layer, adapter in zip(
-                    projected_layers.unbind(dim=0),
-                    self.local_visual_adapters,
-                    strict=True,
-                )
-            ],
-            dim=0,
-        )
-        visual_patches = torch.einsum("l,lbhwc->bhwc", layer_weights, visual_layers)
-        high_frequency = (
-            rgb - F.avg_pool2d(rgb, 5, stride=1, padding=2)
-        ).abs()
-        frequency = F.adaptive_avg_pool2d(
-            high_frequency, output_size=visual_patches.shape[1:3]
-        ).permute(0, 2, 3, 1)
-        visual_patches = F.normalize(
-            visual_patches + self.frequency_weight * self.frequency_adapter(frequency),
-            dim=-1,
-            eps=1e-6,
-        )
+        if self.layer_specific_adapters:
+            visual_layers = torch.stack(
+                [
+                    F.normalize(layer + adapter(layer), dim=-1, eps=1e-6)
+                    for layer, adapter in zip(
+                        projected_layers.unbind(dim=0),
+                        self.local_visual_adapters,
+                        strict=True,
+                    )
+                ],
+                dim=0,
+            )
+            visual_patches = torch.einsum(
+                "l,lbhwc->bhwc", layer_weights, visual_layers
+            )
+        else:
+            # The shared adapter operates after layer fusion, matching the
+            # simpler model that produced the stronger prior unseen result.
+            visual_patches = F.normalize(
+                patches + self.local_visual_adapters[0](patches),
+                dim=-1,
+                eps=1e-6,
+            )
+        if self.frequency_weight > 0.0:
+            high_frequency = (
+                rgb - F.avg_pool2d(rgb, 5, stride=1, padding=2)
+            ).abs()
+            frequency = F.adaptive_avg_pool2d(
+                high_frequency, output_size=visual_patches.shape[1:3]
+            ).permute(0, 2, 3, 1)
+            visual_patches = F.normalize(
+                visual_patches
+                + self.frequency_weight * self.frequency_adapter(frequency),
+                dim=-1,
+                eps=1e-6,
+            )
         visual_global = F.normalize(
             global_feature + self.global_visual_adapter(global_feature),
             dim=-1,

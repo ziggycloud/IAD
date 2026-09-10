@@ -139,6 +139,13 @@ class ClipCompetitionConfigTests(unittest.TestCase):
             config["zero_shot"]["training"]["scheduler"], "cosine"
         )
         self.assertEqual(
+            config["zero_shot"]["model"]["prompt_aggregation"], "mean_anchor"
+        )
+        self.assertFalse(
+            config["zero_shot"]["model"]["dense_refinement_enabled"]
+        )
+        self.assertFalse(config["zero_shot"]["inference"]["window_enabled"])
+        self.assertEqual(
             config["evaluation"]["unseen_clip"][
                 "intermediate_layer_weights"
             ],
